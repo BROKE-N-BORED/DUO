@@ -8,9 +8,10 @@ Or start a relay: type a seed message, press Start Relay, and the two
 models talk to each other — each reply is handed to the other model,
 one turn at a time, until the turn cap or a stop condition.
 
-This is Item 2 of the project: the shell, the model pickers,
-send-to-A/B/both, and the auto-relay loop. Files, tasks, and the rest
-come later.
+This is Item 3 of the project: the shell, the model pickers,
+send-to-A/B/both, the auto-relay loop, and the director controls
+(history editing, hop review, instructions, saved pairs, compare
+mode). Files, tasks, and the rest come later.
 
 ## What you need
 
@@ -63,6 +64,29 @@ bash run.sh
   reply says something like "sounds good" or "I agree".
 - Relayed messages carry a [relay] tag in the window so you can always
   tell what was relayed. The models never see the tag.
+
+## Director controls
+
+- History: each pane has a History button that opens its message list.
+  Select a message and use Up / Down to move it, or Delete to remove
+  it. The model sees the edited order on its next turn. Editing is
+  only available while nothing is generating.
+- Review each hop: tick this before starting a relay and the relay
+  pauses before every hop, showing you the exact text the other model
+  would get. Forward sends it as-is, Forward edited sends your edited
+  version, Skip this hop ends the relay without forwarding.
+- Instructions: the Instructions button above each pane opens a
+  system-prompt field for that side. Whatever you type there is sent
+  as the system message for that model on every turn. Leave it empty
+  for no system message.
+- Pairs: the Pair row saves the current setup — both models plus both
+  instruction fields — under a name, and loads it back from the
+  dropdown. Pairs live in duo-pairs.json next to the app. Nothing is
+  saved or loaded unless you ask for it.
+- Compare: after Send to Both, each pane gets a Use this button. Tap
+  it and that reply is sent to the other side ("You picked this
+  answer: ...") so the conversation continues from the better answer.
+  The picked reply is marked in its pane.
 
 ## Tests
 

@@ -1,4 +1,4 @@
-"""Tests for DUO Items 1+2. No real Ollama needed: a fake Ollama HTTP
+"""Tests for DUO Items 1-3. No real Ollama needed: a fake Ollama HTTP
 server (and a fake client for the GUI tests) stands in for the real one.
 
 Run from the project root:  python3 -m unittest discover -s tests -v
@@ -7,6 +7,7 @@ import copy
 import json
 import os
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -16,9 +17,10 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from dual_chat import (  # noqa: E402
-    AGREEMENT_PHRASES, AWARE_TEMPLATE, Cancelled, ChatSide, Conversation,
-    NoModelSelected, OllamaClient, OllamaError, RelaySession, SerialRunner,
-    parse_ollama_list_output, parse_stop_phrases, parse_tags_payload,
+    AGREEMENT_PHRASES, AWARE_TEMPLATE, COMPARE_PREFIX, Cancelled, ChatSide,
+    Conversation, NoModelSelected, OllamaClient, OllamaError, RelaySession,
+    SerialRunner, load_pairs, pairs_path, parse_ollama_list_output,
+    parse_stop_phrases, parse_tags_payload, save_pair,
 )
 
 
@@ -851,6 +853,540 @@ class RelayGuiTests(unittest.TestCase):
             window.close()
         # Give the queued signals time to land on the closed window.
         self._wait_for(lambda: False, timeout=1.0)
+
+
+# ---------------------------------------------------------------------------
+# ChatSide editing: reorder, delete, labels, instructions (pure, no Qt)
+# ---------------------------------------------------------------------------
+
+class ChatSideEditTests(unittest.TestCase):
+    def _side_with_four(self):
+        side = ChatSide("A")
+        side.model = "fake-a:latest"
+        side.add_user("first")
+        side.add_assistant("alpha one")
+        side.add_user("second")
+        side.add_assistant("alpha two")
+        return side
+
+    def _contents(self, side):
+        return [m["content"] for m in side.history]
+
+    def test_labels_default(self):
+        side = ChatSide("A")
+        side.model = "fake-a:latest"
+        side.add_user("hi")
+        side.add_assistant("hello")
+        self.assertEqual(side.labels, ["You", "fake-a:latest"])
+        side2 = ChatSide("B")
+        side2.add_assistant("hello")
+        self.assertEqual(side2.labels, ["Assistant"])
+
+    def test_labels_move_with_entries(self):
+        side = self._side_with_four()
+        side.move_up(2)
+        self.assertEqual(self._contents(side),
+                         ["first", "second", "alpha one", "alpha two"])
+        self.assertEqual(side.labels,
+                         ["You", "You", "fake-a:latest", "fake-a:latest"])
+
+    def test_move_up_and_down(self):
+        side = self._side_with_four()
+        side.move_up(1)
+        self.assertEqual(self._contents(side),
+                         ["alpha one", "first", "second", "alpha two"])
+        side.move_down(0)
+        self.assertEqual(self._contents(side),
+                         ["first", "alpha one", "second", "alpha two"])
+        side.move_down(3)  # last entry: no-op
+        self.assertEqual(self._contents(side),
+                         ["first", "alpha one", "second", "alpha two"])
+        side.move_up(0)  # first entry: no-op
+        self.assertEqual(self._contents(side),
+                         ["first", "alpha one", "second", "alpha two"])
+
+    def test_move_out_of_range_is_noop(self):
+        side = self._side_with_four()
+        side.move_up(-1)
+        side.move_up(99)
+        side.move_down(-1)
+        side.move_down(99)
+        self.assertEqual(self._contents(side),
+                         ["first", "alpha one", "second", "alpha two"])
+
+    def test_delete_removes_entry_and_label(self):
+        side = self._side_with_four()
+        side.delete_at(1)
+        self.assertEqual(self._contents(side),
+                         ["first", "second", "alpha two"])
+        self.assertEqual(side.labels, ["You", "You", "fake-a:latest"])
+        side.delete_at(99)  # out of range: no-op
+        side.delete_at(-1)
+        self.assertEqual(len(side.history), 3)
+
+    def test_clear_clears_labels_too(self):
+        side = self._side_with_four()
+        side.clear()
+        self.assertEqual(side.history, [])
+        self.assertEqual(side.labels, [])
+
+    def test_messages_for_model_without_instruction(self):
+        side = self._side_with_four()
+        self.assertEqual(side.messages_for_model(), side.history)
+        self.assertIsNot(side.messages_for_model(), side.history)
+
+    def test_messages_for_model_with_instruction(self):
+        side = self._side_with_four()
+        side.instruction = "Be brief."
+        self.assertEqual(side.messages_for_model(), [
+            {"role": "system", "content": "Be brief."},
+        ] + side.history)
+
+    def test_messages_for_model_whitespace_instruction_is_none(self):
+        side = self._side_with_four()
+        side.instruction = "   \n  "
+        self.assertEqual(side.messages_for_model(), side.history)
+
+
+# ---------------------------------------------------------------------------
+# Saved pairs: JSON file round-trip (pure, no Qt)
+# ---------------------------------------------------------------------------
+
+class PairsTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.tmp.name, "duo-pairs.json")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_missing_file_reads_as_empty(self):
+        self.assertEqual(load_pairs(self.path), {})
+
+    def test_corrupt_file_reads_as_empty(self):
+        with open(self.path, "w", encoding="utf-8") as fh:
+            fh.write("{not json")
+        self.assertEqual(load_pairs(self.path), {})
+        with open(self.path, "w", encoding="utf-8") as fh:
+            json.dump({"pairs": ["not", "a", "dict"]}, fh)
+        self.assertEqual(load_pairs(self.path), {})
+
+    def test_save_load_round_trip_exact_contents(self):
+        setup = {"model_a": "fake-a:latest", "model_b": "fake-b:latest",
+                 "instruction_a": "Be brief.", "instruction_b": ""}
+        save_pair(self.path, "work pair", setup)
+        with open(self.path, "r", encoding="utf-8") as fh:
+            on_disk = json.load(fh)
+        self.assertEqual(on_disk, {"pairs": {"work pair": setup}})
+        self.assertEqual(load_pairs(self.path), {"work pair": setup})
+
+    def test_save_keeps_other_pairs_and_overwrites(self):
+        save_pair(self.path, "one", {"model_a": "a", "model_b": None,
+                                     "instruction_a": "", "instruction_b": ""})
+        save_pair(self.path, "two", {"model_a": "b", "model_b": "c",
+                                     "instruction_a": "x", "instruction_b": "y"})
+        save_pair(self.path, "one", {"model_a": "z", "model_b": None,
+                                     "instruction_a": "", "instruction_b": ""})
+        pairs = load_pairs(self.path)
+        self.assertEqual(set(pairs), {"one", "two"})
+        self.assertEqual(pairs["one"]["model_a"], "z")
+        self.assertEqual(pairs["two"]["model_a"], "b")
+
+    def test_pairs_path_env_override(self):
+        with mock.patch.dict(os.environ,
+                             {"DUAL_CHAT_PAIRS_FILE": "/tmp/elsewhere.json"}):
+            self.assertEqual(pairs_path(), "/tmp/elsewhere.json")
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertTrue(pairs_path().endswith("duo-pairs.json"))
+
+
+# ---------------------------------------------------------------------------
+# Director controls GUI tests (offscreen)
+# ---------------------------------------------------------------------------
+
+@unittest.skipUnless(os.environ.get("DUAL_CHAT_GUI_TESTS") == "1",
+                     "GUI tests run with DUAL_CHAT_GUI_TESTS=1")
+class DirectorGuiTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        from PySide6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+        cls.client = FakeGuiClient()
+
+    def setUp(self):
+        from dual_chat import build_window
+        self.client.reset()
+        # Pairs go to a temp file so tests never touch the real one.
+        self.tmp = tempfile.TemporaryDirectory()
+        self.pairs_file = os.path.join(self.tmp.name, "duo-pairs.json")
+        self._env = mock.patch.dict(
+            os.environ, {"DUAL_CHAT_PAIRS_FILE": self.pairs_file})
+        self._env.start()
+        self.window = build_window(self.client)
+        self.window.show()
+        self.state = self.window._dual_chat
+        self._wait_for(lambda: self.state["widgets"]["A"]["picker"].count() == 2)
+        self._pick_models()
+
+    def tearDown(self):
+        self.window.close()
+        self._env.stop()
+        self.tmp.cleanup()
+
+    def _wait_for(self, cond, timeout=10.0):
+        from PySide6.QtTest import QTest
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            QTest.qWait(50)
+            if cond():
+                return True
+        return cond()
+
+    def _pick_models(self):
+        self.state["widgets"]["A"]["picker"].setCurrentIndex(0)
+        self.state["widgets"]["B"]["picker"].setCurrentIndex(1)
+        self.app.processEvents()
+
+    def _transcript(self, side):
+        return self.state["widgets"][side]["transcript"].toPlainText()
+
+    def _send_to_a_and_wait(self, text):
+        self.state["composer"].setPlainText(text)
+        self.state["send_a"].click()
+        return self._wait_for(lambda: (
+            len(self.state["convo"].sides["A"].history) >= 2
+            and not self.state["state"]["busy"]), timeout=15)
+
+    def _last_messages_for(self, model):
+        for seen_model, messages in reversed(self.client.messages_seen):
+            if seen_model == model:
+                return messages
+        return None
+
+    def _open_history(self, side):
+        w = self.state["widgets"][side]
+        if not w["hist_toggle"].isChecked():
+            w["hist_toggle"].click()
+        self.app.processEvents()
+        self.assertTrue(w["hist_frame"].isVisible())
+
+    def test_reorder_changes_what_the_model_sees(self):
+        self.client.replies = {"fake-a:latest": ["alpha one", "alpha two"]}
+        self.assertTrue(self._send_to_a_and_wait("first message"))
+        self.assertTrue(self._send_to_a_and_wait("second message"))
+        convo = self.state["convo"]
+        self.assertEqual(
+            [m["content"] for m in convo.sides["A"].history],
+            ["first message", "alpha one", "second message", "alpha two"])
+        self._open_history("A")
+        lst = self.state["widgets"]["A"]["hist_list"]
+        self.assertEqual(lst.count(), 4)
+        lst.setCurrentRow(2)  # "You: second message"
+        self.app.processEvents()
+        self.assertTrue(self.state["widgets"]["A"]["hist_up"].isEnabled())
+        self.state["widgets"]["A"]["hist_up"].click()
+        self.app.processEvents()
+        # History and transcript both show the new order.
+        self.assertEqual(
+            [m["content"] for m in convo.sides["A"].history],
+            ["first message", "second message", "alpha one", "alpha two"])
+        text = self._transcript("A")
+        self.assertLess(text.find("first message"),
+                        text.find("second message"))
+        self.assertLess(text.find("second message"),
+                        text.find("alpha one"))
+        self.assertLess(text.find("alpha one"), text.find("alpha two"))
+        # The next turn sends the reordered history, exactly.
+        self.assertTrue(self._send_to_a_and_wait("third message"))
+        self.assertEqual(self._last_messages_for("fake-a:latest"), [
+            {"role": "user", "content": "first message"},
+            {"role": "user", "content": "second message"},
+            {"role": "assistant", "content": "alpha one"},
+            {"role": "assistant", "content": "alpha two"},
+            {"role": "user", "content": "third message"},
+        ])
+
+    def test_delete_removes_message_from_history(self):
+        self.client.replies = {"fake-a:latest": ["alpha one", "alpha two"]}
+        self.assertTrue(self._send_to_a_and_wait("first message"))
+        self.assertTrue(self._send_to_a_and_wait("second message"))
+        self._open_history("A")
+        lst = self.state["widgets"]["A"]["hist_list"]
+        lst.setCurrentRow(0)  # "You: first message"
+        self.app.processEvents()
+        self.state["widgets"]["A"]["hist_delete"].click()
+        self.app.processEvents()
+        convo = self.state["convo"]
+        self.assertEqual(
+            [m["content"] for m in convo.sides["A"].history],
+            ["alpha one", "second message", "alpha two"])
+        self.assertNotIn("first message", self._transcript("A"))
+        self.assertTrue(self._send_to_a_and_wait("third message"))
+        self.assertEqual(self._last_messages_for("fake-a:latest"), [
+            {"role": "assistant", "content": "alpha one"},
+            {"role": "user", "content": "second message"},
+            {"role": "assistant", "content": "alpha two"},
+            {"role": "user", "content": "third message"},
+        ])
+
+    def test_history_buttons_follow_selection(self):
+        self.assertTrue(self._send_to_a_and_wait("hello"))
+        self._open_history("A")
+        w = self.state["widgets"]["A"]
+        lst = w["hist_list"]
+        self.assertFalse(w["hist_up"].isEnabled())
+        self.assertFalse(w["hist_down"].isEnabled())
+        self.assertFalse(w["hist_delete"].isEnabled())
+        lst.setCurrentRow(0)
+        self.app.processEvents()
+        self.assertFalse(w["hist_up"].isEnabled())
+        self.assertTrue(w["hist_down"].isEnabled())
+        self.assertTrue(w["hist_delete"].isEnabled())
+        lst.setCurrentRow(1)
+        self.app.processEvents()
+        self.assertTrue(w["hist_up"].isEnabled())
+        self.assertFalse(w["hist_down"].isEnabled())
+
+    def _start_review_relay(self, seed, cap=3):
+        # Note: no client.reset() here -- the caller sets scripted
+        # replies first, and reset() would wipe them.
+        self.state["review_check"].setChecked(True)
+        self.state["start_picker"].setCurrentIndex(0)
+        self.state["cap_spin"].setValue(cap)
+        self.state["mode_picker"].setCurrentIndex(0)  # Blind
+        self.state["composer"].setPlainText(seed)
+        self.app.processEvents()
+        self.state["relay_btn"].click()
+
+    def _wait_for_review(self, timeout=15.0):
+        return self._wait_for(
+            lambda: self.state["review_frame"].isVisible()
+            and self.state["state"].get("pending_hop") is not None,
+            timeout=timeout)
+
+    def _wait_for_relay_stopped(self, timeout=15.0):
+        return self._wait_for(lambda: self.state["relay_status"].text()
+                              .startswith("Relay stopped"), timeout=timeout)
+
+    def test_review_forwards_edited_text(self):
+        self.client.replies = {"fake-a:latest": ["apple pie"],
+                               "fake-b:latest": ["banana split"]}
+        self._start_review_relay("Talk about fruit.", cap=3)
+        self.assertTrue(self._wait_for_review())
+        # Blind mode: the review box shows the bare reply text.
+        self.assertEqual(self.state["review_edit"].toPlainText(), "apple pie")
+        self.assertIn("Model A to Model B",
+                      self.state["review_label"].text())
+        # Nothing was forwarded yet: B has no job.
+        self.assertEqual(self.client.calls, ["fake-a:latest"])
+        self.state["review_edit"].setPlainText("apple crumble")
+        self.state["review_forward_edited"].click()
+        # B replies, then the relay pauses again before the hop back.
+        self.assertTrue(self._wait_for_review())
+        self.assertEqual(self.state["review_edit"].toPlainText(),
+                         "banana split")
+        self.state["review_forward"].click()
+        self.assertTrue(self._wait_for_relay_stopped())
+        # B received the EDITED text, and only the edited text.
+        model, messages = self.client.messages_seen[1]
+        self.assertEqual(model, "fake-b:latest")
+        self.assertEqual(messages, [{"role": "user", "content": "apple crumble"}])
+        # The hop back carried B's reply unchanged.
+        _, messages_a2 = self.client.messages_seen[2]
+        self.assertEqual(messages_a2[-1],
+                         {"role": "user", "content": "banana split"})
+        # His window shows the edited text with the relay tag.
+        self.assertIn("apple crumble", self._transcript("B"))
+        self.assertIn("[relay from Model A]", self._transcript("B"))
+
+    def test_review_forward_ignores_edits(self):
+        self.client.replies = {"fake-a:latest": ["apple pie"],
+                               "fake-b:latest": ["banana split"]}
+        self._start_review_relay("Talk about fruit.", cap=2)
+        self.assertTrue(self._wait_for_review())
+        self.state["review_edit"].setPlainText("CHANGED")
+        self.state["review_forward"].click()
+        self.assertTrue(self._wait_for_relay_stopped())
+        _, messages = self.client.messages_seen[1]
+        self.assertEqual(messages, [{"role": "user", "content": "apple pie"}])
+
+    def test_review_skip_ends_relay(self):
+        self.client.replies = {"fake-a:latest": ["apple pie"]}
+        self._start_review_relay("Talk about fruit.", cap=10)
+        self.assertTrue(self._wait_for_review())
+        self.state["review_skip"].click()
+        self.assertTrue(self._wait_for_relay_stopped())
+        self.assertIn("skipped", self.state["relay_status"].text())
+        self.assertEqual(self.client.calls, ["fake-a:latest"])
+        self.assertFalse(self.state["review_frame"].isVisible())
+        self.assertFalse(self.state["state"]["busy"])
+
+    def test_review_stop_ends_relay_and_next_send_still_works(self):
+        self.client.replies = {"fake-a:latest": ["apple pie"]}
+        self._start_review_relay("Talk about fruit.", cap=10)
+        self.assertTrue(self._wait_for_review())
+        self.state["review_stop"].click()
+        self.assertTrue(self._wait_for_relay_stopped())
+        self.assertIn("stopped by you", self.state["relay_status"].text())
+        self.assertEqual(self.client.calls, ["fake-a:latest"])
+        # The stop during a review pause must not poison the next job
+        # for that side: a plain send still runs to completion.
+        self.state["review_check"].setChecked(False)
+        self.assertTrue(self._send_to_a_and_wait("are you still there?"))
+        self.assertEqual(self.client.calls.count("fake-a:latest"), 2)
+
+    def test_instructions_sent_as_system_message(self):
+        self.state["widgets"]["A"]["instr_edit"].setPlainText(
+            "You are a pirate.")
+        self.state["composer"].setPlainText("Hello")
+        self.state["send_a"].click()
+        self.assertTrue(self._wait_for(
+            lambda: len(self.client.messages_seen) >= 1, timeout=15))
+        self.assertTrue(self._wait_for(
+            lambda: not self.state["state"]["busy"], timeout=15))
+        self.assertEqual(self._last_messages_for("fake-a:latest"), [
+            {"role": "system", "content": "You are a pirate."},
+            {"role": "user", "content": "Hello"},
+        ])
+        # B has no instruction: no system message at all.
+        self.state["composer"].setPlainText("Hello")
+        self.state["send_b"].click()
+        self.assertTrue(self._wait_for(
+            lambda: not self.state["state"]["busy"], timeout=15))
+        self.assertEqual(self._last_messages_for("fake-b:latest"), [
+            {"role": "user", "content": "Hello"},
+        ])
+        # A whitespace-only instruction is the same as none.
+        self.state["widgets"]["B"]["instr_edit"].setPlainText("   ")
+        self.state["composer"].setPlainText("Hello again")
+        self.state["send_b"].click()
+        self.assertTrue(self._wait_for(
+            lambda: not self.state["state"]["busy"], timeout=15))
+        messages = self._last_messages_for("fake-b:latest")
+        self.assertTrue(all(m["role"] != "system" for m in messages))
+
+    def test_pairs_save_load_round_trip(self):
+        self.state["widgets"]["A"]["instr_edit"].setPlainText("Be brief.")
+        self.state["widgets"]["B"]["instr_edit"].setPlainText("Be thorough.")
+        self.state["pair_name"].setText("work pair")
+        self.state["pair_save"].click()
+        self.app.processEvents()
+        with open(self.pairs_file, "r", encoding="utf-8") as fh:
+            on_disk = json.load(fh)
+        self.assertEqual(on_disk, {"pairs": {"work pair": {
+            "model_a": "fake-a:latest", "model_b": "fake-b:latest",
+            "instruction_a": "Be brief.",
+            "instruction_b": "Be thorough."}}})
+        combo = self.state["pair_combo"]
+        self.assertEqual([combo.itemText(i) for i in range(combo.count())],
+                         ["work pair"])
+        # Change everything, then load the pair back from the dropdown.
+        self.state["widgets"]["A"]["picker"].setCurrentIndex(1)
+        self.state["widgets"]["B"]["picker"].setCurrentIndex(0)
+        self.state["widgets"]["A"]["instr_edit"].setPlainText("")
+        self.state["widgets"]["B"]["instr_edit"].setPlainText("")
+        self.app.processEvents()
+        combo.setCurrentIndex(-1)
+        combo.setCurrentIndex(0)
+        self.app.processEvents()
+        convo = self.state["convo"]
+        self.assertEqual(convo.sides["A"].model, "fake-a:latest")
+        self.assertEqual(convo.sides["B"].model, "fake-b:latest")
+        self.assertEqual(
+            self.state["widgets"]["A"]["instr_edit"].toPlainText(),
+            "Be brief.")
+        self.assertEqual(
+            self.state["widgets"]["B"]["instr_edit"].toPlainText(),
+            "Be thorough.")
+        # Re-picking the pair that is already selected still loads it:
+        # change the setup again and activate the same dropdown item.
+        self.state["widgets"]["A"]["picker"].setCurrentIndex(1)
+        self.state["widgets"]["A"]["instr_edit"].setPlainText("Changed.")
+        self.app.processEvents()
+        combo.activated.emit(0)
+        self.app.processEvents()
+        self.assertEqual(convo.sides["A"].model, "fake-a:latest")
+        self.assertEqual(
+            self.state["widgets"]["A"]["instr_edit"].toPlainText(),
+            "Be brief.")
+
+    def test_pairs_nothing_loaded_by_default(self):
+        save_pair(self.pairs_file, "work pair",
+                  {"model_a": "fake-a:latest", "model_b": "fake-b:latest",
+                   "instruction_a": "Be brief.", "instruction_b": ""})
+        from dual_chat import build_window
+        window = build_window(self.client)
+        try:
+            window.show()
+            state = window._dual_chat
+            self.assertTrue(self._wait_for(
+                lambda: state["widgets"]["A"]["picker"].count() == 2))
+            combo = state["pair_combo"]
+            self.assertEqual(
+                [combo.itemText(i) for i in range(combo.count())],
+                ["work pair"])
+            # Listed, but not loaded: pickers still blank, no models set.
+            self.assertEqual(
+                state["widgets"]["A"]["picker"].currentIndex(), -1)
+            self.assertEqual(
+                state["widgets"]["B"]["picker"].currentIndex(), -1)
+            self.assertIsNone(state["convo"].sides["A"].model)
+            self.assertIsNone(state["convo"].sides["B"].model)
+        finally:
+            window.close()
+
+    def test_pair_save_needs_a_name(self):
+        self.state["pair_name"].setText("   ")
+        self.state["pair_save"].click()
+        self.app.processEvents()
+        self.assertFalse(os.path.exists(self.pairs_file))
+        self.assertIn("Name the pair",
+                      self.window.statusBar().currentMessage())
+
+    def test_compare_use_this_sends_pick_to_other_side(self):
+        self.client.replies = {"fake-a:latest": ["answer alpha"],
+                               "fake-b:latest": ["answer beta"]}
+        use_a = self.state["widgets"]["A"]["use_this"]
+        use_b = self.state["widgets"]["B"]["use_this"]
+        self.assertFalse(use_a.isEnabled())
+        self.assertFalse(use_b.isEnabled())
+        self.state["composer"].setPlainText("Which is better?")
+        self.state["send_both"].click()
+        self.assertTrue(self._wait_for(
+            lambda: use_a.isEnabled() and use_b.isEnabled(), timeout=15))
+        self.assertEqual(self.client.calls,
+                         ["fake-a:latest", "fake-b:latest"])
+        use_a.click()
+        self.assertTrue(self._wait_for(
+            lambda: "You picked this answer: answer alpha" in
+            self._transcript("B") and not self.state["state"]["busy"],
+            timeout=15))
+        # Only B got a new job, carrying the picked reply.
+        self.assertEqual(self.client.calls,
+                         ["fake-a:latest", "fake-b:latest", "fake-b:latest"])
+        messages = self._last_messages_for("fake-b:latest")
+        self.assertEqual(messages[-1], {
+            "role": "user",
+            "content": COMPARE_PREFIX % "answer alpha"})
+        # The picked pane is marked, and the offer is spent.
+        self.assertIn("(Picked for Model B.)", self._transcript("A"))
+        self.assertFalse(use_a.isEnabled())
+        self.assertFalse(use_b.isEnabled())
+
+    def test_compare_offer_ends_on_new_send(self):
+        self.client.replies = {"fake-a:latest": ["answer alpha"],
+                               "fake-b:latest": ["answer beta"]}
+        self.state["composer"].setPlainText("Which is better?")
+        self.state["send_both"].click()
+        use_a = self.state["widgets"]["A"]["use_this"]
+        self.assertTrue(self._wait_for(lambda: use_a.isEnabled(),
+                                       timeout=15))
+        self.state["composer"].setPlainText("Something else.")
+        self.state["send_a"].click()
+        self.app.processEvents()
+        self.assertFalse(use_a.isEnabled())
+        self.assertFalse(
+            self.state["widgets"]["B"]["use_this"].isEnabled())
 
 
 if __name__ == "__main__":

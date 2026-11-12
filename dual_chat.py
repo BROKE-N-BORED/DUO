@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""DUO (Item 2) - two Ollama models side by side in one desktop window.
+"""DUO (Item 3) - two Ollama models side by side in one desktop window.
 
 Item 1: the shell, the model pickers, and send-to-A/B/both.
 Item 2: the auto-relay AI-to-AI loop. The user types a seed message, picks
@@ -10,10 +10,15 @@ Item 2: the auto-relay AI-to-AI loop. The user types a seed message, picks
   talking to it. Aware mode frames the relay so the models know they are
   talking to another AI. Relayed hops are tagged in the window's
   transcripts only -- the models never see the tag.
+Item 3: director controls. Reorder or delete any message in a side's
+  history (the model sees the edited order on the next turn); review
+  each relay hop before it is forwarded, editing it if you like;
+  per-side instructions (system prompts) plus saved model pairs; and
+  compare mode -- after Send to Both, pick the better reply and the
+  conversation continues from it.
 
-NOT in Item 2 (later items): reorder, edit-before-forward, system
-prompts, saved pairs, compare mode, auto-summarize, speed readout,
-file upload, tasks, export, provider APIs.
+NOT in Item 3 (later items): auto-summarize, speed readout, file
+upload, tasks, export, provider APIs.
 """
 
 import json
@@ -47,6 +52,18 @@ AWARE_TEMPLATE = ("You are talking with another AI assistant (Model %s). "
 RELAY_CAP_MIN = 1
 RELAY_CAP_MAX = 50
 RELAY_CAP_DEFAULT = 10
+
+# Compare mode: the picked reply is sent to the other side as a user
+# message with this prefix, so the conversation continues from it.
+COMPARE_PREFIX = "You picked this answer: %s"
+
+MSG_PAIR_NEEDS_NAME = "Name the pair first."
+MSG_REVIEW_EMPTY = "Nothing to forward -- edit the text or skip this hop."
+
+# Saved model pairs live in a plain JSON file next to the app.
+# DUAL_CHAT_PAIRS_FILE points at a different file (used by the tests).
+PAIRS_ENV = "DUAL_CHAT_PAIRS_FILE"
+PAIRS_FILENAME = "duo-pairs.json"
 
 
 class OllamaError(Exception):
@@ -171,21 +188,61 @@ class OllamaClient:
 
 
 class ChatSide:
-    """One side's state: its picked model and its own history."""
+    """One side's state: its picked model and its own history.
+
+    ``labels`` runs parallel to ``history``: the display label for each
+    entry ("You", "You [relay from Model A]", or the model name). Labels
+    are window-only -- they never reach the model. ``instruction`` is
+    this side's system prompt ("" means no system message).
+    """
 
     def __init__(self, name):
         self.name = name  # "A" or "B"
         self.model = None
         self.history = []  # [{"role": "user"/"assistant", "content": str}]
+        self.labels = []
+        self.instruction = ""
 
-    def add_user(self, text):
+    def add_user(self, text, label="You"):
         self.history.append({"role": "user", "content": text})
+        self.labels.append(label)
 
-    def add_assistant(self, text):
+    def add_assistant(self, text, label=None):
         self.history.append({"role": "assistant", "content": text})
+        self.labels.append(
+            label if label is not None else (self.model or "Assistant"))
 
     def clear(self):
         self.history = []
+        self.labels = []
+
+    def move_up(self, index):
+        """Move entry ``index`` one slot earlier. No-op at the edges."""
+        if 0 < index < len(self.history):
+            self._swap(index, index - 1)
+
+    def move_down(self, index):
+        """Move entry ``index`` one slot later. No-op at the edges."""
+        if 0 <= index < len(self.history) - 1:
+            self._swap(index, index + 1)
+
+    def _swap(self, i, j):
+        self.history[i], self.history[j] = self.history[j], self.history[i]
+        self.labels[i], self.labels[j] = self.labels[j], self.labels[i]
+
+    def delete_at(self, index):
+        """Remove entry ``index``. No-op when out of range."""
+        if 0 <= index < len(self.history):
+            del self.history[index]
+            del self.labels[index]
+
+    def messages_for_model(self):
+        """The messages a generation sends: system prompt (when set)
+        followed by this side's history, in its current order."""
+        messages = list(self.history)
+        if self.instruction.strip():
+            return [{"role": "system", "content": self.instruction}] + messages
+        return messages
 
 
 class Conversation:
@@ -209,6 +266,49 @@ class Conversation:
 def parse_stop_phrases(text):
     """Split a comma-separated stop-phrase field into clean phrases."""
     return [p.strip() for p in (text or "").split(",") if p.strip()]
+
+
+def pairs_path():
+    """Where saved pairs live: duo-pairs.json next to the app.
+
+    DUAL_CHAT_PAIRS_FILE overrides it (the tests point it at a temp file).
+    """
+    override = os.environ.get(PAIRS_ENV)
+    if override:
+        return override
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        PAIRS_FILENAME)
+
+
+def load_pairs(path):
+    """Saved pairs as {name: setup} from a JSON file.
+
+    Missing, unreadable, or malformed files read as no pairs -- a bad
+    file never stops the app from starting.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    pairs = data.get("pairs") if isinstance(data, dict) else None
+    if not isinstance(pairs, dict):
+        return {}
+    return {name: setup for name, setup in pairs.items()
+            if isinstance(setup, dict)}
+
+
+def save_pair(path, name, setup):
+    """Save one pair (creating or overwriting it) in the JSON file.
+
+    A setup is {"model_a", "model_b", "instruction_a",
+    "instruction_b"}; models may be None when nothing is picked.
+    """
+    pairs = load_pairs(path)
+    pairs[name] = setup
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump({"pairs": pairs}, fh, indent=2, sort_keys=True)
+        fh.write("\n")
 
 
 class RelaySession:
@@ -483,9 +583,15 @@ def build_window(client=None):
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(6)
 
+        title_row = QtWidgets.QHBoxLayout()
         title = QtWidgets.QLabel("Model " + side)
         title.setStyleSheet("font-weight: bold; font-size: 14px;")
-        layout.addWidget(title)
+        title_row.addWidget(title, stretch=1)
+        instr_toggle = QtWidgets.QPushButton("Instructions ▸")
+        instr_toggle.setCheckable(True)
+        instr_toggle.setFlat(True)
+        title_row.addWidget(instr_toggle)
+        layout.addLayout(title_row)
 
         picker_row = QtWidgets.QHBoxLayout()
         picker = QtWidgets.QComboBox()
@@ -498,24 +604,66 @@ def build_window(client=None):
         picker_row.addWidget(refresh)
         layout.addLayout(picker_row)
 
+        # Per-side instructions (system prompt). Collapsed by default;
+        # empty means no system message is sent for this side.
+        instr_edit = QtWidgets.QPlainTextEdit()
+        instr_edit.setPlaceholderText(
+            "Instructions for this model (system prompt)...")
+        instr_edit.setFixedHeight(44)
+        instr_edit.setVisible(False)
+        layout.addWidget(instr_edit)
+
         transcript = QtWidgets.QTextEdit()
         transcript.setReadOnly(True)
         transcript.setPlaceholderText("No messages yet.")
         layout.addWidget(transcript, stretch=1)
 
+        # History editor: reorder or delete any message. Hidden by
+        # default; the model sees the edited order on the next turn.
+        hist_frame = QtWidgets.QFrame()
+        hist_layout = QtWidgets.QVBoxLayout(hist_frame)
+        hist_layout.setContentsMargins(0, 0, 0, 0)
+        hist_layout.setSpacing(4)
+        hist_list = QtWidgets.QListWidget()
+        hist_list.setFixedHeight(110)
+        hist_layout.addWidget(hist_list)
+        hist_btn_row = QtWidgets.QHBoxLayout()
+        hist_up = QtWidgets.QPushButton("Up")
+        hist_down = QtWidgets.QPushButton("Down")
+        hist_delete = QtWidgets.QPushButton("Delete")
+        for btn in (hist_up, hist_down, hist_delete):
+            btn.setEnabled(False)
+            hist_btn_row.addWidget(btn)
+        hist_btn_row.addStretch(1)
+        hist_layout.addLayout(hist_btn_row)
+        hist_frame.setVisible(False)
+        layout.addWidget(hist_frame)
+
         bottom = QtWidgets.QHBoxLayout()
         status = QtWidgets.QLabel("Idle")
         bottom.addWidget(status, stretch=1)
+        use_this = QtWidgets.QPushButton("Use this")
+        use_this.setEnabled(False)
+        bottom.addWidget(use_this)
         stop = QtWidgets.QPushButton("Stop")
         stop.setEnabled(False)
         bottom.addWidget(stop)
         clear = QtWidgets.QPushButton("Clear")
         bottom.addWidget(clear)
+        hist_toggle = QtWidgets.QPushButton("History ▸")
+        hist_toggle.setCheckable(True)
+        hist_toggle.setFlat(True)
+        bottom.addWidget(hist_toggle)
         layout.addLayout(bottom)
 
         widgets[side] = {
             "picker": picker, "refresh": refresh, "transcript": transcript,
             "status": status, "stop": stop, "clear": clear,
+            "instr_toggle": instr_toggle, "instr_edit": instr_edit,
+            "use_this": use_this, "hist_toggle": hist_toggle,
+            "hist_frame": hist_frame, "hist_list": hist_list,
+            "hist_up": hist_up, "hist_down": hist_down,
+            "hist_delete": hist_delete,
             "reply_open": False,
         }
         return frame
@@ -569,7 +717,47 @@ def build_window(client=None):
     relay_row.addWidget(stop_edit, stretch=1)
     agree_check = QtWidgets.QCheckBox("Stop on agreement")
     relay_row.addWidget(agree_check)
+    review_check = QtWidgets.QCheckBox("Review each hop")
+    relay_row.addWidget(review_check)
     d_layout.addLayout(relay_row)
+
+    # --- saved pairs -------------------------------------------------------
+    pair_row = QtWidgets.QHBoxLayout()
+    pair_row.addWidget(QtWidgets.QLabel("Pair:"))
+    pair_combo = QtWidgets.QComboBox()
+    pair_combo.setPlaceholderText("Saved pairs")
+    pair_row.addWidget(pair_combo, stretch=1)
+    pair_name = QtWidgets.QLineEdit()
+    pair_name.setPlaceholderText("Name for this pair")
+    pair_row.addWidget(pair_name, stretch=1)
+    pair_save = QtWidgets.QPushButton("Save pair")
+    pair_row.addWidget(pair_save)
+    d_layout.addLayout(pair_row)
+
+    # --- hop review (shown only while a relay waits on a review) ----------
+    review_frame = QtWidgets.QFrame()
+    review_frame.setFrameShape(QtWidgets.QFrame.StyledPanel)
+    review_layout = QtWidgets.QVBoxLayout(review_frame)
+    review_layout.setContentsMargins(6, 6, 6, 6)
+    review_layout.setSpacing(6)
+    review_label = QtWidgets.QLabel("Review this hop")
+    review_label.setStyleSheet("font-weight: bold;")
+    review_layout.addWidget(review_label)
+    review_edit = QtWidgets.QPlainTextEdit()
+    review_edit.setFixedHeight(64)
+    review_layout.addWidget(review_edit)
+    review_btn_row = QtWidgets.QHBoxLayout()
+    review_forward = QtWidgets.QPushButton("Forward")
+    review_forward_edited = QtWidgets.QPushButton("Forward edited")
+    review_skip = QtWidgets.QPushButton("Skip this hop")
+    review_stop = QtWidgets.QPushButton("Stop relay")
+    for btn in (review_forward, review_forward_edited,
+                review_skip, review_stop):
+        review_btn_row.addWidget(btn)
+    review_btn_row.addStretch(1)
+    review_layout.addLayout(review_btn_row)
+    review_frame.setVisible(False)
+    d_layout.addWidget(review_frame)
 
     relay_status = QtWidgets.QLabel("Relay off.")
     d_layout.addWidget(relay_status)
@@ -578,7 +766,12 @@ def build_window(client=None):
     statusbar = window.statusBar()
     statusbar.showMessage("Loading models...")
 
-    state = {"busy": False, "active": set(), "queued": set(), "relay": None}
+    state = {"busy": False, "active": set(), "queued": set(), "relay": None,
+             # Compare mode: the latest reply per side from a Send to
+             # Both round. Complete when both sides are present.
+             "compare": {}, "compare_round": False,
+             # Edit-before-forward: the hop waiting on a review, or None.
+             "pending_hop": None}
 
     # --- helpers ----------------------------------------------------------
     def scroll_to_end(transcript):
@@ -593,6 +786,52 @@ def build_window(client=None):
         t.setTextCursor(cursor)
         scroll_to_end(t)
 
+    def render_transcript(side):
+        """Rebuild a pane's transcript from its history and labels.
+
+        Used after a reorder or delete. The format matches the live
+        transcript ("You: ...", "<model>: ...", "You [relay ...]: ...");
+        transient notes like "(Stopped.)" are not in the history, so a
+        re-render drops them.
+        """
+        side_obj = convo.sides[side]
+        lines = ["%s: %s" % (label, msg["content"])
+                 for label, msg in zip(side_obj.labels, side_obj.history)]
+        widgets[side]["transcript"].setPlainText(
+            "\n".join(lines) + ("\n" if lines else ""))
+        scroll_to_end(widgets[side]["transcript"])
+
+    def refresh_history_list(side):
+        """Rebuild a pane's history-editor list from its history."""
+        lst = widgets[side]["hist_list"]
+        lst.blockSignals(True)
+        lst.clear()
+        side_obj = convo.sides[side]
+        for label, msg in zip(side_obj.labels, side_obj.history):
+            text = msg["content"].replace("\n", " ")
+            if len(text) > 70:
+                text = text[:67] + "..."
+            lst.addItem("%s: %s" % (label, text))
+        lst.blockSignals(False)
+        refresh_history_buttons(side)
+
+    def refresh_history_buttons(side):
+        """Enable the Up/Down/Delete buttons for the current selection.
+
+        Editing is idle-only: never while this side is generating, a
+        relay is running, or anything is busy.
+        """
+        w = widgets[side]
+        lst = w["hist_list"]
+        row = lst.currentRow()
+        count = len(convo.sides[side].history)
+        idle = (not state["busy"] and state.get("relay") is None
+                and side not in state["active"]
+                and side not in state["queued"])
+        w["hist_up"].setEnabled(idle and row > 0)
+        w["hist_down"].setEnabled(idle and 0 <= row < count - 1)
+        w["hist_delete"].setEnabled(idle and row >= 0)
+
     def refresh_buttons():
         busy = state["busy"]
         relay = state.get("relay")
@@ -606,8 +845,16 @@ def build_window(client=None):
         relay_btn.setEnabled(
             relay_active or (not busy and a_ready and b_ready))
         for widget in (start_picker, cap_spin, mode_picker, stop_edit,
-                       agree_check):
+                       agree_check, review_check):
             widget.setEnabled(not relay_active)
+        # Saving or loading a pair mid-generation could swap a model's
+        # setup under a running turn, so pairs wait for idle too.
+        pairs_idle = not busy and not relay_active
+        pair_combo.setEnabled(pairs_idle)
+        pair_name.setEnabled(pairs_idle)
+        pair_save.setEnabled(pairs_idle)
+        compare_ready = (not busy and not relay_active
+                         and len(state.get("compare", {})) == 2)
         for side in ("A", "B"):
             w = widgets[side]
             w["picker"].setEnabled(not busy)
@@ -619,6 +866,8 @@ def build_window(client=None):
             w["clear"].setEnabled(not relay_active
                                   and side not in state["active"]
                                   and side not in state["queued"])
+            w["use_this"].setEnabled(compare_ready)
+            refresh_history_buttons(side)
 
     def set_status(side, text):
         widgets[side]["status"].setText(text)
@@ -673,6 +922,7 @@ def build_window(client=None):
 
         note_side (optional) also gets a "(Relay stopped: ...)" line in
         its pane, so the stop is visible where the conversation ended.
+        Any waiting hop review is dismissed with the relay.
         """
         session = state.get("relay")
         if session is None:
@@ -680,9 +930,72 @@ def build_window(client=None):
         session.active = False
         session.stop_reason = reason
         state["relay"] = None
+        state["pending_hop"] = None
+        review_frame.setVisible(False)
+        # If nothing is still generating or queued (e.g. the relay ended
+        # from a review pause, where no job runs), the window is idle
+        # again -- no on_idle signal will come to say so.
+        if not state["active"] and not state["queued"]:
+            state["busy"] = False
         relay_status.setText("Relay stopped: %s." % reason)
         if note_side is not None:
             append_text(note_side, "(Relay stopped: %s.)\n" % reason)
+        refresh_buttons()
+
+    def forward_hop(session, from_side, framed):
+        """Relay one reply to the other side and start its turn.
+
+        ``framed`` is exactly what the other model receives as a plain
+        user message; the window shows the same text with a [relay] tag,
+        which the models never see.
+        """
+        next_side = RelaySession.other(from_side)
+        convo.sides[next_side].add_user(
+            framed, label="You [relay from Model %s]" % from_side)
+        append_text(next_side,
+                    "You [relay from Model %s]: %s\n" % (from_side, framed))
+        refresh_history_list(next_side)
+        session.current_side = next_side
+        session.hop_from = from_side
+        state["queued"].add(next_side)
+        set_status(next_side, "Queued...")
+        relay_status.setText(session.status_running())
+        runner.submit(next_side, make_job_fn(
+            next_side, convo.sides[next_side].model,
+            convo.sides[next_side].messages_for_model()))
+
+    def pause_for_review(session, from_side, reply_text):
+        """Park the relay on a hop for the user to review and edit.
+
+        The relay stays active (so the window stays busy and no other
+        send can start), but no job runs until the user forwards,
+        skips, or stops from the review box.
+        """
+        next_side = RelaySession.other(from_side)
+        framed = session.frame(reply_text, from_side)
+        state["pending_hop"] = {"session": session, "from_side": from_side,
+                                "framed": framed}
+        review_label.setText(
+            "Review this hop -- Model %s to Model %s (%s):"
+            % (from_side, next_side, session.mode))
+        review_edit.setPlainText(framed)
+        review_frame.setVisible(True)
+        relay_status.setText("Relay paused for review: turn %d/%d."
+                             % (session.turns_done + 1, session.turn_cap))
+        refresh_buttons()
+
+    def do_forward(text):
+        """Forward a reviewed hop with the given text and resume relaying."""
+        hop = state.get("pending_hop")
+        if hop is None:
+            return
+        state["pending_hop"] = None
+        review_frame.setVisible(False)
+        session = hop["session"]
+        if session is None or not session.active:
+            refresh_buttons()
+            return
+        forward_hop(session, hop["from_side"], text)
         refresh_buttons()
 
     def on_done(side, text):
@@ -690,6 +1003,7 @@ def build_window(client=None):
             return
         finish_reply(side)
         convo.sides[side].add_assistant(text)
+        refresh_history_list(side)
         state["active"].discard(side)
         set_status(side, "Idle")
         session = state.get("relay")
@@ -698,24 +1012,14 @@ def build_window(client=None):
             reason = session.check_stop(text)
             if reason is not None:
                 end_relay(reason, note_side=side)
+            elif review_check.isChecked():
+                pause_for_review(session, side, text)
             else:
-                # Relay this reply to the other side. The other model
-                # receives the framed text as a plain user message; the
-                # window shows the same text with a [relay] tag, which
-                # the models never see.
-                next_side = RelaySession.other(side)
-                framed = session.frame(text, side)
-                convo.sides[next_side].add_user(framed)
-                append_text(next_side,
-                            "You [relay from Model %s]: %s\n" % (side, framed))
-                session.current_side = next_side
-                session.hop_from = side
-                state["queued"].add(next_side)
-                set_status(next_side, "Queued...")
-                relay_status.setText(session.status_running())
-                runner.submit(next_side, make_job_fn(
-                    next_side, convo.sides[next_side].model,
-                    list(convo.sides[next_side].history)))
+                forward_hop(session, side, session.frame(text, side))
+        elif state.get("compare_round"):
+            # A Send to Both round: remember this side's reply so the
+            # "Use this" buttons can offer it once both sides land.
+            state["compare"][side] = text
         refresh_buttons()
 
     def on_failed(side, message):
@@ -772,15 +1076,19 @@ def build_window(client=None):
             statusbar.showMessage(str(exc), 4000)
             return
         state["busy"] = True
+        # A new send starts a new round: any earlier compare offer ends.
+        state["compare"] = {}
+        state["compare_round"] = (action == "Both")
         composer.clear()
         for side_obj in targets:
             side = side_obj.name
             side_obj.add_user(text)
             append_text(side, "You: %s\n" % text)
+            refresh_history_list(side)
             state["queued"].add(side)
             set_status(side, "Queued...")
             runner.submit(side, make_job_fn(
-                side, side_obj.model, list(side_obj.history)))
+                side, side_obj.model, side_obj.messages_for_model()))
         refresh_buttons()
         composer.setFocus()
 
@@ -811,15 +1119,19 @@ def build_window(client=None):
         )
         state["relay"] = session
         state["busy"] = True
+        # A relay is not a compare round.
+        state["compare"] = {}
+        state["compare_round"] = False
         composer.clear()
         side_obj = convo.sides[start_side]
         side_obj.add_user(text)
         append_text(start_side, "You: %s\n" % text)
+        refresh_history_list(start_side)
         state["queued"].add(start_side)
         set_status(start_side, "Queued...")
         relay_status.setText(session.status_running())
         runner.submit(start_side, make_job_fn(
-            start_side, side_obj.model, list(side_obj.history)))
+            start_side, side_obj.model, side_obj.messages_for_model()))
         refresh_buttons()
         composer.setFocus()
 
@@ -829,9 +1141,13 @@ def build_window(client=None):
             return
         current = session.current_side
         end_relay(MSG_RELAY_STOPPED_BY_YOU)
-        # The running job's cancel lands in on_cancelled, which finds no
-        # active relay and just reports "(Stopped.)".
-        runner.cancel(current)
+        # Cancel the in-flight job, if there is one. Its cancel lands in
+        # on_cancelled, which finds no active relay and just reports
+        # "(Stopped.)". During a review pause no job runs, and
+        # cancelling a phantom id would poison the next job submitted
+        # for that side.
+        if current in state["active"] or current in state["queued"]:
+            runner.cancel(current)
 
     def on_relay_button():
         if state.get("relay") is not None:
@@ -840,6 +1156,204 @@ def build_window(client=None):
             do_start_relay()
 
     relay_btn.clicked.connect(on_relay_button)
+
+    # --- hop review --------------------------------------------------------
+    def on_review_forward():
+        hop = state.get("pending_hop")
+        if hop is not None:
+            do_forward(hop["framed"])
+
+    def on_review_forward_edited():
+        text = review_edit.toPlainText()
+        if not text.strip():
+            statusbar.showMessage(MSG_REVIEW_EMPTY, 3000)
+            return
+        do_forward(text)
+
+    def on_review_skip():
+        hop = state.get("pending_hop")
+        from_side = hop["from_side"] if hop is not None else None
+        end_relay("hop skipped by you", note_side=from_side)
+
+    review_forward.clicked.connect(on_review_forward)
+    review_forward_edited.clicked.connect(on_review_forward_edited)
+    review_skip.clicked.connect(on_review_skip)
+    review_stop.clicked.connect(on_relay_button)
+
+    # --- compare mode -------------------------------------------------------
+    def use_this(side):
+        """Continue from this side's reply: send it to the other side.
+
+        Only offered after a Send to Both round, once both replies are
+        in. The other side gets "You picked this answer: <reply>" as a
+        user message and answers it; the picked pane is marked.
+        """
+        if state.get("busy") or state.get("relay") is not None:
+            return
+        text = state.get("compare", {}).get(side)
+        if text is None:
+            return
+        other = RelaySession.other(side)
+        if convo.sides[other].model is None:
+            return
+        picked = COMPARE_PREFIX % text
+        state["compare"] = {}
+        state["compare_round"] = False
+        state["busy"] = True
+        convo.sides[other].add_user(picked)
+        append_text(other, "You: %s\n" % picked)
+        refresh_history_list(other)
+        append_text(side, "(Picked for Model %s.)\n" % other)
+        state["queued"].add(other)
+        set_status(other, "Queued...")
+        runner.submit(other, make_job_fn(
+            other, convo.sides[other].model,
+            convo.sides[other].messages_for_model()))
+        refresh_buttons()
+
+    # --- history editor -----------------------------------------------------
+    def make_hist_move(side, direction):
+        def move():
+            if state["busy"] or state.get("relay") is not None:
+                return
+            lst = widgets[side]["hist_list"]
+            row = lst.currentRow()
+            if row < 0:
+                return
+            side_obj = convo.sides[side]
+            if direction < 0:
+                side_obj.move_up(row)
+                new_row = max(0, row - 1)
+            else:
+                side_obj.move_down(row)
+                new_row = min(len(side_obj.history) - 1, row + 1)
+            render_transcript(side)
+            refresh_history_list(side)
+            lst.setCurrentRow(new_row)
+            refresh_buttons()
+        return move
+
+    def make_hist_delete(side):
+        def delete():
+            if state["busy"] or state.get("relay") is not None:
+                return
+            lst = widgets[side]["hist_list"]
+            row = lst.currentRow()
+            if row < 0:
+                return
+            convo.sides[side].delete_at(row)
+            render_transcript(side)
+            refresh_history_list(side)
+            if convo.sides[side].history:
+                lst.setCurrentRow(
+                    min(row, len(convo.sides[side].history) - 1))
+            refresh_buttons()
+        return delete
+
+    def make_instr_toggle(side):
+        def toggled(checked):
+            widgets[side]["instr_edit"].setVisible(checked)
+            widgets[side]["instr_toggle"].setText(
+                "Instructions ▾" if checked else "Instructions ▸")
+        return toggled
+
+    def make_hist_toggle(side):
+        def toggled(checked):
+            widgets[side]["hist_frame"].setVisible(checked)
+            widgets[side]["hist_toggle"].setText(
+                "History ▾" if checked else "History ▸")
+            if checked:
+                refresh_history_list(side)
+        return toggled
+
+    def make_instr_changed(side):
+        def changed():
+            convo.sides[side].instruction = (
+                widgets[side]["instr_edit"].toPlainText())
+        return changed
+
+    for side in ("A", "B"):
+        w = widgets[side]
+        w["use_this"].clicked.connect(
+            (lambda s: lambda: use_this(s))(side))
+        w["hist_up"].clicked.connect(make_hist_move(side, -1))
+        w["hist_down"].clicked.connect(make_hist_move(side, +1))
+        w["hist_delete"].clicked.connect(make_hist_delete(side))
+        w["hist_list"].currentRowChanged.connect(
+            (lambda s: lambda *a: refresh_history_buttons(s))(side))
+        w["instr_toggle"].toggled.connect(make_instr_toggle(side))
+        w["hist_toggle"].toggled.connect(make_hist_toggle(side))
+        w["instr_edit"].textChanged.connect(make_instr_changed(side))
+
+    # --- saved pairs ---------------------------------------------------------
+    def refresh_pair_combo(select=None):
+        """Reload the pair dropdown from the JSON file. Nothing is
+        loaded by default -- the dropdown just lists what is saved."""
+        pairs = load_pairs(pairs_path())
+        pair_combo.blockSignals(True)
+        pair_combo.clear()
+        names = sorted(pairs)
+        pair_combo.addItems(names)
+        if select in names:
+            pair_combo.setCurrentIndex(names.index(select))
+        else:
+            pair_combo.setCurrentIndex(-1)
+        pair_combo.blockSignals(False)
+        return pairs
+
+    def on_pair_save():
+        name = pair_name.text().strip()
+        if not name:
+            statusbar.showMessage(MSG_PAIR_NEEDS_NAME, 3000)
+            return
+        setup = {
+            "model_a": convo.sides["A"].model,
+            "model_b": convo.sides["B"].model,
+            "instruction_a": widgets["A"]["instr_edit"].toPlainText(),
+            "instruction_b": widgets["B"]["instr_edit"].toPlainText(),
+        }
+        save_pair(pairs_path(), name, setup)
+        refresh_pair_combo(select=name)
+        statusbar.showMessage("Pair '%s' saved." % name, 3000)
+
+    def on_pair_selected(index):
+        if index < 0:
+            return
+        name = pair_combo.currentText()
+        setup = load_pairs(pairs_path()).get(name)
+        if setup is None:
+            return
+        missing = []
+        for side, key in (("A", "model_a"), ("B", "model_b")):
+            model = setup.get(key)
+            if not model:
+                continue
+            picker = widgets[side]["picker"]
+            found = picker.findText(model)
+            if found >= 0:
+                picker.setCurrentIndex(found)
+            else:
+                missing.append(model)
+        widgets["A"]["instr_edit"].setPlainText(
+            setup.get("instruction_a") or "")
+        widgets["B"]["instr_edit"].setPlainText(
+            setup.get("instruction_b") or "")
+        if missing:
+            statusbar.showMessage(
+                "Pair '%s' loaded, but not installed: %s."
+                % (name, ", ".join(missing)), 5000)
+        else:
+            statusbar.showMessage("Pair '%s' loaded." % name, 3000)
+        refresh_buttons()
+
+    pair_save.clicked.connect(on_pair_save)
+    # Both signals: currentIndexChanged covers picking a different pair,
+    # activated covers re-picking the pair that is already selected
+    # (choosing the same item again fires no index change, but the user
+    # still expects the load). Loading twice is harmless -- it applies
+    # the same setup.
+    pair_combo.currentIndexChanged.connect(on_pair_selected)
+    pair_combo.activated.connect(on_pair_selected)
 
     # --- per-side buttons --------------------------------------------------
     def make_stop(side):
@@ -851,7 +1365,12 @@ def build_window(client=None):
         def clear():
             convo.sides[side].clear()
             widgets[side]["transcript"].clear()
+            refresh_history_list(side)
+            # A cleared side ends any compare offer: the pair is broken.
+            state["compare"] = {}
+            state["compare_round"] = False
             set_status(side, "Idle")
+            refresh_buttons()
         return clear
 
     for side in ("A", "B"):
@@ -927,8 +1446,19 @@ def build_window(client=None):
         "stop_edit": stop_edit, "agree_check": agree_check,
         "relay_status": relay_status,
         "do_start_relay": do_start_relay, "stop_relay": stop_relay,
+        "review_check": review_check, "review_frame": review_frame,
+        "review_label": review_label, "review_edit": review_edit,
+        "review_forward": review_forward,
+        "review_forward_edited": review_forward_edited,
+        "review_skip": review_skip, "review_stop": review_stop,
+        "pair_combo": pair_combo, "pair_name": pair_name,
+        "pair_save": pair_save, "refresh_pair_combo": refresh_pair_combo,
+        "use_this": use_this, "do_forward": do_forward,
+        "render_transcript": render_transcript,
+        "refresh_history_list": refresh_history_list,
     }
 
+    refresh_pair_combo()
     load_models()
     refresh_buttons()
     return window
