@@ -16,9 +16,17 @@ Item 3: director controls. Reorder or delete any message in a side's
   per-side instructions (system prompts) plus saved model pairs; and
   compare mode -- after Send to Both, pick the better reply and the
   conversation continues from it.
+Item 4: long-loop support. Each pane gets a Summarize button: that
+  side's own model summarizes the conversation so far, and the older
+  turns are replaced by that summary (kept as a visible "Summary of
+  earlier messages" entry) while the last 4 entries stay verbatim.
+  A budget nudge appears when a side's history passes ~12,000
+  characters -- it never calls the model on its own. And each pane
+  shows a stats line for the last completed turn: tokens/sec, time
+  to first token, total turn time, and the model's RAM from
+  Ollama /api/ps.
 
-NOT in Item 3 (later items): auto-summarize, speed readout, file
-upload, tasks, export, provider APIs.
+NOT in Item 4 (later items): file upload, tasks, export, provider APIs.
 """
 
 import json
@@ -28,6 +36,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 import urllib.error
 import urllib.request
 
@@ -52,6 +61,18 @@ AWARE_TEMPLATE = ("You are talking with another AI assistant (Model %s). "
 RELAY_CAP_MIN = 1
 RELAY_CAP_MAX = 50
 RELAY_CAP_DEFAULT = 10
+
+# Summarize (Item 4): when a side's history passes this many characters
+# the pane nudges the user to summarize. Summarizing keeps the last
+# SUMMARY_KEEP_LAST entries verbatim and replaces everything older
+# with one summary entry, written by that side's own model.
+HISTORY_BUDGET_CHARS = 12000
+SUMMARY_KEEP_LAST = 4
+SUMMARY_LABEL = "Summary of earlier messages"
+SUMMARIZE_PROMPT = (
+    "Summarize our conversation so far in a few short sentences, in "
+    "the third person, covering the main topics and any decisions. "
+    "Keep it brief -- it will replace the earlier messages as context.")
 
 # Compare mode: the picked reply is sent to the other side as a user
 # message with this prefix, so the conversation continues from it.
@@ -106,6 +127,72 @@ def parse_ollama_list_output(text):
     return sorted(names)
 
 
+def parse_ps_payload(payload):
+    """Parse an /api/ps JSON payload into {model name: size in bytes}."""
+    running = {}
+    for entry in payload.get("models", []) or []:
+        name = entry.get("name")
+        size = entry.get("size")
+        if name and isinstance(size, (int, float)):
+            running[name] = size
+    return running
+
+
+def compute_turn_stats(metrics):
+    """Turn metrics into display numbers.
+
+    metrics comes from the streamed done chunk plus client-side
+    timing: eval_count, eval_duration_ns, ttft_s, total_s. Anything
+    missing (or not a number) stays None and shows as "n/a" -- never
+    invented. tokens/sec is eval_count over eval_duration in seconds.
+    """
+    count = metrics.get("eval_count")
+    duration = metrics.get("eval_duration_ns")
+    tok_per_sec = None
+    if (isinstance(count, (int, float))
+            and isinstance(duration, (int, float)) and duration > 0):
+        tok_per_sec = count / (duration / 1_000_000_000)
+
+    def _num(value):
+        return value if isinstance(value, (int, float)) else None
+
+    return {"tok_per_sec": tok_per_sec,
+            "ttft_s": _num(metrics.get("ttft_s")),
+            "total_s": _num(metrics.get("total_s"))}
+
+
+def format_ram(size_bytes):
+    """A model size in bytes as "1.9 GB" or "512 MB"."""
+    if size_bytes >= 1_000_000_000:
+        return "%.1f GB" % (size_bytes / 1_000_000_000)
+    return "%d MB" % round(size_bytes / 1_000_000)
+
+
+STATS_EMPTY_LINE = "-- tok/s · first token -- · turn -- · RAM --"
+
+
+def format_stats_line(stats):
+    """One line for a pane's stats label.
+
+    stats is {"tok_per_sec": float|None, "ttft_s": float|None,
+    "total_s": float|None, "ram": str|None} -- "ram" is preformatted,
+    e.g. "1.9 GB in RAM" or "not loaded". None (before any turn) shows
+    dashes; a missing number shows "n/a".
+    """
+    if stats is None:
+        return STATS_EMPTY_LINE
+    tok = stats.get("tok_per_sec")
+    ttft = stats.get("ttft_s")
+    total = stats.get("total_s")
+    tok_text = ("%.1f tok/s" % tok) if tok is not None else "tok/s n/a"
+    ttft_text = (("first token %.2fs" % ttft) if ttft is not None
+                 else "first token n/a")
+    total_text = (("turn %.1fs" % total) if total is not None
+                  else "turn n/a")
+    ram_text = stats.get("ram") or "RAM n/a"
+    return "%s · %s · %s · %s" % (tok_text, ttft_text, total_text, ram_text)
+
+
 class OllamaClient:
     """Minimal Ollama client over localhost HTTP. Stdlib only."""
 
@@ -134,17 +221,24 @@ class OllamaClient:
         except Exception:
             raise OllamaError(MSG_OLLAMA_DOWN)
 
-    def chat_stream(self, model, messages, on_chunk, cancel_event, timeout=300):
+    def chat_stream(self, model, messages, on_chunk, cancel_event,
+                    timeout=300, on_metrics=None):
         """Stream one chat turn. Calls on_chunk(text) per delta.
 
         Returns the full reply text. Raises Cancelled if cancel_event is
         set, OllamaError with a plain message on failure.
+
+        on_metrics (optional) is called once at the end with the turn's
+        timing: eval_count and eval_duration_ns from the streamed done
+        chunk, plus client-side ttft_s (request start to first content
+        chunk) and total_s. Missing fields are None.
         """
         body = json.dumps(
             {"model": model, "messages": messages, "stream": True}).encode("utf-8")
         req = urllib.request.Request(
             self.base_url + "/api/chat", data=body,
             headers={"Content-Type": "application/json"}, method="POST")
+        started = time.monotonic()
         try:
             resp = urllib.request.urlopen(req, timeout=timeout)
         except urllib.error.HTTPError as exc:
@@ -158,6 +252,8 @@ class OllamaClient:
         except Exception:
             raise OllamaError(MSG_OLLAMA_DOWN)
         full = []
+        ttft = None
+        final = {}
         try:
             while True:
                 if cancel_event is not None and cancel_event.is_set():
@@ -176,15 +272,36 @@ class OllamaClient:
                     raise OllamaError(MSG_MODEL_FAILED)
                 content = (chunk.get("message") or {}).get("content", "")
                 if content:
+                    if ttft is None:
+                        ttft = time.monotonic() - started
                     full.append(content)
                     on_chunk(content)
                 if chunk.get("done"):
+                    final = chunk
                     break
         finally:
             resp.close()
         if cancel_event is not None and cancel_event.is_set():
             raise Cancelled()
+        if on_metrics is not None:
+            on_metrics({
+                "eval_count": final.get("eval_count"),
+                "eval_duration_ns": final.get("eval_duration"),
+                "total_duration_ns": final.get("total_duration"),
+                "prompt_eval_duration_ns": final.get("prompt_eval_duration"),
+                "ttft_s": ttft,
+                "total_s": time.monotonic() - started,
+            })
         return "".join(full)
+
+    def running_models(self, timeout=5):
+        """Models Ollama currently has loaded: {name: size in bytes}."""
+        try:
+            req = urllib.request.Request(self.base_url + "/api/ps")
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return parse_ps_payload(json.loads(resp.read().decode("utf-8")))
+        except Exception:
+            raise OllamaError(MSG_OLLAMA_DOWN)
 
 
 class ChatSide:
@@ -215,6 +332,32 @@ class ChatSide:
     def clear(self):
         self.history = []
         self.labels = []
+
+    def history_chars(self):
+        """Total characters across this side's history contents."""
+        return sum(len(m["content"]) for m in self.history)
+
+    def summarize(self, summary_text):
+        """Fold the older turns into one summary entry.
+
+        Keeps the last SUMMARY_KEEP_LAST entries verbatim; everything
+        older is replaced by a single user entry carrying the summary,
+        labelled SUMMARY_LABEL in the window. Returns False (and
+        changes nothing) when there is nothing older to fold or the
+        summary is empty.
+        """
+        if not summary_text.strip():
+            return False
+        if len(self.history) <= SUMMARY_KEEP_LAST:
+            return False
+        kept = self.history[-SUMMARY_KEEP_LAST:]
+        kept_labels = self.labels[-SUMMARY_KEEP_LAST:]
+        entry = {"role": "user",
+                 "content": "Earlier in this conversation: "
+                            + summary_text.strip()}
+        self.history = [entry] + kept
+        self.labels = [SUMMARY_LABEL] + kept_labels
+        return True
 
     def move_up(self, index):
         """Move entry ``index`` one slot earlier. No-op at the edges."""
@@ -618,6 +761,24 @@ def build_window(client=None):
         transcript.setPlaceholderText("No messages yet.")
         layout.addWidget(transcript, stretch=1)
 
+        # Stats line: the last completed turn's speed and RAM. Dashes
+        # until a turn has run.
+        stats = QtWidgets.QLabel(format_stats_line(None))
+        stats.setStyleSheet("font-size: 11px;")
+        layout.addWidget(stats)
+
+        # Summarize row: the nudge label appears when this side's
+        # history passes the budget; the button is always here.
+        summarize_row = QtWidgets.QHBoxLayout()
+        nudge = QtWidgets.QLabel("History is long — Summarize?")
+        nudge.setVisible(False)
+        summarize_row.addWidget(nudge)
+        summarize_btn = QtWidgets.QPushButton("Summarize")
+        summarize_btn.setEnabled(False)
+        summarize_row.addWidget(summarize_btn)
+        summarize_row.addStretch(1)
+        layout.addLayout(summarize_row)
+
         # History editor: reorder or delete any message. Hidden by
         # default; the model sees the edited order on the next turn.
         hist_frame = QtWidgets.QFrame()
@@ -664,6 +825,7 @@ def build_window(client=None):
             "hist_frame": hist_frame, "hist_list": hist_list,
             "hist_up": hist_up, "hist_down": hist_down,
             "hist_delete": hist_delete,
+            "stats": stats, "nudge": nudge, "summarize": summarize_btn,
             "reply_open": False,
         }
         return frame
@@ -771,7 +933,10 @@ def build_window(client=None):
              # Both round. Complete when both sides are present.
              "compare": {}, "compare_round": False,
              # Edit-before-forward: the hop waiting on a review, or None.
-             "pending_hop": None}
+             "pending_hop": None,
+             # Last completed turn's stats per side (None until a turn
+             # has run), and the side currently summarizing, if any.
+             "stats": {"A": None, "B": None}, "summarizing": None}
 
     # --- helpers ----------------------------------------------------------
     def scroll_to_end(transcript):
@@ -867,15 +1032,61 @@ def build_window(client=None):
                                   and side not in state["active"]
                                   and side not in state["queued"])
             w["use_this"].setEnabled(compare_ready)
+            # Summarize: idle only, a model picked, and something older
+            # to fold. While this side is summarizing the button says
+            # so (it is disabled by the busy check above).
+            summarizing = state.get("summarizing") == side
+            w["summarize"].setText(
+                "Summarizing..." if summarizing else "Summarize")
+            w["summarize"].setEnabled(
+                not busy and not relay_active
+                and convo.sides[side].model is not None
+                and len(convo.sides[side].history) > SUMMARY_KEEP_LAST)
+            # The nudge shows only when summarizing can actually help:
+            # over budget AND something older to fold. It never calls
+            # the model on its own -- it only shows or hides.
+            w["nudge"].setVisible(
+                len(convo.sides[side].history) > SUMMARY_KEEP_LAST
+                and convo.sides[side].history_chars()
+                > HISTORY_BUDGET_CHARS)
             refresh_history_buttons(side)
 
     def set_status(side, text):
         widgets[side]["status"].setText(text)
 
+    def refresh_stats_label(side):
+        widgets[side]["stats"].setText(
+            format_stats_line(state["stats"][side]))
+
     # --- runner wiring ----------------------------------------------------
-    def make_job_fn(side, model, messages):
+    job_stats = {}  # job id -> {"metrics": dict|None, "ram": str|None}
+
+    def _ram_text(model):
+        """'<size> in RAM' for a running model, 'not loaded' when it
+        isn't running, or None when the lookup itself failed (shown
+        as 'RAM n/a')."""
+        try:
+            running = client.running_models()
+        except Exception:
+            return None
+        if model in running:
+            return "%s in RAM" % format_ram(running[model])
+        return "not loaded"
+
+    def make_job_fn(job_id, model, messages, track_stats=True):
+        holder = {"metrics": None, "ram": None}
+        job_stats[job_id] = holder
+
         def fn(emit, cancel_event):
-            return client.chat_stream(model, messages, emit, cancel_event)
+            kwargs = {}
+            if track_stats:
+                kwargs["on_metrics"] = (
+                    lambda m: holder.update(metrics=m))
+            text = client.chat_stream(model, messages, emit, cancel_event,
+                                      **kwargs)
+            if track_stats:
+                holder["ram"] = _ram_text(model)
+            return text
         return fn
 
     def _emit(signal, *args):
@@ -897,8 +1108,28 @@ def build_window(client=None):
         on_idle=lambda: _emit(signals.idle),
     )
 
-    def on_started(side):
+    def _job_side(job_id):
+        """(side, is_summarize) for a runner job id.
+
+        Normal turns use the side as the job id ("A"/"B"); summarize
+        turns use "sum-A"/"sum-B".
+        """
+        if job_id.startswith("sum-"):
+            return job_id[4:], True
+        return job_id, False
+
+    def on_started(job_id):
         if not alive():
+            return
+        side, is_summary = _job_side(job_id)
+        if is_summary:
+            # A summarize turn streams nothing into the transcript: the
+            # summary lands as one entry when it finishes. The side is
+            # deliberately NOT added to active/queued -- the per-side
+            # Stop button cancels job id == side, which would poison
+            # the next real turn for this side.
+            set_status(side, "Summarizing...")
+            refresh_buttons()
             return
         state["queued"].discard(side)
         state["active"].add(side)
@@ -907,8 +1138,11 @@ def build_window(client=None):
         append_text(side, "%s: " % convo.sides[side].model)
         refresh_buttons()
 
-    def on_chunk(side, text):
+    def on_chunk(job_id, text):
         if not alive():
+            return
+        side, is_summary = _job_side(job_id)
+        if is_summary:
             return
         append_text(side, text)
 
@@ -998,14 +1232,43 @@ def build_window(client=None):
         forward_hop(session, hop["from_side"], text)
         refresh_buttons()
 
-    def on_done(side, text):
+    def finish_summarize(side, text):
+        """Apply a summarize turn: fold the older history into the
+        summary entry. An empty summary changes nothing."""
+        state["summarizing"] = None
+        set_status(side, "Idle")
+        if not text.strip():
+            statusbar.showMessage(
+                "Summarize came back empty — history unchanged.", 4000)
+            refresh_buttons()
+            return
+        if convo.sides[side].summarize(text):
+            render_transcript(side)
+            refresh_history_list(side)
+            statusbar.showMessage("History summarized.", 3000)
+        refresh_buttons()
+
+    def on_done(job_id, text):
         if not alive():
+            return
+        side, is_summary = _job_side(job_id)
+        if is_summary:
+            finish_summarize(side, text)
             return
         finish_reply(side)
         convo.sides[side].add_assistant(text)
         refresh_history_list(side)
         state["active"].discard(side)
         set_status(side, "Idle")
+        # Stats for this turn (every turn, relay turns included). A
+        # summarize turn never lands here, so it never overwrites the
+        # last real turn's stats.
+        holder = job_stats.pop(job_id, None)
+        if holder is not None:
+            stats = compute_turn_stats(holder.get("metrics") or {})
+            stats["ram"] = holder.get("ram")
+            state["stats"][side] = stats
+            refresh_stats_label(side)
         session = state.get("relay")
         if session is not None and session.active:
             session.turns_done += 1
@@ -1022,8 +1285,15 @@ def build_window(client=None):
             state["compare"][side] = text
         refresh_buttons()
 
-    def on_failed(side, message):
+    def on_failed(job_id, message):
         if not alive():
+            return
+        side, is_summary = _job_side(job_id)
+        if is_summary:
+            state["summarizing"] = None
+            append_text(side, "(Summarize failed: %s)\n" % message)
+            set_status(side, "Idle")
+            refresh_buttons()
             return
         finish_reply(side)
         append_text(side, "(%s)\n" % message)
@@ -1033,8 +1303,16 @@ def build_window(client=None):
             end_relay(message)
         refresh_buttons()
 
-    def on_cancelled(side):
+    def on_cancelled(job_id):
         if not alive():
+            return
+        side, is_summary = _job_side(job_id)
+        if is_summary:
+            # No button cancels a summarize turn, but stay safe if one
+            # ever does: the history is simply left as it was.
+            state["summarizing"] = None
+            set_status(side, "Idle")
+            refresh_buttons()
             return
         finish_reply(side)
         append_text(side, "(%s)\n" % MSG_STOPPED)
@@ -1095,6 +1373,34 @@ def build_window(client=None):
     send_a.clicked.connect(lambda: do_send("A"))
     send_b.clicked.connect(lambda: do_send("B"))
     send_both.clicked.connect(lambda: do_send("Both"))
+
+    # --- summarize --------------------------------------------------------
+    def do_summarize(side):
+        """Ask this side's own model to summarize its conversation,
+        then fold the older turns into the summary entry. One extra
+        model turn, run through the same one-at-a-time runner; the
+        summary request itself never enters the history."""
+        if state["busy"] or state.get("relay") is not None:
+            return
+        side_obj = convo.sides[side]
+        if side_obj.model is None:
+            statusbar.showMessage(
+                MSG_NO_MODEL.format(side="Model " + side), 4000)
+            return
+        if len(side_obj.history) <= SUMMARY_KEEP_LAST:
+            statusbar.showMessage("Nothing to summarize yet.", 3000)
+            return
+        state["busy"] = True
+        state["summarizing"] = side
+        # A summarize turn is not a compare round: the offer is spent.
+        state["compare"] = {}
+        state["compare_round"] = False
+        messages = side_obj.messages_for_model() + [
+            {"role": "user", "content": SUMMARIZE_PROMPT}]
+        set_status(side, "Summarizing...")
+        runner.submit("sum-" + side, make_job_fn(
+            "sum-" + side, side_obj.model, messages, track_stats=False))
+        refresh_buttons()
 
     # --- relay ------------------------------------------------------------
     def do_start_relay():
@@ -1361,6 +1667,11 @@ def build_window(client=None):
             runner.cancel(side)
         return stop
 
+    def make_summarize(side):
+        def summarize():
+            do_summarize(side)
+        return summarize
+
     def make_clear(side):
         def clear():
             convo.sides[side].clear()
@@ -1369,12 +1680,16 @@ def build_window(client=None):
             # A cleared side ends any compare offer: the pair is broken.
             state["compare"] = {}
             state["compare_round"] = False
+            # ...and its last turn's stats no longer describe anything.
+            state["stats"][side] = None
+            refresh_stats_label(side)
             set_status(side, "Idle")
             refresh_buttons()
         return clear
 
     for side in ("A", "B"):
         widgets[side]["stop"].clicked.connect(make_stop(side))
+        widgets[side]["summarize"].clicked.connect(make_summarize(side))
         widgets[side]["clear"].clicked.connect(make_clear(side))
 
     # --- model pickers -----------------------------------------------------
@@ -1383,6 +1698,9 @@ def build_window(client=None):
             picker = widgets[side]["picker"]
             convo.sides[side].model = (
                 picker.currentText() if index >= 0 else None)
+            # A different model makes the last turn's stats stale.
+            state["stats"][side] = None
+            refresh_stats_label(side)
             refresh_buttons()
         return changed
 
@@ -1456,6 +1774,7 @@ def build_window(client=None):
         "use_this": use_this, "do_forward": do_forward,
         "render_transcript": render_transcript,
         "refresh_history_list": refresh_history_list,
+        "do_summarize": do_summarize, "refresh_buttons": refresh_buttons,
     }
 
     refresh_pair_combo()

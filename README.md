@@ -8,10 +8,11 @@ Or start a relay: type a seed message, press Start Relay, and the two
 models talk to each other — each reply is handed to the other model,
 one turn at a time, until the turn cap or a stop condition.
 
-This is Item 3 of the project: the shell, the model pickers,
-send-to-A/B/both, the auto-relay loop, and the director controls
+This is Item 4 of the project: the shell, the model pickers,
+send-to-A/B/both, the auto-relay loop, the director controls
 (history editing, hop review, instructions, saved pairs, compare
-mode). Files, tasks, and the rest come later.
+mode), and long-loop support (summarize, budget nudge, per-turn
+speed and RAM readout). Files, tasks, and the rest come later.
 
 ## What you need
 
@@ -87,6 +88,22 @@ bash run.sh
   it and that reply is sent to the other side ("You picked this
   answer: ...") so the conversation continues from the better answer.
   The picked reply is marked in its pane.
+
+## Long loops
+
+- Summarize: each pane has a Summarize button. It asks that side's
+  own model to summarize the conversation so far, then replaces the
+  older turns with that summary — kept as a visible "Summary of
+  earlier messages" entry — while the last 4 messages stay verbatim.
+  It is one extra model turn, so it takes a while on a CPU.
+- Budget nudge: when a side's history passes about 12,000 characters,
+  the pane shows "History is long — Summarize?" next to the button.
+  The nudge never calls the model on its own — you decide.
+- Stats: under each pane, the last completed turn's speed — tokens
+  per second, time to first token, total turn time — plus the model's
+  RAM from Ollama ("1.9 GB in RAM", or "not loaded" when it isn't
+  running). Dashes until a turn has run; "n/a" when Ollama doesn't
+  report a number.
 
 ## Tests
 

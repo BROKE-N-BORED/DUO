@@ -1,4 +1,4 @@
-"""Tests for DUO Items 1-3. No real Ollama needed: a fake Ollama HTTP
+"""Tests for DUO Items 1-4. No real Ollama needed: a fake Ollama HTTP
 server (and a fake client for the GUI tests) stands in for the real one.
 
 Run from the project root:  python3 -m unittest discover -s tests -v
@@ -18,9 +18,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from dual_chat import (  # noqa: E402
     AGREEMENT_PHRASES, AWARE_TEMPLATE, COMPARE_PREFIX, Cancelled, ChatSide,
-    Conversation, NoModelSelected, OllamaClient, OllamaError, RelaySession,
-    SerialRunner, load_pairs, pairs_path, parse_ollama_list_output,
-    parse_stop_phrases, parse_tags_payload, save_pair,
+    Conversation, HISTORY_BUDGET_CHARS, NoModelSelected, OllamaClient,
+    OllamaError, RelaySession, SUMMARY_KEEP_LAST, SUMMARY_LABEL,
+    SUMMARIZE_PROMPT, SerialRunner, compute_turn_stats, format_ram,
+    format_stats_line, load_pairs, pairs_path, parse_ollama_list_output,
+    parse_ps_payload, parse_stop_phrases, parse_tags_payload, save_pair,
 )
 
 
@@ -51,6 +53,11 @@ class FakeOllamaHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/api/tags":
             self._send_json({"models": [{"name": n} for n in self.models]})
+        elif self.path == "/api/ps":
+            self._send_json({"models": [
+                {"name": "fake-a:latest", "size": 1900000000},
+                {"name": "fake-b:latest", "size": 1500000000},
+            ]})
         else:
             self._send_json({"error": "not found"}, status=404)
 
@@ -78,7 +85,11 @@ class FakeOllamaHandler(BaseHTTPRequestHandler):
                 time.sleep(0.01)
             self.wfile.write(
                 json.dumps({"message": {"role": "assistant", "content": ""},
-                            "done": True, "done_reason": "stop"}
+                            "done": True, "done_reason": "stop",
+                            "eval_count": 20,
+                            "eval_duration": 1000000000,
+                            "prompt_eval_duration": 200000000,
+                            "total_duration": 1500000000}
                            ).encode("utf-8") + b"\n")
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
@@ -409,6 +420,37 @@ class OllamaClientTests(unittest.TestCase):
                 lambda t: None, threading.Event())
         self.assertIn("isn't running", str(ctx.exception))
 
+    def test_chat_stream_reports_metrics(self):
+        client = OllamaClient(self.url)
+        seen = {}
+        full = client.chat_stream(
+            "fake-a:latest", [{"role": "user", "content": "hi"}],
+            lambda t: None, threading.Event(),
+            on_metrics=seen.update)
+        self.assertEqual(full, "Hello from A.")
+        # The done chunk's timing fields, exactly as the server sent them.
+        self.assertEqual(seen["eval_count"], 20)
+        self.assertEqual(seen["eval_duration_ns"], 1000000000)
+        self.assertEqual(seen["prompt_eval_duration_ns"], 200000000)
+        self.assertEqual(seen["total_duration_ns"], 1500000000)
+        # Client-side timing is measured, not canned: present, sane.
+        self.assertIsNotNone(seen["ttft_s"])
+        self.assertGreaterEqual(seen["ttft_s"], 0)
+        self.assertIsNotNone(seen["total_s"])
+        self.assertGreaterEqual(seen["total_s"], seen["ttft_s"])
+
+    def test_running_models(self):
+        client = OllamaClient(self.url)
+        self.assertEqual(client.running_models(),
+                         {"fake-a:latest": 1900000000,
+                          "fake-b:latest": 1500000000})
+
+    def test_running_models_down_plain_error(self):
+        client = OllamaClient("http://127.0.0.1:9")  # nothing listens here
+        with self.assertRaises(OllamaError) as ctx:
+            client.running_models()
+        self.assertIn("isn't running", str(ctx.exception))
+
 
 # ---------------------------------------------------------------------------
 # GUI tests (offscreen)
@@ -421,14 +463,23 @@ class FakeGuiClient:
     order (the last one repeats). ``messages_seen`` records every messages
     list the app sent, deep-copied, so relay tests can assert the exact
     text each model received. ``max_active`` proves generations never
-    overlap. Call reset() between tests.
+    overlap. ``metrics`` maps a model to canned timing values reported
+    through on_metrics (a default set is used when a model has none);
+    ``ps`` maps a model name to its canned size in bytes for
+    running_models ({} means nothing is loaded). Call reset() between
+    tests.
     """
+
+    DEFAULT_METRICS = {"eval_count": 10, "eval_duration_ns": 500000000,
+                       "ttft_s": 0.25, "total_s": 0.75}
 
     def __init__(self):
         self.calls = []
         self.messages_seen = []
         self.replies = {}
         self.reply_index = {}
+        self.metrics = {}
+        self.ps = {}
         self.max_active = 0
         self._active = 0
         self.delay = 0.02  # seconds slept per word (raise to slow a turn)
@@ -440,6 +491,8 @@ class FakeGuiClient:
             self.messages_seen.clear()
             self.replies.clear()
             self.reply_index.clear()
+            self.metrics.clear()
+            self.ps.clear()
             self.max_active = 0
             self._active = 0
             self.delay = 0.02
@@ -447,7 +500,11 @@ class FakeGuiClient:
     def list_models(self, timeout=5):
         return ["fake-a:latest", "fake-b:latest"]
 
-    def chat_stream(self, model, messages, on_chunk, cancel_event, timeout=300):
+    def running_models(self, timeout=5):
+        return dict(self.ps)
+
+    def chat_stream(self, model, messages, on_chunk, cancel_event,
+                    timeout=300, on_metrics=None):
         with self.lock:
             self.calls.append(model)
             self.messages_seen.append((model, copy.deepcopy(messages)))
@@ -469,6 +526,8 @@ class FakeGuiClient:
         finally:
             with self.lock:
                 self._active -= 1
+        if on_metrics is not None:
+            on_metrics(dict(self.metrics.get(model, self.DEFAULT_METRICS)))
         return text
 
 
@@ -949,6 +1008,145 @@ class ChatSideEditTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Summarize: fold older turns into one summary entry (pure, no Qt)
+# ---------------------------------------------------------------------------
+
+class SummarizeTests(unittest.TestCase):
+    def _side_with_six(self):
+        side = ChatSide("A")
+        side.model = "fake-a:latest"
+        side.add_user("first")
+        side.add_assistant("alpha one")
+        side.add_user("second")
+        side.add_assistant("alpha two")
+        side.add_user("third")
+        side.add_assistant("alpha three")
+        return side
+
+    def test_summarize_keeps_last_four_verbatim(self):
+        side = self._side_with_six()
+        self.assertTrue(side.summarize("They talked about fruit."))
+        self.assertEqual(
+            [m["content"] for m in side.history],
+            ["Earlier in this conversation: They talked about fruit.",
+             "second", "alpha two", "third", "alpha three"])
+        self.assertEqual(side.labels, [
+            SUMMARY_LABEL, "You", "fake-a:latest", "You", "fake-a:latest"])
+        self.assertEqual(side.history[0]["role"], "user")
+        self.assertEqual(SUMMARY_KEEP_LAST, 4)
+
+    def test_summarize_short_history_is_noop(self):
+        side = ChatSide("A")
+        side.add_user("hi")
+        side.add_assistant("hello")
+        self.assertFalse(side.summarize("whatever"))
+        self.assertEqual(len(side.history), 2)
+        # Exactly 4 entries: nothing older to fold.
+        side.add_user("again")
+        side.add_assistant("yep")
+        self.assertFalse(side.summarize("whatever"))
+        self.assertEqual(len(side.history), 4)
+
+    def test_summarize_five_entries_folds_one(self):
+        side = self._side_with_six()
+        side.delete_at(0)
+        self.assertEqual(len(side.history), 5)
+        self.assertTrue(side.summarize("Summary."))
+        self.assertEqual(
+            [m["content"] for m in side.history],
+            ["Earlier in this conversation: Summary.",
+             "second", "alpha two", "third", "alpha three"])
+
+    def test_summarize_empty_summary_is_noop(self):
+        side = self._side_with_six()
+        self.assertFalse(side.summarize("   "))
+        self.assertEqual(len(side.history), 6)
+
+    def test_second_summarize_folds_the_first(self):
+        side = self._side_with_six()
+        side.summarize("First summary.")
+        side.add_user("fourth")
+        side.add_assistant("alpha four")
+        self.assertEqual(len(side.history), 7)
+        self.assertTrue(side.summarize("Second summary."))
+        self.assertEqual(
+            [m["content"] for m in side.history],
+            ["Earlier in this conversation: Second summary.",
+             "third", "alpha three", "fourth", "alpha four"])
+        # One summary entry, not two: the old one was folded in.
+        self.assertEqual(side.labels.count(SUMMARY_LABEL), 1)
+
+    def test_history_chars_sums_contents(self):
+        side = ChatSide("A")
+        self.assertEqual(side.history_chars(), 0)
+        side.add_user("abc")
+        side.add_assistant("de")
+        self.assertEqual(side.history_chars(), 5)
+
+    def test_budget_constant(self):
+        self.assertEqual(HISTORY_BUDGET_CHARS, 12000)
+
+
+# ---------------------------------------------------------------------------
+# Turn stats: math, formatting, /api/ps parsing (pure, no Qt)
+# ---------------------------------------------------------------------------
+
+class StatsMathTests(unittest.TestCase):
+    def test_compute_tok_per_sec_exact(self):
+        stats = compute_turn_stats({
+            "eval_count": 40, "eval_duration_ns": 2000000000,
+            "ttft_s": 0.5, "total_s": 2.5})
+        self.assertEqual(stats, {"tok_per_sec": 20.0,
+                                 "ttft_s": 0.5, "total_s": 2.5})
+
+    def test_compute_missing_fields_are_none(self):
+        self.assertEqual(compute_turn_stats({}),
+                         {"tok_per_sec": None, "ttft_s": None,
+                          "total_s": None})
+        # Zero duration: no division, no invented speed.
+        self.assertIsNone(compute_turn_stats(
+            {"eval_count": 40, "eval_duration_ns": 0})["tok_per_sec"])
+        self.assertIsNone(compute_turn_stats(
+            {"eval_count": 40})["tok_per_sec"])
+        self.assertIsNone(compute_turn_stats(
+            {"eval_duration_ns": 1000})["tok_per_sec"])
+        self.assertIsNone(compute_turn_stats(
+            {"ttft_s": "fast"})["ttft_s"])
+
+    def test_format_stats_line_exact(self):
+        self.assertEqual(format_stats_line(None),
+                         "-- tok/s · first token -- · turn -- · RAM --")
+        self.assertEqual(format_stats_line({
+            "tok_per_sec": 20.0, "ttft_s": 0.5, "total_s": 2.5,
+            "ram": "1.9 GB in RAM"}),
+            "20.0 tok/s · first token 0.50s · turn 2.5s · 1.9 GB in RAM")
+        self.assertEqual(format_stats_line({
+            "tok_per_sec": None, "ttft_s": None, "total_s": None,
+            "ram": "not loaded"}),
+            "tok/s n/a · first token n/a · turn n/a · not loaded")
+        self.assertEqual(format_stats_line({
+            "tok_per_sec": 12.345, "ttft_s": 1.0, "total_s": 10.0,
+            "ram": None}),
+            "12.3 tok/s · first token 1.00s · turn 10.0s · RAM n/a")
+
+    def test_parse_ps_payload(self):
+        self.assertEqual(parse_ps_payload(
+            {"models": [{"name": "a:2b", "size": 1900000000},
+                        {"name": "b:2b", "size": 512000000}]}),
+            {"a:2b": 1900000000, "b:2b": 512000000})
+        self.assertEqual(parse_ps_payload({}), {})
+        self.assertEqual(parse_ps_payload({"models": []}), {})
+        self.assertEqual(parse_ps_payload({"models": [{"name": "a:2b"}]}), {})
+        self.assertEqual(parse_ps_payload({"models": [{"size": 5}]}), {})
+
+    def test_format_ram(self):
+        self.assertEqual(format_ram(1900000000), "1.9 GB")
+        self.assertEqual(format_ram(1500000000), "1.5 GB")
+        self.assertEqual(format_ram(512000000), "512 MB")
+        self.assertEqual(format_ram(1000000000), "1.0 GB")
+
+
+# ---------------------------------------------------------------------------
 # Saved pairs: JSON file round-trip (pure, no Qt)
 # ---------------------------------------------------------------------------
 
@@ -1387,6 +1585,302 @@ class DirectorGuiTests(unittest.TestCase):
         self.assertFalse(use_a.isEnabled())
         self.assertFalse(
             self.state["widgets"]["B"]["use_this"].isEnabled())
+
+
+# ---------------------------------------------------------------------------
+# Item 4 GUI tests: summarize, budget nudge, turn stats (offscreen)
+# ---------------------------------------------------------------------------
+
+@unittest.skipUnless(os.environ.get("DUAL_CHAT_GUI_TESTS") == "1",
+                     "GUI tests run with DUAL_CHAT_GUI_TESTS=1")
+class Item4GuiTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        from PySide6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+        cls.client = FakeGuiClient()
+
+    def setUp(self):
+        from dual_chat import build_window
+        self.client.reset()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.pairs_file = os.path.join(self.tmp.name, "duo-pairs.json")
+        self._env = mock.patch.dict(
+            os.environ, {"DUAL_CHAT_PAIRS_FILE": self.pairs_file})
+        self._env.start()
+        self.window = build_window(self.client)
+        self.window.show()
+        self.state = self.window._dual_chat
+        self._wait_for(lambda: self.state["widgets"]["A"]["picker"].count() == 2)
+        self._pick_models()
+
+    def tearDown(self):
+        self.window.close()
+        self._env.stop()
+        self.tmp.cleanup()
+
+    def _wait_for(self, cond, timeout=10.0):
+        from PySide6.QtTest import QTest
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            QTest.qWait(50)
+            if cond():
+                return True
+        return cond()
+
+    def _pick_models(self):
+        self.state["widgets"]["A"]["picker"].setCurrentIndex(0)
+        self.state["widgets"]["B"]["picker"].setCurrentIndex(1)
+        self.app.processEvents()
+
+    def _transcript(self, side):
+        return self.state["widgets"][side]["transcript"].toPlainText()
+
+    def _stats(self, side):
+        return self.state["widgets"][side]["stats"].text()
+
+    def _send_to_a_and_wait(self, text):
+        self.state["composer"].setPlainText(text)
+        self.state["send_a"].click()
+        return self._wait_for(lambda: (
+            len(self.state["convo"].sides["A"].history) >= 2
+            and not self.state["state"]["busy"]), timeout=15)
+
+    def _last_messages_for(self, model):
+        for seen_model, messages in reversed(self.client.messages_seen):
+            if seen_model == model:
+                return messages
+        return None
+
+    def _start_relay(self, seed, cap=10):
+        self.state["start_picker"].setCurrentIndex(0)
+        self.state["cap_spin"].setValue(cap)
+        self.state["mode_picker"].setCurrentIndex(0)  # Blind
+        self.state["composer"].setPlainText(seed)
+        self.app.processEvents()
+        self.state["relay_btn"].click()
+
+    def _wait_for_relay_stopped(self, timeout=15.0):
+        return self._wait_for(lambda: self.state["relay_status"].text()
+                              .startswith("Relay stopped"), timeout=timeout)
+
+    def _three_exchanges(self):
+        self.client.replies = {"fake-a:latest": [
+            "alpha one", "alpha two", "alpha three"]}
+        self.assertTrue(self._send_to_a_and_wait("first message"))
+        self.assertTrue(self._send_to_a_and_wait("second message"))
+        self.assertTrue(self._send_to_a_and_wait("third message"))
+        self.assertEqual(len(self.state["convo"].sides["A"].history), 6)
+
+    def test_stats_show_dashes_before_any_turn(self):
+        dashes = "-- tok/s · first token -- · turn -- · RAM --"
+        self.assertEqual(self._stats("A"), dashes)
+        self.assertEqual(self._stats("B"), dashes)
+
+    def test_stats_after_turn_show_exact_canned_values(self):
+        self.client.metrics = {"fake-a:latest": {
+            "eval_count": 40, "eval_duration_ns": 2000000000,
+            "ttft_s": 0.5, "total_s": 2.5}}
+        self.client.ps = {"fake-a:latest": 1900000000}
+        self.assertTrue(self._send_to_a_and_wait("Hello"))
+        self.assertEqual(
+            self._stats("A"),
+            "20.0 tok/s · first token 0.50s · turn 2.5s · 1.9 GB in RAM")
+        # B hasn't run: still dashes.
+        self.assertEqual(
+            self._stats("B"),
+            "-- tok/s · first token -- · turn -- · RAM --")
+
+    def test_stats_ram_not_loaded(self):
+        self.client.ps = {}  # nothing running
+        self.assertTrue(self._send_to_a_and_wait("Hello"))
+        self.assertIn("not loaded", self._stats("A"))
+
+    def test_stats_na_when_timing_absent(self):
+        self.client.metrics = {"fake-a:latest": {}}  # no timing fields
+        self.client.ps = {}
+        self.assertTrue(self._send_to_a_and_wait("Hello"))
+        self.assertEqual(
+            self._stats("A"),
+            "tok/s n/a · first token n/a · turn n/a · not loaded")
+
+    def test_stats_update_after_relay_turns(self):
+        self.client.replies = {"fake-a:latest": ["apple pie"],
+                               "fake-b:latest": ["banana split"]}
+        self.client.metrics = {
+            "fake-a:latest": {"eval_count": 10,
+                              "eval_duration_ns": 1000000000,
+                              "ttft_s": 0.1, "total_s": 1.0},
+            "fake-b:latest": {"eval_count": 30,
+                              "eval_duration_ns": 1000000000,
+                              "ttft_s": 0.2, "total_s": 1.5}}
+        self.client.ps = {"fake-a:latest": 1900000000,
+                          "fake-b:latest": 1500000000}
+        self._start_relay("Talk about fruit.", cap=2)
+        self.assertTrue(self._wait_for_relay_stopped())
+        self.assertEqual(
+            self._stats("A"),
+            "10.0 tok/s · first token 0.10s · turn 1.0s · 1.9 GB in RAM")
+        self.assertEqual(
+            self._stats("B"),
+            "30.0 tok/s · first token 0.20s · turn 1.5s · 1.5 GB in RAM")
+
+    def test_stats_reset_when_side_cleared(self):
+        self.assertTrue(self._send_to_a_and_wait("Hello"))
+        self.assertNotEqual(
+            self._stats("A"),
+            "-- tok/s · first token -- · turn -- · RAM --")
+        self.state["widgets"]["A"]["clear"].click()
+        self.assertEqual(
+            self._stats("A"),
+            "-- tok/s · first token -- · turn -- · RAM --")
+
+    def test_summarize_replaces_older_turns(self):
+        self.client.replies = {"fake-a:latest": [
+            "alpha one", "alpha two", "alpha three",
+            "They discussed fruit and picked apple pie."]}
+        self.assertTrue(self._send_to_a_and_wait("first message"))
+        self.assertTrue(self._send_to_a_and_wait("second message"))
+        self.assertTrue(self._send_to_a_and_wait("third message"))
+        convo = self.state["convo"]
+        self.assertEqual(len(convo.sides["A"].history), 6)
+        summarize_btn = self.state["widgets"]["A"]["summarize"]
+        self.assertTrue(summarize_btn.isEnabled())
+        summarize_btn.click()
+        ok = self._wait_for(lambda: (
+            len(convo.sides["A"].history) == 5
+            and convo.sides["A"].labels[0] == SUMMARY_LABEL
+            and not self.state["state"]["busy"]), timeout=15)
+        self.assertTrue(ok, "history should fold into summary + last 4")
+        self.assertEqual(
+            [m["content"] for m in convo.sides["A"].history],
+            ["Earlier in this conversation: "
+             "They discussed fruit and picked apple pie.",
+             "second message", "alpha two",
+             "third message", "alpha three"])
+        # The summary entry is visible in his window.
+        self.assertIn("Summary of earlier messages", self._transcript("A"))
+        self.assertIn("They discussed fruit", self._transcript("A"))
+        # The summarize turn asked for a summary of the full history --
+        # and the request itself never entered the history.
+        model, summary_call = self.client.messages_seen[3]
+        self.assertEqual(model, "fake-a:latest")
+        self.assertEqual(len(summary_call), 7)
+        self.assertEqual(summary_call[-1],
+                         {"role": "user", "content": SUMMARIZE_PROMPT})
+        # The next turn sends the summary + last 4, exactly.
+        self.assertTrue(self._send_to_a_and_wait("fourth message"))
+        self.assertEqual(self._last_messages_for("fake-a:latest"), [
+            {"role": "user", "content":
+             "Earlier in this conversation: "
+             "They discussed fruit and picked apple pie."},
+            {"role": "user", "content": "second message"},
+            {"role": "assistant", "content": "alpha two"},
+            {"role": "user", "content": "third message"},
+            {"role": "assistant", "content": "alpha three"},
+            {"role": "user", "content": "fourth message"},
+        ])
+
+    def test_summarize_button_disabled_with_short_history(self):
+        btn = self.state["widgets"]["A"]["summarize"]
+        self.assertFalse(btn.isEnabled())  # no history at all
+        self.assertTrue(self._send_to_a_and_wait("hello"))
+        self.assertFalse(btn.isEnabled())  # one exchange: nothing to fold
+
+    def test_nudge_appears_past_budget_and_calls_nothing(self):
+        side = self.state["convo"].sides["A"]
+        self.assertFalse(self.state["widgets"]["A"]["nudge"].isVisible())
+        side.add_user("x" * 13000)
+        side.add_assistant("short")
+        side.add_user("a")
+        side.add_assistant("b")
+        side.add_user("c")
+        side.add_assistant("d")
+        self.assertGreater(side.history_chars(), HISTORY_BUDGET_CHARS)
+        self.state["refresh_buttons"]()
+        self.assertTrue(self.state["widgets"]["A"]["nudge"].isVisible())
+        self.assertIn("History is long",
+                      self.state["widgets"]["A"]["nudge"].text())
+        # The nudge never calls the model on its own.
+        self.assertEqual(self.client.calls, [])
+        self.assertEqual(self.client.messages_seen, [])
+
+    def test_nudge_clears_after_summarize(self):
+        side = self.state["convo"].sides["A"]
+        side.add_user("x" * 13000)
+        side.add_assistant("short")
+        side.add_user("a")
+        side.add_assistant("b")
+        side.add_user("c")
+        side.add_assistant("d")
+        self.state["refresh_buttons"]()
+        self.assertTrue(self.state["widgets"]["A"]["nudge"].isVisible())
+        self.client.replies = {"fake-a:latest": ["A long ramble."]}
+        self.state["widgets"]["A"]["summarize"].click()
+        ok = self._wait_for(lambda: (
+            len(side.history) == 5
+            and not self.state["state"]["busy"]), timeout=15)
+        self.assertTrue(ok, "summarize should fold the long history")
+        self.assertLess(side.history_chars(), HISTORY_BUDGET_CHARS)
+        self.assertFalse(self.state["widgets"]["A"]["nudge"].isVisible())
+
+    def test_summarize_disabled_mid_generation(self):
+        self._three_exchanges()
+        btn = self.state["widgets"]["A"]["summarize"]
+        self.assertTrue(btn.isEnabled())
+        self.client.delay = 0.5
+        self.client.replies = {"fake-a:latest": ["one two three four five"]}
+        self.state["composer"].setPlainText("slow one")
+        self.state["send_a"].click()
+        self.assertTrue(self._wait_for(
+            lambda: self.state["state"]["busy"], timeout=5))
+        self.assertFalse(btn.isEnabled())
+        self.assertFalse(
+            self.state["widgets"]["B"]["summarize"].isEnabled())
+        self.assertTrue(self._wait_for(
+            lambda: not self.state["state"]["busy"], timeout=15))
+        self.assertTrue(btn.isEnabled())
+
+    def test_summarize_button_shows_working_state(self):
+        self.client.replies = {"fake-a:latest": [
+            "alpha one", "alpha two", "alpha three",
+            " ".join(["word"] * 20)]}
+        self.assertTrue(self._send_to_a_and_wait("first"))
+        self.assertTrue(self._send_to_a_and_wait("second"))
+        self.assertTrue(self._send_to_a_and_wait("third"))
+        self.client.delay = 0.3
+        btn = self.state["widgets"]["A"]["summarize"]
+        self.assertTrue(btn.isEnabled())
+        btn.click()
+        self.assertTrue(self._wait_for(
+            lambda: btn.text() == "Summarizing...", timeout=5))
+        self.assertFalse(btn.isEnabled())
+        self.assertTrue(self._wait_for(
+            lambda: not self.state["state"]["busy"], timeout=15))
+        self.assertEqual(btn.text(), "Summarize")
+        self.assertTrue(btn.isEnabled())
+
+    def test_summarize_disabled_mid_relay(self):
+        self._three_exchanges()
+        btn = self.state["widgets"]["A"]["summarize"]
+        self.assertTrue(btn.isEnabled())
+        self.client.replies = {"fake-a:latest": [" ".join(["word"] * 100)],
+                               "fake-b:latest": ["short"]}
+        self._start_relay("Go on.", cap=10)
+        self.assertTrue(self._wait_for(
+            lambda: self.state["state"].get("relay") is not None,
+            timeout=5))
+        self.assertFalse(btn.isEnabled())
+        self.assertFalse(
+            self.state["widgets"]["B"]["summarize"].isEnabled())
+        self.state["relay_btn"].click()
+        self.assertTrue(self._wait_for_relay_stopped())
+        # The status flips to "stopped" before the cancelled job's
+        # idle signal clears busy; wait for idle, then the button
+        # must be back.
+        self.assertTrue(self._wait_for(
+            lambda: not self.state["state"]["busy"], timeout=10))
+        self.assertTrue(btn.isEnabled())
 
 
 if __name__ == "__main__":
