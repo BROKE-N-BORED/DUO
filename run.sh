@@ -1,5 +1,5 @@
 #!/bin/bash
-# Dual Chat - start the app.
+# DUO - start the app.
 # Run with: bash run.sh
 cd "$(dirname "$0")"
 if [ -x .venv/bin/python ]; then

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build the Dual Chat zip with correct stored file modes.
+"""Build the DUO zip with correct stored file modes.
 
 GUI extractors drop the execute bit unless external_attr carries the
 regular-file type bits: 0o100755 for scripts, 0o100644 for plain files.
@@ -8,7 +8,7 @@ import os
 import zipfile
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
-OUT = os.path.join(os.path.dirname(ROOT), "dual-chat-v0.1.zip")
+OUT = os.path.join(os.path.dirname(ROOT), "duo-v0.2.zip")
 
 FILES = {
     "dual_chat.py": 0o100644,
@@ -24,7 +24,7 @@ def main():
     with zipfile.ZipFile(OUT, "w", zipfile.ZIP_DEFLATED) as zf:
         for rel, mode in FILES.items():
             path = os.path.join(ROOT, rel)
-            info = zipfile.ZipInfo("dual-chat/" + rel)
+            info = zipfile.ZipInfo("duo/" + rel)
             info.external_attr = mode << 16
             with open(path, "rb") as fh:
                 zf.writestr(info, fh.read())

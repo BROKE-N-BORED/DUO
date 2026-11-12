@@ -1,11 +1,16 @@
-# Dual Chat
+# DUO
 
 Two Ollama models side by side in one desktop window. Pick a model for
 the left pane and one for the right, type a message, and send it to A,
 to B, or to both at once. Each side keeps its own conversation.
 
-This is Item 1 of the project: the shell, the model pickers, and
-send-to-A/B/both. Auto-relay, files, tasks, and the rest come later.
+Or start a relay: type a seed message, press Start Relay, and the two
+models talk to each other — each reply is handed to the other model,
+one turn at a time, until the turn cap or a stop condition.
+
+This is Item 2 of the project: the shell, the model pickers,
+send-to-A/B/both, and the auto-relay loop. Files, tasks, and the rest
+come later.
 
 ## What you need
 
@@ -41,6 +46,23 @@ bash run.sh
 - Stop ends the turn in progress on that side. Clear wipes that side's
   conversation. Conversations are not saved between runs yet.
 - If Ollama isn't running, the pane says so in plain words.
+
+## Relay
+
+- Pick a model on both sides, type a seed message, choose which side
+  starts, and press Start Relay. The seed goes to the starting side;
+  its reply goes to the other side; that reply comes back — one model
+  generating at a time, so the PC never runs two models at once.
+- Turns caps the relay at that many replies (default 10, up to 50).
+  Stop Relay ends it whenever you want.
+- Blind (default): each model gets the bare reply text as a plain
+  message, so it thinks it's talking to a person. Aware: the reply is
+  framed so the models know they're talking to another AI.
+- Stop on ends the relay when a reply contains one of your words or
+  phrases (separated by commas). Stop on agreement ends it when a
+  reply says something like "sounds good" or "I agree".
+- Relayed messages carry a [relay] tag in the window so you can always
+  tell what was relayed. The models never see the tag.
 
 ## Tests
 

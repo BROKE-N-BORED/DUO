@@ -1,5 +1,5 @@
 #!/bin/bash
-# Dual Chat - one-time install.
+# DUO - one-time install.
 # Creates a private folder (.venv) with PySide6-Essentials, the only
 # package the app needs. No sudo, nothing installed system-wide.
 # Run with: bash install.sh
@@ -13,7 +13,7 @@ fi
 
 # Python 3.10 or newer.
 if ! python3 -c "import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)"; then
-  echo "Dual Chat needs Python 3.10 or newer."
+  echo "DUO needs Python 3.10 or newer."
   python3 --version
   exit 1
 fi

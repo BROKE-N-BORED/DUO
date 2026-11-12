@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
-"""Dual Chat (Item 1) - two Ollama models side by side in one desktop window.
+"""DUO (Item 2) - two Ollama models side by side in one desktop window.
 
-Item 1 scope only:
-  * One native Qt window, Model A on the left, Model B on the right.
-  * A model picker above each pane (Ollama localhost, nothing selected
-    by default). Send is disabled for a side until a model is picked there.
-  * One composer at the bottom with Send to A / Send to B / Send to Both.
-  * Each side keeps its own separate conversation history.
-  * ONE generation at a time across the whole app (Send to Both runs A
-    first, then B) so two models never thrash the PC's RAM at once.
-  * Per-side Stop and Clear buttons. Plain-language errors, no tracebacks.
+Item 1: the shell, the model pickers, and send-to-A/B/both.
+Item 2: the auto-relay AI-to-AI loop. The user types a seed message, picks
+  the starting side, and presses Start Relay. Each reply is handed to the
+  other model, one generation at a time, until the turn cap, the Stop
+  button, or a stop condition. Blind mode (default) delivers the bare
+  reply text as a plain user message, so each model sees only a person
+  talking to it. Aware mode frames the relay so the models know they are
+  talking to another AI. Relayed hops are tagged in the window's
+  transcripts only -- the models never see the tag.
 
-NOT in Item 1 (later items): auto-relay, reorder, edit-before-forward,
-file upload, tasks, system prompts, export, provider APIs.
+NOT in Item 2 (later items): reorder, edit-before-forward, system
+prompts, saved pairs, compare mode, auto-summarize, speed readout,
+file upload, tasks, export, provider APIs.
 """
 
 import json
@@ -25,7 +26,7 @@ import threading
 import urllib.error
 import urllib.request
 
-APP_NAME = "Dual Chat"
+APP_NAME = "DUO"
 DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434"
 OLLAMA_URL_ENV = "DUAL_CHAT_OLLAMA_URL"
 
@@ -35,6 +36,17 @@ MSG_MODEL_FAILED = "That model couldn't be loaded. Pick another model and try ag
 MSG_NO_MODEL = "Pick a model for {side} first."
 MSG_STOPPED = "Stopped."
 MSG_EMPTY = "Type a message first."
+MSG_RELAY_NEEDS_BOTH = "Pick a model for both sides to start a relay."
+MSG_RELAY_STOPPED_BY_YOU = "stopped by you"
+
+# Agreement stop: simple case-insensitive substring matching on this
+# fixed list. No LLM judge -- the 2B models are slow enough already.
+AGREEMENT_PHRASES = ("i agree", "agreed", "sounds good", "that works")
+AWARE_TEMPLATE = ("You are talking with another AI assistant (Model %s). "
+                  "It said: %s")
+RELAY_CAP_MIN = 1
+RELAY_CAP_MAX = 50
+RELAY_CAP_DEFAULT = 10
 
 
 class OllamaError(Exception):
@@ -194,6 +206,97 @@ class Conversation:
         return [self.sides[s] for s in wanted]
 
 
+def parse_stop_phrases(text):
+    """Split a comma-separated stop-phrase field into clean phrases."""
+    return [p.strip() for p in (text or "").split(",") if p.strip()]
+
+
+class RelaySession:
+    """One relay run: config, turn counting, framing, stop checks.
+
+    Pure logic, no Qt -- the GUI drives it from the runner callbacks.
+    A "turn" is one generation. The seed turn is turn 1, so a cap of N
+    means exactly N generations before the relay halts.
+    """
+
+    def __init__(self, start_side, turn_cap=RELAY_CAP_DEFAULT, mode="blind",
+                 stop_phrases=(), stop_on_agreement=False):
+        self.start_side = start_side
+        self.current_side = start_side  # side whose turn is in flight
+        self.hop_from = "you"  # who the current turn is answering
+        self.turn_cap = max(RELAY_CAP_MIN,
+                            min(RELAY_CAP_MAX, int(turn_cap)))
+        self.mode = mode  # "blind" or "aware"
+        self.stop_phrases = list(stop_phrases)
+        self.stop_on_agreement = stop_on_agreement
+        self.turns_done = 0
+        self.active = True
+        self.stop_reason = None
+
+    @staticmethod
+    def other(side):
+        return "B" if side == "A" else "A"
+
+    def frame(self, text, from_side):
+        """The message the other model receives for a relayed reply.
+
+        Blind: the bare reply text, no framing at all -- the model sees
+        only a person talking to it. Aware: framed so the models know
+        they are talking to another AI.
+        """
+        if self.mode == "aware":
+            return AWARE_TEMPLATE % (from_side, text)
+        return text
+
+    def find_stop_phrase(self, text):
+        """The configured stop phrase found in text, or None.
+
+        Case-insensitive substring match.
+        """
+        lowered = text.lower()
+        for phrase in self.stop_phrases:
+            if phrase.lower() in lowered:
+                return phrase
+        return None
+
+    def find_agreement(self, text):
+        """The agreement phrase found in text, or None.
+
+        Only when stop-on-agreement is enabled. Case-insensitive
+        substring match on the fixed AGREEMENT_PHRASES list.
+        """
+        if not self.stop_on_agreement:
+            return None
+        lowered = text.lower()
+        for phrase in AGREEMENT_PHRASES:
+            if phrase in lowered:
+                return phrase
+        return None
+
+    def check_stop(self, reply_text):
+        """Stop reason for this reply, or None to keep relaying.
+
+        Call after incrementing turns_done. A phrase or agreement stop
+        is reported before the cap when they land on the same turn,
+        because it says more about why the relay ended.
+        """
+        phrase = self.find_stop_phrase(reply_text)
+        if phrase is not None:
+            return "phrase %r found" % phrase
+        agreement = self.find_agreement(reply_text)
+        if agreement is not None:
+            return "agreement reached (%r)" % agreement
+        if self.turns_done >= self.turn_cap:
+            return "turn cap reached"
+        return None
+
+    def status_running(self):
+        """Live status line, e.g. "Relay on: turn 3/10, A to B"."""
+        return "Relay on: turn %d/%d, %s to %s" % (
+            self.turns_done + 1, self.turn_cap,
+            self.hop_from, self.current_side)
+
+
 class SerialRunner:
     """Runs generation jobs strictly one at a time, in submit order.
 
@@ -323,9 +426,15 @@ class _ModelLoader:
             def run(self):
                 try:
                     models = client.list_models()
-                    signals.models_loaded.emit(models)
+                    try:
+                        signals.models_loaded.emit(models)
+                    except RuntimeError:
+                        pass  # Window gone; nothing left to update.
                 except OllamaError as exc:
-                    signals.models_failed.emit(str(exc))
+                    try:
+                        signals.models_failed.emit(str(exc))
+                    except RuntimeError:
+                        pass  # Window gone; nothing left to update.
 
         self.thread = _Thread()
 
@@ -339,6 +448,7 @@ class MainWindow:
 def build_window(client=None):
     """Create the main window. Returns (window, app_state_dict)."""
     from PySide6 import QtCore, QtWidgets
+    import shiboken6
 
     client = client or OllamaClient()
     signals = _Signals()
@@ -348,6 +458,11 @@ def build_window(client=None):
     window.setWindowTitle(APP_NAME)
     window.resize(1100, 680)  # Fits a 1366x768 screen with room to spare.
     window.setMinimumSize(900, 540)
+
+    def alive():
+        # Queued runner signals can land after the window is gone (e.g.
+        # closing right as a relay stops). Never touch widgets then.
+        return shiboken6.isValid(window)
 
     central = QtWidgets.QWidget()
     window.setCentralWidget(central)
@@ -430,12 +545,40 @@ def build_window(client=None):
         btn.setEnabled(False)
         btn_row.addWidget(btn)
     d_layout.addLayout(btn_row)
+
+    # --- relay row ---------------------------------------------------------
+    relay_row = QtWidgets.QHBoxLayout()
+    relay_btn = QtWidgets.QPushButton("Start Relay")
+    relay_btn.setEnabled(False)
+    relay_row.addWidget(relay_btn)
+    relay_row.addWidget(QtWidgets.QLabel("Start with:"))
+    start_picker = QtWidgets.QComboBox()
+    start_picker.addItems(["A", "B"])
+    relay_row.addWidget(start_picker)
+    relay_row.addWidget(QtWidgets.QLabel("Turns:"))
+    cap_spin = QtWidgets.QSpinBox()
+    cap_spin.setRange(RELAY_CAP_MIN, RELAY_CAP_MAX)
+    cap_spin.setValue(RELAY_CAP_DEFAULT)
+    relay_row.addWidget(cap_spin)
+    mode_picker = QtWidgets.QComboBox()
+    mode_picker.addItems(["Blind", "Aware"])
+    relay_row.addWidget(mode_picker)
+    relay_row.addWidget(QtWidgets.QLabel("Stop on:"))
+    stop_edit = QtWidgets.QLineEdit()
+    stop_edit.setPlaceholderText("words, separated by commas")
+    relay_row.addWidget(stop_edit, stretch=1)
+    agree_check = QtWidgets.QCheckBox("Stop on agreement")
+    relay_row.addWidget(agree_check)
+    d_layout.addLayout(relay_row)
+
+    relay_status = QtWidgets.QLabel("Relay off.")
+    d_layout.addWidget(relay_status)
     root.addWidget(director)
 
     statusbar = window.statusBar()
     statusbar.showMessage("Loading models...")
 
-    state = {"busy": False, "active": set(), "queued": set()}
+    state = {"busy": False, "active": set(), "queued": set(), "relay": None}
 
     # --- helpers ----------------------------------------------------------
     def scroll_to_end(transcript):
@@ -452,18 +595,29 @@ def build_window(client=None):
 
     def refresh_buttons():
         busy = state["busy"]
+        relay = state.get("relay")
+        relay_active = relay is not None and relay.active
         a_ready = convo.sides["A"].model is not None
         b_ready = convo.sides["B"].model is not None
         send_a.setEnabled(not busy and a_ready)
         send_b.setEnabled(not busy and b_ready)
         send_both.setEnabled(not busy and a_ready and b_ready)
+        relay_btn.setText("Stop Relay" if relay_active else "Start Relay")
+        relay_btn.setEnabled(
+            relay_active or (not busy and a_ready and b_ready))
+        for widget in (start_picker, cap_spin, mode_picker, stop_edit,
+                       agree_check):
+            widget.setEnabled(not relay_active)
         for side in ("A", "B"):
             w = widgets[side]
             w["picker"].setEnabled(not busy)
             w["refresh"].setEnabled(not busy)
             w["stop"].setEnabled(side in state["active"]
                                  or side in state["queued"])
-            w["clear"].setEnabled(side not in state["active"]
+            # No clearing either side mid-relay: the relay is writing
+            # into both histories.
+            w["clear"].setEnabled(not relay_active
+                                  and side not in state["active"]
                                   and side not in state["queued"])
 
     def set_status(side, text):
@@ -475,16 +629,28 @@ def build_window(client=None):
             return client.chat_stream(model, messages, emit, cancel_event)
         return fn
 
+    def _emit(signal, *args):
+        # The runner is a daemon thread and outlives the window: once
+        # the window is gone its signal source is deleted and there is
+        # nothing left to update. Swallow that instead of killing the
+        # thread with a traceback.
+        try:
+            signal.emit(*args)
+        except RuntimeError:
+            pass
+
     runner = SerialRunner(
-        on_start=lambda job: signals.started.emit(job["id"]),
-        on_chunk=lambda job, text: signals.chunk.emit(job["id"], text),
-        on_done=lambda job, text: signals.done.emit(job["id"], text),
-        on_error=lambda job, msg: signals.failed.emit(job["id"], msg),
-        on_cancelled=lambda job: signals.cancelled.emit(job["id"]),
-        on_idle=lambda: signals.idle.emit(),
+        on_start=lambda job: _emit(signals.started, job["id"]),
+        on_chunk=lambda job, text: _emit(signals.chunk, job["id"], text),
+        on_done=lambda job, text: _emit(signals.done, job["id"], text),
+        on_error=lambda job, msg: _emit(signals.failed, job["id"], msg),
+        on_cancelled=lambda job: _emit(signals.cancelled, job["id"]),
+        on_idle=lambda: _emit(signals.idle),
     )
 
     def on_started(side):
+        if not alive():
+            return
         state["queued"].discard(side)
         state["active"].add(side)
         set_status(side, "Thinking...")
@@ -493,6 +659,8 @@ def build_window(client=None):
         refresh_buttons()
 
     def on_chunk(side, text):
+        if not alive():
+            return
         append_text(side, text)
 
     def finish_reply(side):
@@ -500,29 +668,88 @@ def build_window(client=None):
             append_text(side, "\n")
             widgets[side]["reply_open"] = False
 
+    def end_relay(reason, note_side=None):
+        """End the active relay, showing why in the status line.
+
+        note_side (optional) also gets a "(Relay stopped: ...)" line in
+        its pane, so the stop is visible where the conversation ended.
+        """
+        session = state.get("relay")
+        if session is None:
+            return
+        session.active = False
+        session.stop_reason = reason
+        state["relay"] = None
+        relay_status.setText("Relay stopped: %s." % reason)
+        if note_side is not None:
+            append_text(note_side, "(Relay stopped: %s.)\n" % reason)
+        refresh_buttons()
+
     def on_done(side, text):
+        if not alive():
+            return
         finish_reply(side)
         convo.sides[side].add_assistant(text)
         state["active"].discard(side)
         set_status(side, "Idle")
+        session = state.get("relay")
+        if session is not None and session.active:
+            session.turns_done += 1
+            reason = session.check_stop(text)
+            if reason is not None:
+                end_relay(reason, note_side=side)
+            else:
+                # Relay this reply to the other side. The other model
+                # receives the framed text as a plain user message; the
+                # window shows the same text with a [relay] tag, which
+                # the models never see.
+                next_side = RelaySession.other(side)
+                framed = session.frame(text, side)
+                convo.sides[next_side].add_user(framed)
+                append_text(next_side,
+                            "You [relay from Model %s]: %s\n" % (side, framed))
+                session.current_side = next_side
+                session.hop_from = side
+                state["queued"].add(next_side)
+                set_status(next_side, "Queued...")
+                relay_status.setText(session.status_running())
+                runner.submit(next_side, make_job_fn(
+                    next_side, convo.sides[next_side].model,
+                    list(convo.sides[next_side].history)))
         refresh_buttons()
 
     def on_failed(side, message):
+        if not alive():
+            return
         finish_reply(side)
         append_text(side, "(%s)\n" % message)
         state["active"].discard(side)
         set_status(side, "Idle")
+        if state.get("relay") is not None:
+            end_relay(message)
         refresh_buttons()
 
     def on_cancelled(side):
+        if not alive():
+            return
         finish_reply(side)
         append_text(side, "(%s)\n" % MSG_STOPPED)
         state["active"].discard(side)
         state["queued"].discard(side)
         set_status(side, "Idle")
+        if state.get("relay") is not None:
+            end_relay(MSG_RELAY_STOPPED_BY_YOU)
         refresh_buttons()
 
     def on_idle():
+        if not alive():
+            return
+        # A relay submits its next job from the done handler, which the
+        # GUI processes before this idle signal -- but the runner may
+        # still report idle between hops. Stay busy while a relay runs.
+        if state.get("relay") is not None:
+            refresh_buttons()
+            return
         state["busy"] = False
         refresh_buttons()
 
@@ -561,6 +788,59 @@ def build_window(client=None):
     send_b.clicked.connect(lambda: do_send("B"))
     send_both.clicked.connect(lambda: do_send("Both"))
 
+    # --- relay ------------------------------------------------------------
+    def do_start_relay():
+        if state.get("relay") is not None or state["busy"]:
+            return
+        text = composer.toPlainText().strip()
+        if not text:
+            statusbar.showMessage(MSG_EMPTY, 3000)
+            return
+        if (convo.sides["A"].model is None
+                or convo.sides["B"].model is None):
+            statusbar.showMessage(MSG_RELAY_NEEDS_BOTH, 4000)
+            return
+        start_side = start_picker.currentText()
+        session = RelaySession(
+            start_side=start_side,
+            turn_cap=cap_spin.value(),
+            mode=("aware" if mode_picker.currentText() == "Aware"
+                  else "blind"),
+            stop_phrases=parse_stop_phrases(stop_edit.text()),
+            stop_on_agreement=agree_check.isChecked(),
+        )
+        state["relay"] = session
+        state["busy"] = True
+        composer.clear()
+        side_obj = convo.sides[start_side]
+        side_obj.add_user(text)
+        append_text(start_side, "You: %s\n" % text)
+        state["queued"].add(start_side)
+        set_status(start_side, "Queued...")
+        relay_status.setText(session.status_running())
+        runner.submit(start_side, make_job_fn(
+            start_side, side_obj.model, list(side_obj.history)))
+        refresh_buttons()
+        composer.setFocus()
+
+    def stop_relay():
+        session = state.get("relay")
+        if session is None or not session.active:
+            return
+        current = session.current_side
+        end_relay(MSG_RELAY_STOPPED_BY_YOU)
+        # The running job's cancel lands in on_cancelled, which finds no
+        # active relay and just reports "(Stopped.)".
+        runner.cancel(current)
+
+    def on_relay_button():
+        if state.get("relay") is not None:
+            stop_relay()
+        else:
+            do_start_relay()
+
+    relay_btn.clicked.connect(on_relay_button)
+
     # --- per-side buttons --------------------------------------------------
     def make_stop(side):
         def stop():
@@ -592,6 +872,8 @@ def build_window(client=None):
             on_picker_changed(side))
 
     def populate_models(models):
+        if not alive():
+            return
         for side in ("A", "B"):
             picker = widgets[side]["picker"]
             previous = convo.sides[side].model
@@ -614,6 +896,8 @@ def build_window(client=None):
         refresh_buttons()
 
     def on_models_failed(message):
+        if not alive():
+            return
         statusbar.showMessage(message)
         refresh_buttons()
 
@@ -638,6 +922,11 @@ def build_window(client=None):
         "widgets": widgets, "composer": composer,
         "send_a": send_a, "send_b": send_b, "send_both": send_both,
         "do_send": do_send, "load_models": load_models, "state": state,
+        "relay_btn": relay_btn, "start_picker": start_picker,
+        "cap_spin": cap_spin, "mode_picker": mode_picker,
+        "stop_edit": stop_edit, "agree_check": agree_check,
+        "relay_status": relay_status,
+        "do_start_relay": do_start_relay, "stop_relay": stop_relay,
     }
 
     load_models()
