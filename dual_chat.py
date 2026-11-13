@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""DUO 0.25 - two Ollama models side by side in one desktop window.
+"""DUO 0.28 - two Ollama models side by side in one desktop window.
 
 Item 1: the shell, the model pickers, and send-to-A/B/both.
 Item 2: the auto-relay AI-to-AI loop. The user types a seed message, picks
@@ -128,6 +128,23 @@ v0.25: the monolith split (audit T14). The code that used to live
   phone deck, and the entry point, re-exporting the moved names
   so imports through here keep working. Nothing you can see
   changed: same window, same features, same files.
+v0.26: one message structure (audit T15). Each side used to keep
+  three separate lists -- message contents, sender labels, short
+  display texts -- that had to stay in step by hand. Each message
+  is now one object holding its role, content, label, and display
+  text together, so a label can never land on the wrong message.
+  Same window, same features, same files -- and DUO is now
+  MIT-licensed (see LICENSE).
+v0.27: the full transcript log is bounded (audit T16). It used to
+  grow without limit across a long session; it now keeps the most
+  recent 2,000 entries, oldest first out, and the saved full
+  transcript says so at the top when a session passes it.
+v0.28: the update story (audit T17). DUO checks GitHub once at
+  startup, on a background thread, and says in the status bar when
+  a newer Release is out -- silently saying nothing when offline.
+  A "Check for updates" button runs the same check on demand and
+  reports either way. DUO never downloads or installs anything;
+  the user downloads from GitHub themselves.
 """
 
 import html
@@ -176,9 +193,11 @@ from duo_model import (
 from duo_ollama import (
     CHAT_MAX_ATTEMPTS, CHAT_RETRY_DELAYS, CHAT_TIMEOUT, DEFAULT_OLLAMA_URL,
     MSG_MODEL_FAILED, MSG_OLLAMA_DOWN, MSG_OLLAMA_NOT_INSTALLED,
-    MSG_OLLAMA_SLOW, MSG_OLLAMA_START_FAILED, OLLAMA_URL_ENV, Cancelled,
-    OllamaClient, OllamaError, OllamaServerManager, parse_ollama_list_output,
-    parse_ps_payload, parse_tags_payload,)
+    MSG_OLLAMA_SLOW, MSG_OLLAMA_START_FAILED, OLLAMA_URL_ENV,
+    UPDATE_CHECK_TIMEOUT, UPDATE_CHECK_URL, UPDATE_CHECK_URL_ENV, Cancelled,
+    OllamaClient, OllamaError, OllamaServerManager, check_for_update,
+    parse_ollama_list_output, parse_ps_payload, parse_tags_payload,
+    parse_version,)
 from duo_runner import SerialRunner
 from duo_stats import (
     STATS_EMPTY_LINE, compute_turn_stats, format_ram, format_session_line,
@@ -267,7 +286,7 @@ def make_debug_logger(log_dir=None):
         return _NullLogger()
 
 APP_NAME = "DUO"
-APP_VERSION = "0.27"
+APP_VERSION = "0.28"
 
 # Phone deck (v0.11): DUO serves a small local page for his phone.
 # Fixed port with a fallback chain if it is busy; DUAL_CHAT_DECK_PORT
@@ -285,6 +304,14 @@ MSG_PHONE_BUSY = "DUO is busy right now. Wait for the current turn to finish, th
 MSG_PHONE_RELAY = "A relay is running. Stop the relay before sending from your phone."
 MSG_PHONE_TASK = "A task is running. Wait for it to finish, then send again."
 MSG_PHONE_TARGET = "Pick who to send to: A, B, or Both."
+# Update check (v0.28): the note when a newer Release is out
+# ("DUO 0.29 is out ..."), what a manual check says when this copy
+# is current, and what it says when the check itself failed. The
+# automatic startup check only ever shows the first one -- when
+# this copy is current or the check fails, it stays silent.
+MSG_UPDATE_AVAILABLE = "DUO %s is out — see the Releases page on GitHub."
+MSG_UPDATE_LATEST = "You're on the latest version."
+MSG_UPDATE_FAILED = "Couldn't check for updates — are you online?"
 MSG_PYSIDE6_MISSING = (
     "DUO needs PySide6 to open its window, and it isn't installed.\n"
     "Run the installer first:\n"
@@ -891,6 +918,10 @@ class _SignalObject:
             models_loaded = Signal(list)
             models_failed = Signal(str)
             ollama_started = Signal(bool, str)
+            # Update check: (result, manual) where result is
+            # check_for_update's ("newer"/"latest"/"failed", version)
+            # and manual says whether the button asked for it.
+            update_checked = Signal(object, bool)
             # Phone deck send: (text, target, holder dict with a
             # "done" Event and an "error" slot the GUI thread fills).
             phone_send = Signal(str, str, object)
@@ -905,6 +936,7 @@ class _SignalObject:
         self.models_loaded = self._inner.models_loaded
         self.models_failed = self._inner.models_failed
         self.ollama_started = self._inner.ollama_started
+        self.update_checked = self._inner.update_checked
         self.phone_send = self._inner.phone_send
 
 
@@ -955,6 +987,26 @@ class _OllamaStarter:
                 ok, message = manager.start()
                 try:
                     signals.ollama_started.emit(ok, message)
+                except RuntimeError:
+                    pass  # Window gone; nothing left to update.
+
+        self.thread = _Thread()
+
+
+class _UpdateChecker:
+    """Runs the update check off the GUI thread (the network call
+    can take up to the 5s timeout). Emits (result, manual) through
+    signals.update_checked, where result is check_for_update's
+    ("newer"/"latest"/"failed", version) tuple."""
+
+    def __init__(self, signals, current_version, manual):
+        from PySide6.QtCore import QThread
+
+        class _Thread(QThread):
+            def run(self):
+                result = check_for_update(current_version)
+                try:
+                    signals.update_checked.emit(result, manual)
                 except RuntimeError:
                     pass  # Window gone; nothing left to update.
 
@@ -1292,8 +1344,11 @@ def build_window(client=None, logger=None, deck_port=None):
     d_layout.addWidget(attach_frame)
 
     btn_row = QtWidgets.QHBoxLayout()
-    hint = QtWidgets.QLabel("Send to one side, or to both at once.")
-    btn_row.addWidget(hint, stretch=1)
+    # No hint label here: the row holds nine buttons now, and a
+    # label gets clipped to a stub ("Send to A, B, or bc", v0.28).
+    # The buttons say what they do; the stretch keeps them
+    # right-aligned, where they were.
+    btn_row.addStretch(1)
     send_a = QtWidgets.QPushButton("Send to A")
     send_b = QtWidgets.QPushButton("Send to B")
     send_both = QtWidgets.QPushButton("Send to Both")
@@ -1312,6 +1367,8 @@ def build_window(client=None, logger=None, deck_port=None):
     btn_row.addWidget(debug_btn)
     phone_btn = QtWidgets.QPushButton("Phone deck")
     btn_row.addWidget(phone_btn)
+    update_btn = QtWidgets.QPushButton("Check for updates")
+    btn_row.addWidget(update_btn)
     d_layout.addLayout(btn_row)
 
     # --- relay row ---------------------------------------------------------
@@ -3405,6 +3462,48 @@ def build_window(client=None, logger=None, deck_port=None):
     signals.ollama_started.connect(on_ollama_started)
     start_ollama_btn.clicked.connect(do_start_ollama)
 
+    # --- update check (v0.28) ---------------------------------------------
+    # Two triggers, one check: once automatically at startup (below,
+    # next to load_models) and on demand from the button. Both run
+    # off the GUI thread, and both report through the same slot --
+    # whichever finishes last writes its note, so a slow startup
+    # check can never leave a stale result over a manual one. The
+    # automatic check only speaks when a newer version is out: up
+    # to date or failed (offline, say) it stays silent. The manual
+    # check reports either way. Nothing is ever downloaded or
+    # installed -- the note just points at the Releases page.
+    update_checkers = []
+
+    def run_update_check(manual):
+        checker = _UpdateChecker(signals, APP_VERSION, manual)
+        update_checkers.append(checker)
+        checker.thread.finished.connect(
+            lambda: update_checkers.remove(checker)
+            if checker in update_checkers else None)
+        checker.thread.start()
+
+    def on_update_checked(result, manual):
+        if not alive():
+            return
+        status, version = result
+        if status == "newer":
+            logger.action("update available: DUO %s" % version)
+            statusbar.showMessage(
+                MSG_UPDATE_AVAILABLE % version, 5000)
+        elif manual and status == "latest":
+            logger.info("update check: up to date")
+            statusbar.showMessage(MSG_UPDATE_LATEST, 5000)
+        elif manual and status == "failed":
+            logger.info("update check failed")
+            statusbar.showMessage(MSG_UPDATE_FAILED, 5000)
+        elif status == "latest":
+            logger.info("update check: up to date")
+        else:
+            logger.info("update check failed")
+
+    signals.update_checked.connect(on_update_checked)
+    update_btn.clicked.connect(lambda: run_update_check(manual=True))
+
     for side in ("A", "B"):
         widgets[side]["refresh"].clicked.connect(load_models)
 
@@ -3560,6 +3659,8 @@ def build_window(client=None, logger=None, deck_port=None):
         "phone_btn": phone_btn, "deck_server": deck_server,
         "show_phone_deck": show_phone_deck,
         "on_phone_send": on_phone_send,
+        "update_btn": update_btn, "run_update_check": run_update_check,
+        "on_update_checked": on_update_checked,
     }
 
     # Closing the window stops a server DUO itself started -- no orphan
@@ -3640,6 +3741,10 @@ def build_window(client=None, logger=None, deck_port=None):
     refresh_pair_combo()
     refresh_preset_combo()
     load_models()
+    # The update check runs once per launch, on a background thread,
+    # and never blocks the window opening. It is not re-run on
+    # refreshes or pane actions -- only the button runs it again.
+    run_update_check(manual=False)
     refresh_buttons()
     return window
 

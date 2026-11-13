@@ -68,6 +68,11 @@ Everything in one app:
   the split between the panes are remembered between runs, so it
   opens where you left it. The title bar shows the version, and
   the window has its own icon.
+- **Update check** — DUO checks GitHub once at startup and says in
+  the status bar when a newer Release is out (silently saying
+  nothing when offline), and a "Check for updates" button runs the
+  same check whenever you like. It never downloads or installs
+  anything — you download from GitHub yourself.
 
 ## What you need
 
@@ -131,6 +136,10 @@ bash run.sh
   buttons keep a transcript as a text file.
 - The window remembers its size, position, and the split between
   the panes, so it opens where you left it.
+- DUO checks for a newer Release once at startup and says so in
+  the status bar when one is out; the "Check for updates" button
+  next to Phone deck runs the same check on demand. It never
+  downloads or installs anything.
 - If Ollama isn't running, the pane says so in plain words.
 
 ## Relay

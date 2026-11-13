@@ -1,7 +1,22 @@
 # DUO changelog
 
 Every version, newest first. v0.1–v0.17 were built on 2026-11-12;
-v0.18–v0.27 on 2026-11-13.
+v0.18–v0.28 on 2026-11-13.
+
+## v0.28 — 2026-11-13
+
+DUO tells you when a newer version is out. Once at startup, on a
+background thread that never holds the window up, it asks GitHub
+for the latest Release and, when one is newer than the copy
+running, says so in the status bar — "DUO 0.29 is out — see the
+Releases page on GitHub." When the copy is current, or when there
+is no network, the startup check says nothing. A "Check for
+updates" button next to Phone deck runs the same check whenever
+you like and reports either way: the same note when a newer
+version is out, "You're on the latest version." when there
+isn't, and a plain note when the check itself fails. DUO never
+downloads or installs anything — the note just points at the
+Releases page, and you download from GitHub yourself.
 
 ## v0.27 — 2026-11-13
 

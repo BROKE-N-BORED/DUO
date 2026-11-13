@@ -17,6 +17,7 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest import mock
 
@@ -31,6 +32,7 @@ from dual_chat import (  # noqa: E402
     MAX_ATTACHMENT_BYTES, MSG_EMPTY, MSG_MODEL_FAILED, MSG_OLLAMA_DOWN,
     MSG_OLLAMA_NOT_INSTALLED, MSG_OLLAMA_SLOW, MSG_OLLAMA_START_FAILED,
     MSG_PHONE_BUSY, MSG_PHONE_RELAY, MSG_PHONE_TARGET,
+    MSG_UPDATE_AVAILABLE, MSG_UPDATE_FAILED, MSG_UPDATE_LATEST,
     SETTINGS_APP, SETTINGS_ORG, SETTING_ENTER_TO_SEND,
     SETTING_SPLITTER_STATE, SETTING_TEMPERATURE,
     SETTING_WINDOW_GEOMETRY,
@@ -38,6 +40,7 @@ from dual_chat import (  # noqa: E402
     TASK_REVISE_TEMPLATE, TASK_ROUNDS_DEFAULT, TASK_ROUNDS_MAX,
     TASK_ROUNDS_MIN,
     TEMPERATURE_DEFAULT, TEMPERATURE_MAX, TEMPERATURE_MIN,
+    UPDATE_CHECK_TIMEOUT, UPDATE_CHECK_URL, UPDATE_CHECK_URL_ENV,
     AttachmentError, Cancelled,
     ChatMessage, ChatSide, Conversation, ConversationError, DeckServer,
     HISTORY_BUDGET_CHARS,
@@ -46,7 +49,8 @@ from dual_chat import (  # noqa: E402
     SUMMARY_KEEP_LAST, SUMMARY_LABEL, SUMMARIZE_PROMPT, SerialRunner,
     TaskSession, TranscriptError, append_full_log_entry, attachment_tag,
     build_attached_message,
-    build_deck_state, compute_turn_stats, conversation_to_data,
+    build_deck_state, check_for_update, compute_turn_stats,
+    conversation_to_data,
     data_to_conversation, default_both_filename,
     default_conversation_filename, default_debug_filename,
     default_full_filename, default_side_filename, delete_pair,
@@ -61,7 +65,7 @@ from dual_chat import (  # noqa: E402
     markdown_to_html,
     pairs_path, parse_ollama_list_output, parse_ps_payload,
     parse_side_transcript, parse_stop_phrases, parse_tags_payload,
-    phrase_matches,
+    parse_version, phrase_matches,
     presets_file_corrupt, presets_path,
     render_qr_pixmap,
     sanitize_filename_part,
@@ -6379,7 +6383,7 @@ class FrontDoorTests(unittest.TestCase):
 
     def test_changelog_covers_every_version(self):
         log = self._read("CHANGELOG.md")
-        for version in ["0.%d" % n for n in range(1, 28)]:
+        for version in ["0.%d" % n for n in range(1, 29)]:
             self.assertIn(version, log)
 
     def test_gitignore_covers_runtime_files(self):
@@ -8431,6 +8435,8 @@ class ModuleSplitTests(unittest.TestCase):
             (dual_chat.OllamaError, duo_ollama.OllamaError),
             (dual_chat.Cancelled, duo_ollama.Cancelled),
             (dual_chat.CHAT_RETRY_DELAYS, duo_ollama.CHAT_RETRY_DELAYS),
+            (dual_chat.check_for_update, duo_ollama.check_for_update),
+            (dual_chat.parse_version, duo_ollama.parse_version),
             (dual_chat.SerialRunner, duo_runner.SerialRunner),
             (dual_chat.compute_turn_stats, duo_stats.compute_turn_stats),
             (dual_chat.format_stats_line, duo_stats.format_stats_line),
@@ -8719,6 +8725,308 @@ class MessageStructureTests(unittest.TestCase):
                   encoding="utf-8") as fh:
             script = fh.read()
         self.assertIn('"LICENSE": 0o100644', script)
+
+class UpdateCheckTests(unittest.TestCase):
+    """v0.28 (audit T17): the update check's pure core -- version
+    parsing and comparison, and the GitHub latest-release lookup
+    against stubbed HTTP responses. The UI notes the outcomes map
+    to are pinned in UpdateCheckGuiTests."""
+
+    def _open(self, body=None, error=None, calls=None):
+        """A urlopen stub: answers with `body` bytes, raises `error`,
+        and records (request, timeout) pairs in `calls`."""
+
+        class _Response:
+            def read(self):
+                return body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        def opener(request, timeout=None):
+            if calls is not None:
+                calls.append((request, timeout))
+            if error is not None:
+                raise error
+            return _Response()
+
+        return opener
+
+    def _tag_body(self, tag):
+        return json.dumps({"tag_name": tag}).encode("utf-8")
+
+    def test_parse_version_plain(self):
+        self.assertEqual(parse_version("0.28"), (0, 28))
+        self.assertEqual(parse_version("1.2.3"), (1, 2, 3))
+
+    def test_parse_version_leading_v(self):
+        self.assertEqual(parse_version("v0.28"), (0, 28))
+        self.assertEqual(parse_version("V1.0"), (1, 0))
+
+    def test_parse_version_compares_numerically(self):
+        # "0.9" < "0.10" must hold -- a string compare gets this
+        # backwards, and a wrong order would hide a real update.
+        self.assertLess(parse_version("0.9"), parse_version("0.10"))
+        self.assertLess(parse_version("0.28"), parse_version("0.29"))
+        self.assertEqual(parse_version("0.28"), parse_version("v0.28"))
+
+    def test_parse_version_malformed_is_none(self):
+        for bad in ("", "v", "banana", "0.28-beta", "1.", ".5",
+                    "0.-1", "0. 28", None, 5, b"0.28"):
+            self.assertIsNone(parse_version(bad), bad)
+
+    def test_newer_tag_reports_newer_with_normalized_version(self):
+        result = check_for_update(
+            "0.28", urlopen=self._open(self._tag_body("v0.29")))
+        self.assertEqual(result, ("newer", "0.29"))
+
+    def test_tag_without_v_reports_newer(self):
+        result = check_for_update(
+            "0.28", urlopen=self._open(self._tag_body("0.30")))
+        self.assertEqual(result, ("newer", "0.30"))
+
+    def test_same_tag_reports_latest(self):
+        result = check_for_update(
+            "0.28", urlopen=self._open(self._tag_body("v0.28")))
+        self.assertEqual(result, ("latest", None))
+
+    def test_older_tag_reports_latest(self):
+        result = check_for_update(
+            "0.28", urlopen=self._open(self._tag_body("v0.27")))
+        self.assertEqual(result, ("latest", None))
+
+    def test_nine_is_older_than_ten(self):
+        result = check_for_update(
+            "0.9", urlopen=self._open(self._tag_body("v0.10")))
+        self.assertEqual(result, ("newer", "0.10"))
+
+    def test_malformed_json_is_failed(self):
+        result = check_for_update(
+            "0.28", urlopen=self._open(b"not json at all"))
+        self.assertEqual(result, ("failed", None))
+
+    def test_missing_tag_is_failed(self):
+        body = json.dumps({"name": "no tag here"}).encode("utf-8")
+        result = check_for_update("0.28", urlopen=self._open(body))
+        self.assertEqual(result, ("failed", None))
+
+    def test_non_dict_payload_is_failed(self):
+        body = json.dumps(["v0.29"]).encode("utf-8")
+        result = check_for_update("0.28", urlopen=self._open(body))
+        self.assertEqual(result, ("failed", None))
+
+    def test_malformed_tag_is_failed(self):
+        result = check_for_update(
+            "0.28", urlopen=self._open(self._tag_body("banana")))
+        self.assertEqual(result, ("failed", None))
+
+    def test_timeout_is_failed(self):
+        result = check_for_update(
+            "0.28", urlopen=self._open(error=TimeoutError("timed out")))
+        self.assertEqual(result, ("failed", None))
+
+    def test_connection_error_is_failed(self):
+        result = check_for_update(
+            "0.28", urlopen=self._open(
+                error=urllib.error.URLError("no route to host")))
+        self.assertEqual(result, ("failed", None))
+
+    def test_http_error_is_failed(self):
+        error = urllib.error.HTTPError(
+            UPDATE_CHECK_URL, 403, "Forbidden", {}, None)
+        result = check_for_update("0.28", urlopen=self._open(error=error))
+        self.assertEqual(result, ("failed", None))
+
+    def test_unexpected_error_never_raises(self):
+        result = check_for_update(
+            "0.28", urlopen=self._open(error=RuntimeError("boom")))
+        self.assertEqual(result, ("failed", None))
+
+    def test_bad_current_version_is_failed(self):
+        result = check_for_update(
+            "banana", urlopen=self._open(self._tag_body("v0.29")))
+        self.assertEqual(result, ("failed", None))
+
+    def test_asks_the_github_latest_release_url_with_short_timeout(self):
+        calls = []
+        check_for_update("0.28", urlopen=self._open(
+            self._tag_body("v0.28"), calls=calls))
+        self.assertEqual(len(calls), 1)
+        request, timeout = calls[0]
+        self.assertEqual(request.full_url, UPDATE_CHECK_URL)
+        self.assertEqual(timeout, UPDATE_CHECK_TIMEOUT)
+        self.assertEqual(UPDATE_CHECK_TIMEOUT, 5)
+
+    def test_default_url_is_the_repo_latest_release(self):
+        self.assertEqual(
+            UPDATE_CHECK_URL,
+            "https://api.github.com/repos/BROKE-N-BORED/DUO"
+            "/releases/latest")
+
+    def test_env_override_changes_the_url(self):
+        override = "http://127.0.0.1:9/fake-releases"
+        calls = []
+        with mock.patch.dict(os.environ,
+                             {UPDATE_CHECK_URL_ENV: override}):
+            check_for_update("0.28", urlopen=self._open(
+                self._tag_body("v0.28"), calls=calls))
+        self.assertEqual(calls[0][0].full_url, override)
+
+
+@unittest.skipUnless(os.environ.get("DUAL_CHAT_GUI_TESTS") == "1",
+                     "GUI tests run with DUAL_CHAT_GUI_TESTS=1")
+class UpdateCheckGuiTests(unittest.TestCase):
+    """v0.28 (audit T17): the update check in the window -- the
+    startup check and the button, with the network stubbed. The
+    stub is patched in before build_window, because the window
+    runs its startup check as soon as it is built."""
+
+    @classmethod
+    def setUpClass(cls):
+        from PySide6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+        cls.client = FakeGuiClient()
+
+    def setUp(self):
+        self.check_result = ("latest", None)
+        self.check_first_result = None
+        self.check_gate = None
+        self.check_calls = []
+        self.window = None
+        self._patcher = mock.patch("dual_chat.check_for_update",
+                                   side_effect=self._stub_check)
+        self._patcher.start()
+        self.client.reset()
+
+    def tearDown(self):
+        if self.check_gate is not None:
+            self.check_gate.set()
+        if self.window is not None:
+            self.window.close()
+        self.app.processEvents()
+        self._patcher.stop()
+
+    def _stub_check(self, *args, **kwargs):
+        call_no = len(self.check_calls)
+        self.check_calls.append(args)
+        # The gate holds only the first (startup) call, so a test
+        # can release it after the window has settled.
+        if self.check_gate is not None and call_no == 0:
+            self.check_gate.wait(timeout=10)
+        if call_no == 0 and self.check_first_result is not None:
+            return self.check_first_result
+        return self.check_result
+
+    def _build_window(self):
+        from dual_chat import build_window
+        self.window = build_window(self.client, logger=TEST_LOGGER)
+        self.window.show()
+        self.state = self.window._dual_chat
+        self.assertTrue(self._wait_for(
+            lambda: self.state["widgets"]["A"]["picker"].count() == 2),
+            "pickers should load the fake models")
+
+    def _wait_for(self, cond, timeout=10.0):
+        from PySide6.QtTest import QTest
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            QTest.qWait(50)
+            if cond():
+                return True
+        return cond()
+
+    def _message(self):
+        return self.window.statusBar().currentMessage()
+
+    def test_button_present_and_enabled_at_idle(self):
+        self._build_window()
+        btn = self.state["update_btn"]
+        self.assertTrue(btn.isVisible())
+        self.assertTrue(btn.isEnabled())
+        self.assertEqual(btn.text(), "Check for updates")
+
+    def test_startup_check_newer_shows_the_note(self):
+        # Hold the startup check until the model list has loaded:
+        # otherwise populate_models' "Ollama connected" note can
+        # land after the update note and hide it.
+        self.check_gate = threading.Event()
+        self.check_first_result = ("newer", "0.29")
+        self._build_window()
+        self.assertEqual(self._message(),
+                         "Ollama connected: 2 model(s) found.")
+        self.check_gate.set()
+        self.assertTrue(self._wait_for(
+            lambda: self._message()
+            == MSG_UPDATE_AVAILABLE % "0.29"), self._message())
+
+    def test_startup_check_latest_stays_silent(self):
+        self.check_first_result = ("latest", None)
+        self._build_window()
+        self.assertTrue(self._wait_for(
+            lambda: len(self.check_calls) >= 1))
+        self.app.processEvents()
+        self.assertEqual(self._message(),
+                         "Ollama connected: 2 model(s) found.")
+
+    def test_startup_check_failed_stays_silent(self):
+        self.check_first_result = ("failed", None)
+        self._build_window()
+        self.assertTrue(self._wait_for(
+            lambda: len(self.check_calls) >= 1))
+        self.app.processEvents()
+        self.assertEqual(self._message(),
+                         "Ollama connected: 2 model(s) found.")
+
+    def test_manual_check_latest(self):
+        self._build_window()
+        self.assertTrue(self._wait_for(
+            lambda: len(self.check_calls) >= 1))
+        self.check_result = ("latest", None)
+        self.state["update_btn"].click()
+        self.assertTrue(self._wait_for(
+            lambda: self._message() == MSG_UPDATE_LATEST),
+            self._message())
+
+    def test_manual_check_failed(self):
+        self._build_window()
+        self.assertTrue(self._wait_for(
+            lambda: len(self.check_calls) >= 1))
+        self.check_result = ("failed", None)
+        self.state["update_btn"].click()
+        self.assertTrue(self._wait_for(
+            lambda: self._message() == MSG_UPDATE_FAILED),
+            self._message())
+
+    def test_manual_check_newer(self):
+        self._build_window()
+        self.assertTrue(self._wait_for(
+            lambda: len(self.check_calls) >= 1))
+        self.check_result = ("newer", "0.31")
+        self.state["update_btn"].click()
+        self.assertTrue(self._wait_for(
+            lambda: self._message()
+            == MSG_UPDATE_AVAILABLE % "0.31"), self._message())
+
+    def test_manual_check_while_startup_in_flight_last_wins(self):
+        # The startup check is held on the gate; the manual check
+        # runs and reports first. When the startup check finally
+        # finishes, its note is the one standing -- no stale
+        # result is left over the newer one.
+        self.check_gate = threading.Event()
+        self.check_first_result = ("newer", "0.30")
+        self._build_window()
+        self.check_result = ("latest", None)
+        self.state["update_btn"].click()
+        self.assertTrue(self._wait_for(
+            lambda: self._message() == MSG_UPDATE_LATEST),
+            self._message())
+        self.check_gate.set()
+        self.assertTrue(self._wait_for(
+            lambda: self._message()
+            == MSG_UPDATE_AVAILABLE % "0.30"), self._message())
 
 
 if __name__ == "__main__":
