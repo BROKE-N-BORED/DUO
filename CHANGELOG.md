@@ -1,7 +1,15 @@
 # DUO changelog
 
 Every version, newest first. v0.1–v0.17 were built on 2026-11-12;
-v0.18 on 2026-11-13.
+v0.18–v0.19 on 2026-11-13.
+
+## v0.19 — 2026-11-13
+
+Temperature controls. Each pane has a Temperature control under its
+model picker (0.0–2.0, default 0.7 — that is Ollama's own default,
+now visible instead of silent). The value travels with every turn
+that side generates — direct sends, relay hops, task runs, and
+summaries — and is remembered per side between runs.
 
 ## v0.18 — 2026-11-13
 

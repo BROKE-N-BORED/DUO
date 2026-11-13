@@ -15,7 +15,10 @@ Everything in one app:
 
 - **Chat** — two panes, each with its own model picker and
   conversation; send to A, to B, or to both. One model generates at
-  a time, so the PC never runs two models at once.
+  a time, so the PC never runs two models at once. Each pane also
+  has a Temperature control (0.0–2.0, default 0.7, which is
+  Ollama's own default): lower is more focused, higher is more
+  random.
 - **Relay** — the two models talk to each other, blind (each thinks
   it's talking to a person) or aware (they know it's another AI),
   with a turn cap, stop phrases, stop on agreement, and an option to
@@ -106,7 +109,10 @@ bash run.sh
 
 - Each pane has its own model picker. Nothing is picked for you — choose
   a model in a pane before you can send to it. The Refresh button
-  reloads the list from Ollama.
+  reloads the list from Ollama. Under the picker is a Temperature
+  control (0.0–2.0, default 0.7, which is Ollama's own default):
+  lower is more focused, higher is more random. Each side's
+  temperature is remembered between runs.
 - Send to A talks only to the left model. Send to B talks only to the
   right model. Send to Both sends the same message to each side, one
   after the other — A first, then B — so the PC never runs two models

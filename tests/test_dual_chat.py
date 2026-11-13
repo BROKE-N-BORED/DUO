@@ -31,8 +31,10 @@ from dual_chat import (  # noqa: E402
     MSG_OLLAMA_NOT_INSTALLED, MSG_OLLAMA_SLOW, MSG_OLLAMA_START_FAILED,
     MSG_PHONE_BUSY, MSG_PHONE_RELAY, MSG_PHONE_TARGET,
     SETTINGS_APP, SETTINGS_ORG, SETTING_ENTER_TO_SEND,
-    SETTING_SPLITTER_STATE, SETTING_WINDOW_GEOMETRY,
+    SETTING_SPLITTER_STATE, SETTING_TEMPERATURE,
+    SETTING_WINDOW_GEOMETRY,
     TASK_CONTINUE_TEMPLATE, TASK_FOLLOW_UPS, TASK_REVIEW_TEMPLATE,
+    TEMPERATURE_DEFAULT, TEMPERATURE_MAX, TEMPERATURE_MIN,
     AttachmentError, Cancelled,
     ChatSide, Conversation, ConversationError, DeckServer,
     HISTORY_BUDGET_CHARS,
@@ -76,6 +78,9 @@ class FakeOllamaHandler(BaseHTTPRequestHandler):
         "fake-a:latest": ["Hello ", "from A."],
         "fake-b:latest": ["Hello ", "from B."],
     }
+    # Every /api/chat request body received, in order. Tests that
+    # assert on the wire (e.g. the options tests) clear it first.
+    bodies = []
     protocol_version = "HTTP/1.1"
 
     def log_message(self, *args):
@@ -106,6 +111,7 @@ class FakeOllamaHandler(BaseHTTPRequestHandler):
             return
         length = int(self.headers.get("Content-Length") or 0)
         payload = json.loads(self.rfile.read(length).decode("utf-8"))
+        FakeOllamaHandler.bodies.append(payload)
         model = payload.get("model")
         if model not in self.replies:
             self._send_json(
@@ -549,6 +555,27 @@ class OllamaClientTests(unittest.TestCase):
         self.assertEqual(full, "Hello from A.")
         self.assertEqual(seen, ["Hello ", "from A."])
 
+    def test_chat_stream_sends_options(self):
+        FakeOllamaHandler.bodies.clear()
+        client = OllamaClient(self.url)
+        full = client.chat_stream(
+            "fake-a:latest", [{"role": "user", "content": "hi"}],
+            lambda t: None, threading.Event(),
+            options={"temperature": 1.4})
+        self.assertEqual(full, "Hello from A.")
+        self.assertEqual(len(FakeOllamaHandler.bodies), 1)
+        self.assertEqual(FakeOllamaHandler.bodies[0].get("options"),
+                         {"temperature": 1.4})
+
+    def test_chat_stream_without_options_sends_no_options_key(self):
+        FakeOllamaHandler.bodies.clear()
+        client = OllamaClient(self.url)
+        client.chat_stream(
+            "fake-a:latest", [{"role": "user", "content": "hi"}],
+            lambda t: None, threading.Event())
+        self.assertEqual(len(FakeOllamaHandler.bodies), 1)
+        self.assertNotIn("options", FakeOllamaHandler.bodies[0])
+
     def test_chat_stream_unknown_model_plain_error(self):
         client = OllamaClient(self.url)
         with self.assertRaises(OllamaError) as ctx:
@@ -621,7 +648,9 @@ class FakeGuiClient:
     ``replies`` maps a model to a scripted list of replies, consumed in
     order (the last one repeats). ``messages_seen`` records every messages
     list the app sent, deep-copied, so relay tests can assert the exact
-    text each model received. ``max_active`` proves generations never
+    text each model received. ``options_seen`` records the options dict
+    passed with each turn, so temperature tests can assert what each
+    side transmitted. ``max_active`` proves generations never
     overlap. ``metrics`` maps a model to canned timing values reported
     through on_metrics (a default set is used when a model has none);
     ``ps`` maps a model name to its canned size in bytes for
@@ -635,6 +664,7 @@ class FakeGuiClient:
     def __init__(self):
         self.calls = []
         self.messages_seen = []
+        self.options_seen = []
         self.replies = {}
         self.reply_index = {}
         self.metrics = {}
@@ -648,6 +678,7 @@ class FakeGuiClient:
         with self.lock:
             self.calls.clear()
             self.messages_seen.clear()
+            self.options_seen.clear()
             self.replies.clear()
             self.reply_index.clear()
             self.metrics.clear()
@@ -666,10 +697,12 @@ class FakeGuiClient:
         return dict(self.ps)
 
     def chat_stream(self, model, messages, on_chunk, cancel_event,
-                    timeout=1800, on_metrics=None, on_retry=None):
+                    timeout=1800, on_metrics=None, on_retry=None,
+                    options=None):
         with self.lock:
             self.calls.append(model)
             self.messages_seen.append((model, copy.deepcopy(messages)))
+            self.options_seen.append((model, options))
             idx = self.reply_index.get(model, 0)
             script = self.replies.get(model)
             if script:
@@ -3901,7 +3934,7 @@ class StartOllamaGuiTests(unittest.TestCase):
         class SlowClient(FakeGuiClient):
             def chat_stream(self, model, messages, on_chunk,
                             cancel_event, timeout=1800, on_metrics=None,
-                            on_retry=None):
+                            on_retry=None, options=None):
                 raise OllamaError(MSG_OLLAMA_SLOW)
 
         window = build_window(SlowClient(), logger=TEST_LOGGER)
@@ -3927,7 +3960,7 @@ class StartOllamaGuiTests(unittest.TestCase):
         class SlowClient(FakeGuiClient):
             def chat_stream(self, model, messages, on_chunk,
                             cancel_event, timeout=1800, on_metrics=None,
-                            on_retry=None):
+                            on_retry=None, options=None):
                 raise OllamaError(MSG_OLLAMA_SLOW)
 
         window = build_window(SlowClient(), logger=TEST_LOGGER)
@@ -3957,7 +3990,7 @@ class StartOllamaGuiTests(unittest.TestCase):
         class BadModelClient(FakeGuiClient):
             def chat_stream(self, model, messages, on_chunk,
                             cancel_event, timeout=1800, on_metrics=None,
-                            on_retry=None):
+                            on_retry=None, options=None):
                 raise OllamaError(MSG_MODEL_FAILED)
 
         window = build_window(BadModelClient(), logger=TEST_LOGGER)
@@ -5154,7 +5187,7 @@ class FrontDoorTests(unittest.TestCase):
 
     def test_changelog_covers_every_version(self):
         log = self._read("CHANGELOG.md")
-        for version in ["0.%d" % n for n in range(1, 19)]:
+        for version in ["0.%d" % n for n in range(1, 20)]:
             self.assertIn(version, log)
 
     def test_gitignore_covers_runtime_files(self):
@@ -5766,6 +5799,137 @@ class ConversationGuiTests(unittest.TestCase):
         with self._save_dialog(""):
             self.state["save_convo"].click()
         self.assertEqual(set(os.listdir(self.tmp.name)), before)
+
+
+# ---------------------------------------------------------------------------
+# Temperature controls (v0.19, audit T8)
+# ---------------------------------------------------------------------------
+
+@unittest.skipUnless(os.environ.get("DUAL_CHAT_GUI_TESTS") == "1",
+                     "GUI tests run with DUAL_CHAT_GUI_TESTS=1")
+class TemperatureGuiTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        from PySide6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+        cls.client = FakeGuiClient()
+
+    def setUp(self):
+        # Temperatures are persisted per side, so clear both before
+        # every window: each test starts from the default (0.7).
+        self._clear_temperatures()
+        from dual_chat import build_window
+        self.client.reset()
+        self.window = build_window(self.client, logger=TEST_LOGGER)
+        self.window.show()
+        self.state = self.window._dual_chat
+        self._wait_for(lambda: self.state["widgets"]["A"]["picker"].count() == 2)
+        self._pick_models()
+
+    def tearDown(self):
+        self.window.close()
+        self._clear_temperatures()
+
+    def _clear_temperatures(self):
+        from PySide6.QtCore import QSettings
+        settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
+        settings.remove(SETTING_TEMPERATURE % "A")
+        settings.remove(SETTING_TEMPERATURE % "B")
+        settings.sync()
+
+    def _wait_for(self, cond, timeout=10.0):
+        from PySide6.QtTest import QTest
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            QTest.qWait(50)
+            if cond():
+                return True
+        return cond()
+
+    def _pick_models(self):
+        self.state["widgets"]["A"]["picker"].setCurrentIndex(0)
+        self.state["widgets"]["B"]["picker"].setCurrentIndex(1)
+        self.app.processEvents()
+
+    def _temp(self, side):
+        return self.state["widgets"][side]["temperature"]
+
+    def test_controls_present_and_default(self):
+        for side in ("A", "B"):
+            spin = self._temp(side)
+            self.assertTrue(spin.isVisible())
+            self.assertEqual(spin.value(), TEMPERATURE_DEFAULT)
+            self.assertEqual(spin.minimum(), TEMPERATURE_MIN)
+            self.assertEqual(spin.maximum(), TEMPERATURE_MAX)
+            self.assertEqual(spin.singleStep(), 0.1)
+            self.assertEqual(spin.decimals(), 1)
+            self.assertIn("0.7 is Ollama's default", spin.toolTip())
+
+    def test_temperature_clamps_to_range(self):
+        self._temp("A").setValue(5.0)
+        self.assertEqual(self._temp("A").value(), TEMPERATURE_MAX)
+        self._temp("A").setValue(-1.0)
+        self.assertEqual(self._temp("A").value(), TEMPERATURE_MIN)
+
+    def test_temperature_persists_across_restart(self):
+        from dual_chat import build_window
+        self._temp("A").setValue(1.3)
+        self._temp("B").setValue(0.2)
+        self.app.processEvents()
+        self.window.close()
+        self.app.processEvents()
+        window2 = build_window(self.client, logger=TEST_LOGGER)
+        try:
+            window2.show()
+            state2 = window2._dual_chat
+            self.assertTrue(self._wait_for(
+                lambda: state2["widgets"]["A"]["picker"].count() == 2))
+            self.assertEqual(
+                state2["widgets"]["A"]["temperature"].value(), 1.3)
+            self.assertEqual(
+                state2["widgets"]["B"]["temperature"].value(), 0.2)
+        finally:
+            window2.close()
+
+    def test_send_to_both_transmits_each_sides_temperature(self):
+        self._temp("A").setValue(0.3)
+        self._temp("B").setValue(1.4)
+        self.app.processEvents()
+        self.client.options_seen.clear()
+        self.state["composer"].setPlainText("Hello, both of you.")
+        self.state["send_both"].click()
+        ok = self._wait_for(lambda: (
+            len(self.state["convo"].sides["A"].history) == 2
+            and len(self.state["convo"].sides["B"].history) == 2),
+            timeout=15)
+        self.assertTrue(ok, "send to both should land in both panes")
+        self.assertEqual(
+            self.client.options_seen,
+            [("fake-a:latest", {"temperature": 0.3}),
+             ("fake-b:latest", {"temperature": 1.4})])
+
+    def test_relay_hops_transmit_each_sides_temperature(self):
+        self._temp("A").setValue(0.3)
+        self._temp("B").setValue(1.4)
+        self.app.processEvents()
+        self.client.options_seen.clear()
+        self.state["start_picker"].setCurrentIndex(0)  # A starts
+        self.state["cap_spin"].setValue(2)
+        self.state["mode_picker"].setCurrentIndex(0)  # Blind
+        self.state["composer"].setPlainText("Talk to each other.")
+        self.app.processEvents()
+        self.state["relay_btn"].click()
+        ok = self._wait_for(
+            lambda: self.state["relay_status"].text().startswith(
+                "Relay stopped"),
+            timeout=20)
+        self.assertTrue(ok, "relay should run and stop: %s"
+                        % self.state["relay_status"].text())
+        # Turn 1 is A's (the seed), turn 2 is B's (A's reply).
+        self.assertEqual(
+            self.client.options_seen,
+            [("fake-a:latest", {"temperature": 0.3}),
+             ("fake-b:latest", {"temperature": 1.4})])
 
 
 if __name__ == "__main__":

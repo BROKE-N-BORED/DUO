@@ -96,6 +96,11 @@ v0.18: atomic writes everywhere. The pairs file and all three
   write can never leave a half-written file behind -- the old file
   stays intact, and a failed save says so plainly instead of
   crashing.
+v0.19: temperature controls. Each pane has a Temperature control
+  (0.0-2.0, default 0.7, which is Ollama's own default -- made
+  visible instead of silent). The value travels with every turn
+  that side generates, as Ollama's options, and is remembered per
+  side between runs.
 """
 
 import datetime
@@ -195,7 +200,7 @@ def make_debug_logger(log_dir=None):
         return _NullLogger()
 
 APP_NAME = "DUO"
-APP_VERSION = "0.18"
+APP_VERSION = "0.19"
 DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434"
 OLLAMA_URL_ENV = "DUAL_CHAT_OLLAMA_URL"
 
@@ -243,6 +248,12 @@ SETTING_ENTER_TO_SEND = "composer/enter_to_send"
 # split are remembered the same way, saved when the window closes.
 SETTING_WINDOW_GEOMETRY = "window/geometry"
 SETTING_SPLITTER_STATE = "window/splitter"
+# Model parameters (v0.19): each side's temperature is remembered
+# per side the same way. %s is the side ("A"/"B").
+SETTING_TEMPERATURE = "temperature/%s"
+TEMPERATURE_DEFAULT = 0.7  # Ollama's own default, made visible.
+TEMPERATURE_MIN = 0.0
+TEMPERATURE_MAX = 2.0
 
 # Agreement stop: simple case-insensitive substring matching on this
 # fixed list. No LLM judge -- the 2B models are slow enough already.
@@ -483,11 +494,16 @@ class OllamaClient:
             return False
 
     def chat_stream(self, model, messages, on_chunk, cancel_event,
-                    timeout=CHAT_TIMEOUT, on_metrics=None, on_retry=None):
+                    timeout=CHAT_TIMEOUT, on_metrics=None, on_retry=None,
+                    options=None):
         """Stream one chat turn. Calls on_chunk(text) per delta.
 
         Returns the full reply text. Raises Cancelled if cancel_event is
         set, OllamaError with a plain message on failure.
+
+        ``options`` (optional) is Ollama's options dict for the turn --
+        the GUI passes {"temperature": <the side's value>}. When None,
+        no options key is sent at all, so Ollama uses its defaults.
 
         on_metrics (optional) is called once at the end with the turn's
         timing: eval_count and eval_duration_ns from the streamed done
@@ -515,7 +531,7 @@ class OllamaClient:
             try:
                 return self._chat_attempt(
                     model, messages, on_chunk, cancel_event,
-                    timeout, started, on_metrics)
+                    timeout, started, on_metrics, options)
             except _Retryable as exc:
                 if attempt >= CHAT_MAX_ATTEMPTS:
                     raise self._final_ollama_error(exc)
@@ -541,15 +557,17 @@ class OllamaClient:
         return OllamaError(MSG_OLLAMA_DOWN)
 
     def _chat_attempt(self, model, messages, on_chunk, cancel_event,
-                      timeout, started, on_metrics):
+                      timeout, started, on_metrics, options=None):
         """One try at a chat turn. Returns the full reply text.
 
         Raises Cancelled, OllamaError (model failure, or a mid-stream
         failure after content already streamed), or _Retryable (a
         failure before any content streamed -- safe to try again).
         """
-        body = json.dumps(
-            {"model": model, "messages": messages, "stream": True}).encode("utf-8")
+        payload = {"model": model, "messages": messages, "stream": True}
+        if options is not None:
+            payload["options"] = options
+        body = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(
             self.base_url + "/api/chat", data=body,
             headers={"Content-Type": "application/json"}, method="POST")
@@ -1987,6 +2005,12 @@ def build_window(client=None, logger=None, deck_port=None):
     panes = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
     root.addWidget(panes, stretch=1)
 
+    # Persisted preferences (QSettings): created here, before the
+    # panes, because the panes read their saved temperatures as they
+    # are built. Explicit org/app names so the settings land in the
+    # same place no matter how the app was launched.
+    prefs = QtCore.QSettings(SETTINGS_ORG, SETTINGS_APP)
+
     # --- one pane per side -----------------------------------------------
     widgets = {}  # side -> dict of widgets
 
@@ -2017,6 +2041,32 @@ def build_window(client=None, logger=None, deck_port=None):
         refresh = QtWidgets.QPushButton("Refresh")
         picker_row.addWidget(refresh)
         layout.addLayout(picker_row)
+
+        # Temperature (v0.19): per side, 0.0-2.0, default 0.7 -- that
+        # is Ollama's own default, made visible instead of silent.
+        # Remembered per side between runs (QSettings).
+        temp_row = QtWidgets.QHBoxLayout()
+        temp_label = QtWidgets.QLabel("Temperature")
+        temp_row.addWidget(temp_label)
+        temp_spin = QtWidgets.QDoubleSpinBox()
+        temp_spin.setRange(TEMPERATURE_MIN, TEMPERATURE_MAX)
+        temp_spin.setSingleStep(0.1)
+        temp_spin.setDecimals(1)
+        temp_spin.setToolTip(
+            "0.7 is Ollama's default — lower is more focused, "
+            "higher is more random.")
+        temp_spin.setValue(prefs.value(
+            SETTING_TEMPERATURE % side, TEMPERATURE_DEFAULT,
+            type=float))
+
+        def _save_temperature(value):
+            prefs.setValue(SETTING_TEMPERATURE % side, float(value))
+            prefs.sync()
+
+        temp_spin.valueChanged.connect(_save_temperature)
+        temp_row.addWidget(temp_spin)
+        temp_row.addStretch(1)
+        layout.addLayout(temp_row)
 
         # Per-side instructions (system prompt). Collapsed by default;
         # empty means no system message is sent for this side.
@@ -2096,6 +2146,7 @@ def build_window(client=None, logger=None, deck_port=None):
 
         widgets[side] = {
             "picker": picker, "refresh": refresh, "transcript": transcript,
+            "temperature": temp_spin,
             "status": status, "stop": stop, "clear": clear,
             "save": save,
             "instr_toggle": instr_toggle, "instr_edit": instr_edit,
@@ -2146,7 +2197,6 @@ def build_window(client=None, logger=None, deck_port=None):
     enter_send_check.setToolTip(
         "When on, Enter sends to both models and Shift+Enter adds "
         "a new line. Ctrl+Enter always sends to both.")
-    prefs = QtCore.QSettings(SETTINGS_ORG, SETTINGS_APP)
     enter_send_check.setChecked(
         prefs.value(SETTING_ENTER_TO_SEND, False, type=bool))
 
@@ -2554,6 +2604,13 @@ def build_window(client=None, logger=None, deck_port=None):
     def make_job_fn(job_id, model, messages, track_stats=True):
         holder = {"metrics": None, "ram": None}
         job_stats[job_id] = holder
+        # Temperature (v0.19): read when the job is made -- the value
+        # in effect when the turn was started -- and sent as Ollama's
+        # options. Every generation goes through here: direct sends,
+        # relay hops, task runs, and summaries.
+        job_side, _is_summary = _job_side(job_id)
+        options = {"temperature":
+                   widgets[job_side]["temperature"].value()}
 
         def _on_retry(attempt, delay, kind):
             logger.warning(
@@ -2561,7 +2618,7 @@ def build_window(client=None, logger=None, deck_port=None):
                 "retrying in %.1fs", model, attempt, kind, delay)
 
         def fn(emit, cancel_event):
-            kwargs = {"on_retry": _on_retry}
+            kwargs = {"on_retry": _on_retry, "options": options}
             if track_stats:
                 kwargs["on_metrics"] = (
                     lambda m: holder.update(metrics=m))
