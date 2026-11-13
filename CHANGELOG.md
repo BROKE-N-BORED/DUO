@@ -1,7 +1,17 @@
 # DUO changelog
 
 Every version, newest first. v0.1–v0.17 were built on 2026-11-12;
-v0.18–v0.19 on 2026-11-13.
+v0.18–v0.20 on 2026-11-13.
+
+## v0.20 — 2026-11-13
+
+Token counts. The stats line under each pane now shows how many
+tokens the last turn used — generated and prompt, straight from
+Ollama's done chunk, never estimated. Underneath it, each pane
+keeps a running session total across every generation since the
+app started — sends, relay hops, tasks, and summaries. A failed
+turn shows n/a and adds nothing; Clear never resets the session
+total.
 
 ## v0.19 — 2026-11-13
 

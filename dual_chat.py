@@ -101,6 +101,11 @@ v0.19: temperature controls. Each pane has a Temperature control
   visible instead of silent). The value travels with every turn
   that side generates, as Ollama's options, and is remembered per
   side between runs.
+v0.20: token counts. The stats line shows how many tokens the last
+  turn used -- generated and prompt, straight from Ollama's done
+  chunk, never estimated -- and each pane keeps a running session
+  total underneath. A failed turn shows n/a and adds nothing;
+  Clear never resets the session total.
 """
 
 import datetime
@@ -200,7 +205,7 @@ def make_debug_logger(log_dir=None):
         return _NullLogger()
 
 APP_NAME = "DUO"
-APP_VERSION = "0.19"
+APP_VERSION = "0.20"
 DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434"
 OLLAMA_URL_ENV = "DUAL_CHAT_OLLAMA_URL"
 
@@ -373,9 +378,12 @@ def compute_turn_stats(metrics):
     """Turn metrics into display numbers.
 
     metrics comes from the streamed done chunk plus client-side
-    timing: eval_count, eval_duration_ns, ttft_s, total_s. Anything
-    missing (or not a number) stays None and shows as "n/a" -- never
-    invented. tokens/sec is eval_count over eval_duration in seconds.
+    timing: eval_count, eval_duration_ns, prompt_eval_count,
+    ttft_s, total_s. Anything missing (or not a number) stays None
+    and shows as "n/a" -- never invented. tokens/sec is eval_count
+    over eval_duration in seconds. The counts are the turn's own
+    numbers, straight from Ollama -- generated (out) and prompt
+    (in) -- never estimated from characters.
     """
     count = metrics.get("eval_count")
     duration = metrics.get("eval_duration_ns")
@@ -387,7 +395,12 @@ def compute_turn_stats(metrics):
     def _num(value):
         return value if isinstance(value, (int, float)) else None
 
+    def _count(value):
+        return int(value) if isinstance(value, (int, float)) else None
+
     return {"tok_per_sec": tok_per_sec,
+            "eval_count": _count(metrics.get("eval_count")),
+            "prompt_eval_count": _count(metrics.get("prompt_eval_count")),
             "ttft_s": _num(metrics.get("ttft_s")),
             "total_s": _num(metrics.get("total_s"))}
 
@@ -399,29 +412,53 @@ def format_ram(size_bytes):
     return "%d MB" % round(size_bytes / 1_000_000)
 
 
-STATS_EMPTY_LINE = "-- tok/s · first token -- · turn -- · RAM --"
+STATS_EMPTY_LINE = ("-- tok/s · -- out / -- in · first token -- · "
+                    "turn -- · RAM --")
+
+
+def format_session_line(totals):
+    """A side's running session total: "Session: 42 out / 128 in".
+
+    totals is {"out": int, "in": int} -- tokens generated and
+    prompt tokens across every generation this side has made since
+    the app started.
+    """
+    return "Session: %d out / %d in" % (totals["out"], totals["in"])
 
 
 def format_stats_line(stats):
     """One line for a pane's stats label.
 
-    stats is {"tok_per_sec": float|None, "ttft_s": float|None,
+    stats is {"tok_per_sec": float|None, "eval_count": int|None,
+    "prompt_eval_count": int|None, "ttft_s": float|None,
     "total_s": float|None, "ram": str|None} -- "ram" is preformatted,
     e.g. "1.9 GB in RAM" or "not loaded". None (before any turn) shows
-    dashes; a missing number shows "n/a".
+    dashes; a missing number shows "n/a". The token segment sits
+    right after the speed: "42 out / 128 in" when Ollama reported
+    both counts, "tokens n/a" when it reported neither, and the
+    half it did report when it reported only one.
     """
     if stats is None:
         return STATS_EMPTY_LINE
     tok = stats.get("tok_per_sec")
+    out = stats.get("eval_count")
+    prompt = stats.get("prompt_eval_count")
     ttft = stats.get("ttft_s")
     total = stats.get("total_s")
     tok_text = ("%.1f tok/s" % tok) if tok is not None else "tok/s n/a"
+    if out is None and prompt is None:
+        tokens_text = "tokens n/a"
+    else:
+        out_text = ("%d out" % out) if out is not None else "n/a out"
+        in_text = ("%d in" % prompt) if prompt is not None else "n/a in"
+        tokens_text = "%s / %s" % (out_text, in_text)
     ttft_text = (("first token %.2fs" % ttft) if ttft is not None
                  else "first token n/a")
     total_text = (("turn %.1fs" % total) if total is not None
                   else "turn n/a")
     ram_text = stats.get("ram") or "RAM n/a"
-    return "%s · %s · %s · %s" % (tok_text, ttft_text, total_text, ram_text)
+    return "%s · %s · %s · %s · %s" % (
+        tok_text, tokens_text, ttft_text, total_text, ram_text)
 
 
 def _ollama_failure_kind(exc):
@@ -506,10 +543,11 @@ class OllamaClient:
         no options key is sent at all, so Ollama uses its defaults.
 
         on_metrics (optional) is called once at the end with the turn's
-        timing: eval_count and eval_duration_ns from the streamed done
-        chunk, plus client-side ttft_s (request start to first content
-        chunk) and total_s. Missing fields are None. Both timings span
-        the whole turn, retries included -- that is what the user waited.
+        timing: eval_count, eval_duration_ns, and prompt_eval_count
+        from the streamed done chunk, plus client-side ttft_s
+        (request start to first content chunk) and total_s. Missing
+        fields are None. Both timings span the whole turn, retries
+        included -- that is what the user waited.
 
         on_retry (optional) is called before each retry with
         (attempt, delay_seconds, kind): attempt is the attempt that
@@ -628,6 +666,7 @@ class OllamaClient:
             on_metrics({
                 "eval_count": final.get("eval_count"),
                 "eval_duration_ns": final.get("eval_duration"),
+                "prompt_eval_count": final.get("prompt_eval_count"),
                 "total_duration_ns": final.get("total_duration"),
                 "prompt_eval_duration_ns": final.get("prompt_eval_duration"),
                 "ttft_s": ttft,
@@ -2092,6 +2131,14 @@ def build_window(client=None, logger=None, deck_port=None):
         stats.setStyleSheet("font-size: 11px;")
         layout.addWidget(stats)
 
+        # Session token total: every token this side has generated
+        # or been prompted with since the app started. Clear never
+        # resets it -- only restarting the app does.
+        session_tokens = QtWidgets.QLabel(
+            format_session_line({"out": 0, "in": 0}))
+        session_tokens.setStyleSheet("font-size: 11px;")
+        layout.addWidget(session_tokens)
+
         # Summarize row: the nudge label appears when this side's
         # history passes the budget; the button is always here.
         summarize_row = QtWidgets.QHBoxLayout()
@@ -2154,7 +2201,8 @@ def build_window(client=None, logger=None, deck_port=None):
             "hist_frame": hist_frame, "hist_list": hist_list,
             "hist_up": hist_up, "hist_down": hist_down,
             "hist_delete": hist_delete,
-            "stats": stats, "nudge": nudge, "summarize": summarize_btn,
+            "stats": stats, "session_tokens": session_tokens,
+            "nudge": nudge, "summarize": summarize_btn,
             "reply_open": False,
         }
         return frame
@@ -2355,6 +2403,11 @@ def build_window(client=None, logger=None, deck_port=None):
              # Last completed turn's stats per side (None until a turn
              # has run), and the side currently summarizing, if any.
              "stats": {"A": None, "B": None}, "summarizing": None,
+             # Session token totals per side: {"out": int, "in": int}
+             # across every generation since the app started. Clear
+             # never resets these -- only restarting the app does.
+             "session_tokens": {"A": {"out": 0, "in": 0},
+                                "B": {"out": 0, "in": 0}},
              # Attachments waiting for the next send: [{"name", "text"}].
              # One-shot -- they clear after a send.
              "attachments": [],
@@ -2581,6 +2634,10 @@ def build_window(client=None, logger=None, deck_port=None):
         widgets[side]["stats"].setText(
             format_stats_line(state["stats"][side]))
 
+    def refresh_session_label(side):
+        widgets[side]["session_tokens"].setText(
+            format_session_line(state["session_tokens"][side]))
+
     # --- runner wiring ----------------------------------------------------
     job_stats = {}  # job id -> {"metrics": dict|None, "ram": str|None}
 
@@ -2657,6 +2714,30 @@ def build_window(client=None, logger=None, deck_port=None):
         if job_id.startswith("sum-"):
             return job_id[4:], True
         return job_id, False
+
+    def _take_job_stats(job_id, side):
+        """Pop a finished job's holder and return its stats dict.
+
+        The turn's token counts -- when Ollama reported them -- are
+        folded into the side's session total first. A job with no
+        holder (never tracked) returns None. A failed turn has no
+        metrics, so its stats come back all None and nothing is
+        added to the total. The caller decides whether the stats
+        line itself gets the result: summaries count toward the
+        total but never overwrite the last real turn's line.
+        """
+        holder = job_stats.pop(job_id, None)
+        if holder is None:
+            return None
+        stats = compute_turn_stats(holder.get("metrics") or {})
+        stats["ram"] = holder.get("ram")
+        totals = state["session_tokens"][side]
+        if stats["eval_count"] is not None:
+            totals["out"] += stats["eval_count"]
+        if stats["prompt_eval_count"] is not None:
+            totals["in"] += stats["prompt_eval_count"]
+        refresh_session_label(side)
+        return stats
 
     def on_started(job_id):
         if not alive():
@@ -2839,6 +2920,9 @@ def build_window(client=None, logger=None, deck_port=None):
             return
         side, is_summary = _job_side(job_id)
         if is_summary:
+            # A summarize turn counts toward the session token total
+            # but never overwrites the last real turn's stats line.
+            _take_job_stats(job_id, side)
             finish_summarize(side, text)
             return
         finish_reply(side)
@@ -2847,13 +2931,9 @@ def build_window(client=None, logger=None, deck_port=None):
         refresh_history_list(side)
         state["active"].discard(side)
         set_status(side, "Idle")
-        # Stats for this turn (every turn, relay turns included). A
-        # summarize turn never lands here, so it never overwrites the
-        # last real turn's stats.
-        holder = job_stats.pop(job_id, None)
-        if holder is not None:
-            stats = compute_turn_stats(holder.get("metrics") or {})
-            stats["ram"] = holder.get("ram")
+        # Stats for this turn (every turn, relay turns included).
+        stats = _take_job_stats(job_id, side)
+        if stats is not None:
             state["stats"][side] = stats
             refresh_stats_label(side)
             logger.info(
@@ -2894,6 +2974,9 @@ def build_window(client=None, logger=None, deck_port=None):
         side, is_summary = _job_side(job_id)
         if is_summary:
             state["summarizing"] = None
+            # A failed summarize contributes nothing -- no counts,
+            # and the stats line is not a summarize turn's to touch.
+            job_stats.pop(job_id, None)
             append_note(side, "(Summarize failed: %s)" % message)
             set_status(side, "Idle")
             logger.error("summarize failed: side %s: %s" % (side, message))
@@ -2903,6 +2986,12 @@ def build_window(client=None, logger=None, deck_port=None):
         append_note(side, "(%s)" % message)
         state["active"].discard(side)
         set_status(side, "Idle")
+        # The failed turn has no numbers: its stats show n/a, and
+        # nothing is added to the session total.
+        stats = _take_job_stats(job_id, side)
+        if stats is not None:
+            state["stats"][side] = stats
+            refresh_stats_label(side)
         logger.error("turn failed: side %s, model %s: %s"
                      % (side, convo.sides[side].model, message))
         # Ollama down or unresponsive: offer the Start Ollama button.
@@ -2920,6 +3009,8 @@ def build_window(client=None, logger=None, deck_port=None):
     def on_cancelled(job_id):
         if not alive():
             return
+        # A stopped turn contributes nothing -- no stats, no counts.
+        job_stats.pop(job_id, None)
         side, is_summary = _job_side(job_id)
         if is_summary:
             # No button cancels a summarize turn, but stay safe if one
@@ -3343,8 +3434,11 @@ def build_window(client=None, logger=None, deck_port=None):
         messages = side_obj.messages_for_model() + [
             {"role": "user", "content": SUMMARIZE_PROMPT}]
         set_status(side, "Summarizing...")
+        # Summaries track stats so their tokens count toward the
+        # session total (v0.20); on_done never lets them touch the
+        # stats line itself.
         runner.submit("sum-" + side, make_job_fn(
-            "sum-" + side, side_obj.model, messages, track_stats=False))
+            "sum-" + side, side_obj.model, messages, track_stats=True))
         refresh_buttons()
 
     # --- relay ------------------------------------------------------------

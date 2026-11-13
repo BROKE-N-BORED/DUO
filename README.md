@@ -30,7 +30,7 @@ Everything in one app:
 - **Long loops** — Summarize folds a long conversation into a short
   summary so it keeps fitting a small model's context, a nudge
   suggests it when a history gets long, and every turn shows its
-  speed and the model's RAM.
+  speed, its token counts, and the model's RAM.
 - **Files** — attach text files to a message and the model reads
   them with it.
 - **Tasks** — give one model a job and have the other review it or
@@ -183,10 +183,14 @@ bash run.sh
   the pane shows "History is long — Summarize?" next to the button.
   The nudge never calls the model on its own — you decide.
 - Stats: under each pane, the last completed turn's speed — tokens
-  per second, time to first token, total turn time — plus the model's
-  RAM from Ollama ("1.9 GB in RAM", or "not loaded" when it isn't
-  running). Dashes until a turn has run; "n/a" when Ollama doesn't
-  report a number.
+  per second, time to first token, total turn time — plus how many
+  tokens the turn used ("42 out / 128 in": generated and prompt,
+  straight from Ollama) and the model's RAM from Ollama ("1.9 GB in
+  RAM", or "not loaded" when it isn't running). Dashes until a turn
+  has run; "n/a" when Ollama doesn't report a number. Underneath,
+  each pane keeps a running session total ("Session: 42 out /
+  128 in") across every generation since the app started; Clear
+  never resets it.
 
 ## Files
 

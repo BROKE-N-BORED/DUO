@@ -47,7 +47,8 @@ from dual_chat import (  # noqa: E402
     default_conversation_filename, default_debug_filename,
     default_full_filename, default_side_filename, delete_pair,
     format_both_transcript,
-    format_full_transcript, format_ram, format_side_transcript,
+    format_full_transcript, format_ram, format_session_line,
+    format_side_transcript,
     format_stats_line, get_lan_ip, load_attachment,
     load_conversation_file, load_pairs,
     make_debug_logger,
@@ -133,6 +134,7 @@ class FakeOllamaHandler(BaseHTTPRequestHandler):
                             "done": True, "done_reason": "stop",
                             "eval_count": 20,
                             "eval_duration": 1000000000,
+                            "prompt_eval_count": 128,
                             "prompt_eval_duration": 200000000,
                             "total_duration": 1500000000}
                            ).encode("utf-8") + b"\n")
@@ -617,6 +619,7 @@ class OllamaClientTests(unittest.TestCase):
         # The done chunk's timing fields, exactly as the server sent them.
         self.assertEqual(seen["eval_count"], 20)
         self.assertEqual(seen["eval_duration_ns"], 1000000000)
+        self.assertEqual(seen["prompt_eval_count"], 128)
         self.assertEqual(seen["prompt_eval_duration_ns"], 200000000)
         self.assertEqual(seen["total_duration_ns"], 1500000000)
         # Client-side timing is measured, not canned: present, sane.
@@ -659,6 +662,7 @@ class FakeGuiClient:
     """
 
     DEFAULT_METRICS = {"eval_count": 10, "eval_duration_ns": 500000000,
+                       "prompt_eval_count": 100,
                        "ttft_s": 0.25, "total_s": 0.75}
 
     def __init__(self):
@@ -1309,13 +1313,17 @@ class StatsMathTests(unittest.TestCase):
     def test_compute_tok_per_sec_exact(self):
         stats = compute_turn_stats({
             "eval_count": 40, "eval_duration_ns": 2000000000,
+            "prompt_eval_count": 128,
             "ttft_s": 0.5, "total_s": 2.5})
         self.assertEqual(stats, {"tok_per_sec": 20.0,
+                                 "eval_count": 40,
+                                 "prompt_eval_count": 128,
                                  "ttft_s": 0.5, "total_s": 2.5})
 
     def test_compute_missing_fields_are_none(self):
         self.assertEqual(compute_turn_stats({}),
-                         {"tok_per_sec": None, "ttft_s": None,
+                         {"tok_per_sec": None, "eval_count": None,
+                          "prompt_eval_count": None, "ttft_s": None,
                           "total_s": None})
         # Zero duration: no division, no invented speed.
         self.assertIsNone(compute_turn_stats(
@@ -1329,19 +1337,49 @@ class StatsMathTests(unittest.TestCase):
 
     def test_format_stats_line_exact(self):
         self.assertEqual(format_stats_line(None),
-                         "-- tok/s · first token -- · turn -- · RAM --")
+                         "-- tok/s · -- out / -- in · first token -- · "
+                         "turn -- · RAM --")
         self.assertEqual(format_stats_line({
-            "tok_per_sec": 20.0, "ttft_s": 0.5, "total_s": 2.5,
+            "tok_per_sec": 20.0, "eval_count": 40,
+            "prompt_eval_count": 128, "ttft_s": 0.5, "total_s": 2.5,
             "ram": "1.9 GB in RAM"}),
-            "20.0 tok/s · first token 0.50s · turn 2.5s · 1.9 GB in RAM")
+            "20.0 tok/s · 40 out / 128 in · first token 0.50s · "
+            "turn 2.5s · 1.9 GB in RAM")
         self.assertEqual(format_stats_line({
-            "tok_per_sec": None, "ttft_s": None, "total_s": None,
+            "tok_per_sec": None, "eval_count": None,
+            "prompt_eval_count": None, "ttft_s": None, "total_s": None,
             "ram": "not loaded"}),
-            "tok/s n/a · first token n/a · turn n/a · not loaded")
+            "tok/s n/a · tokens n/a · first token n/a · turn n/a · "
+            "not loaded")
         self.assertEqual(format_stats_line({
-            "tok_per_sec": 12.345, "ttft_s": 1.0, "total_s": 10.0,
+            "tok_per_sec": 12.345, "eval_count": 7,
+            "prompt_eval_count": 90, "ttft_s": 1.0, "total_s": 10.0,
             "ram": None}),
-            "12.3 tok/s · first token 1.00s · turn 10.0s · RAM n/a")
+            "12.3 tok/s · 7 out / 90 in · first token 1.00s · "
+            "turn 10.0s · RAM n/a")
+
+    def test_format_stats_line_partial_counts(self):
+        # Only one count reported: show the half Ollama sent.
+        base = {"tok_per_sec": 20.0, "ttft_s": 0.5, "total_s": 2.5,
+                "ram": "1.9 GB in RAM"}
+        self.assertIn("40 out / n/a in", format_stats_line(dict(
+            base, eval_count=40, prompt_eval_count=None)))
+        self.assertIn("n/a out / 128 in", format_stats_line(dict(
+            base, eval_count=None, prompt_eval_count=128)))
+
+    def test_compute_non_number_counts_are_none(self):
+        # A non-number is not a count: the sanitizer drops it before
+        # the formatter ever sees it.
+        stats = compute_turn_stats({"eval_count": "many",
+                                    "prompt_eval_count": "lots"})
+        self.assertIsNone(stats["eval_count"])
+        self.assertIsNone(stats["prompt_eval_count"])
+
+    def test_format_session_line(self):
+        self.assertEqual(format_session_line({"out": 0, "in": 0}),
+                         "Session: 0 out / 0 in")
+        self.assertEqual(format_session_line({"out": 42, "in": 128}),
+                         "Session: 42 out / 128 in")
 
     def test_parse_ps_payload(self):
         self.assertEqual(parse_ps_payload(
@@ -1983,23 +2021,27 @@ class Item4GuiTests(unittest.TestCase):
         self.assertEqual(len(self.state["convo"].sides["A"].history), 6)
 
     def test_stats_show_dashes_before_any_turn(self):
-        dashes = "-- tok/s · first token -- · turn -- · RAM --"
+        dashes = ("-- tok/s · -- out / -- in · first token -- · "
+                  "turn -- · RAM --")
         self.assertEqual(self._stats("A"), dashes)
         self.assertEqual(self._stats("B"), dashes)
 
     def test_stats_after_turn_show_exact_canned_values(self):
         self.client.metrics = {"fake-a:latest": {
             "eval_count": 40, "eval_duration_ns": 2000000000,
+            "prompt_eval_count": 128,
             "ttft_s": 0.5, "total_s": 2.5}}
         self.client.ps = {"fake-a:latest": 1900000000}
         self.assertTrue(self._send_to_a_and_wait("Hello"))
         self.assertEqual(
             self._stats("A"),
-            "20.0 tok/s · first token 0.50s · turn 2.5s · 1.9 GB in RAM")
+            "20.0 tok/s · 40 out / 128 in · first token 0.50s · "
+            "turn 2.5s · 1.9 GB in RAM")
         # B hasn't run: still dashes.
         self.assertEqual(
             self._stats("B"),
-            "-- tok/s · first token -- · turn -- · RAM --")
+            "-- tok/s · -- out / -- in · first token -- · "
+            "turn -- · RAM --")
 
     def test_stats_ram_not_loaded(self):
         self.client.ps = {}  # nothing running
@@ -2012,7 +2054,8 @@ class Item4GuiTests(unittest.TestCase):
         self.assertTrue(self._send_to_a_and_wait("Hello"))
         self.assertEqual(
             self._stats("A"),
-            "tok/s n/a · first token n/a · turn n/a · not loaded")
+            "tok/s n/a · tokens n/a · first token n/a · turn n/a · "
+            "not loaded")
 
     def test_stats_update_after_relay_turns(self):
         self.client.replies = {"fake-a:latest": ["apple pie"],
@@ -2020,9 +2063,11 @@ class Item4GuiTests(unittest.TestCase):
         self.client.metrics = {
             "fake-a:latest": {"eval_count": 10,
                               "eval_duration_ns": 1000000000,
+                              "prompt_eval_count": 50,
                               "ttft_s": 0.1, "total_s": 1.0},
             "fake-b:latest": {"eval_count": 30,
                               "eval_duration_ns": 1000000000,
+                              "prompt_eval_count": 75,
                               "ttft_s": 0.2, "total_s": 1.5}}
         self.client.ps = {"fake-a:latest": 1900000000,
                           "fake-b:latest": 1500000000}
@@ -2030,20 +2075,24 @@ class Item4GuiTests(unittest.TestCase):
         self.assertTrue(self._wait_for_relay_stopped())
         self.assertEqual(
             self._stats("A"),
-            "10.0 tok/s · first token 0.10s · turn 1.0s · 1.9 GB in RAM")
+            "10.0 tok/s · 10 out / 50 in · first token 0.10s · "
+            "turn 1.0s · 1.9 GB in RAM")
         self.assertEqual(
             self._stats("B"),
-            "30.0 tok/s · first token 0.20s · turn 1.5s · 1.5 GB in RAM")
+            "30.0 tok/s · 30 out / 75 in · first token 0.20s · "
+            "turn 1.5s · 1.5 GB in RAM")
 
     def test_stats_reset_when_side_cleared(self):
         self.assertTrue(self._send_to_a_and_wait("Hello"))
         self.assertNotEqual(
             self._stats("A"),
-            "-- tok/s · first token -- · turn -- · RAM --")
+            "-- tok/s · -- out / -- in · first token -- · "
+            "turn -- · RAM --")
         self.state["widgets"]["A"]["clear"].click()
         self.assertEqual(
             self._stats("A"),
-            "-- tok/s · first token -- · turn -- · RAM --")
+            "-- tok/s · -- out / -- in · first token -- · "
+            "turn -- · RAM --")
 
     def test_summarize_replaces_older_turns(self):
         self.client.replies = {"fake-a:latest": [
@@ -5187,7 +5236,7 @@ class FrontDoorTests(unittest.TestCase):
 
     def test_changelog_covers_every_version(self):
         log = self._read("CHANGELOG.md")
-        for version in ["0.%d" % n for n in range(1, 20)]:
+        for version in ["0.%d" % n for n in range(1, 21)]:
             self.assertIn(version, log)
 
     def test_gitignore_covers_runtime_files(self):
@@ -5930,6 +5979,216 @@ class TemperatureGuiTests(unittest.TestCase):
             self.client.options_seen,
             [("fake-a:latest", {"temperature": 0.3}),
              ("fake-b:latest", {"temperature": 1.4})])
+
+
+@unittest.skipUnless(os.environ.get("DUAL_CHAT_GUI_TESTS") == "1",
+                     "GUI tests run with DUAL_CHAT_GUI_TESTS=1")
+class TokenCountGuiTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        from PySide6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+        cls.client = FakeGuiClient()
+
+    def setUp(self):
+        from dual_chat import build_window
+        self.client.reset()
+        self.window = build_window(self.client, logger=TEST_LOGGER)
+        self.window.show()
+        self.state = self.window._dual_chat
+        self._wait_for(lambda: self.state["widgets"]["A"]["picker"].count() == 2)
+        self._pick_models()
+
+    def tearDown(self):
+        self.window.close()
+
+    def _wait_for(self, cond, timeout=10.0):
+        from PySide6.QtTest import QTest
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            QTest.qWait(50)
+            if cond():
+                return True
+        return cond()
+
+    def _pick_models(self):
+        self.state["widgets"]["A"]["picker"].setCurrentIndex(0)
+        self.state["widgets"]["B"]["picker"].setCurrentIndex(1)
+        self.app.processEvents()
+
+    def _stats(self, side):
+        return self.state["widgets"][side]["stats"].text()
+
+    def _session(self, side):
+        return self.state["widgets"][side]["session_tokens"].text()
+
+    def _send_to_a_and_wait(self, text):
+        before = len(self.state["convo"].sides["A"].history)
+        self.state["composer"].setPlainText(text)
+        self.state["send_a"].click()
+        return self._wait_for(lambda: (
+            len(self.state["convo"].sides["A"].history) > before
+            and not self.state["state"]["busy"]), timeout=15)
+
+    def _send_to_both_and_wait(self, text):
+        before_a = len(self.state["convo"].sides["A"].history)
+        before_b = len(self.state["convo"].sides["B"].history)
+        self.state["composer"].setPlainText(text)
+        self.state["send_both"].click()
+        return self._wait_for(lambda: (
+            len(self.state["convo"].sides["A"].history) > before_a
+            and len(self.state["convo"].sides["B"].history) > before_b
+            and not self.state["state"]["busy"]), timeout=15)
+
+    def test_session_labels_start_at_zero(self):
+        for side in ("A", "B"):
+            label = self.state["widgets"][side]["session_tokens"]
+            self.assertTrue(label.isVisible())
+            self.assertEqual(label.text(), "Session: 0 out / 0 in")
+
+    def test_turn_counts_show_in_stats_line_and_session_label(self):
+        self.client.metrics = {"fake-a:latest": {
+            "eval_count": 42, "eval_duration_ns": 2000000000,
+            "prompt_eval_count": 128,
+            "ttft_s": 0.5, "total_s": 2.5}}
+        self.assertTrue(self._send_to_a_and_wait("Hello"))
+        self.assertIn("42 out / 128 in", self._stats("A"))
+        self.assertEqual(self._session("A"), "Session: 42 out / 128 in")
+        # B hasn't run: its total is still zero.
+        self.assertEqual(self._session("B"), "Session: 0 out / 0 in")
+
+    def test_session_totals_accumulate_across_turns(self):
+        self.client.metrics = {"fake-a:latest": {
+            "eval_count": 42, "eval_duration_ns": 2000000000,
+            "prompt_eval_count": 128,
+            "ttft_s": 0.5, "total_s": 2.5}}
+        self.assertTrue(self._send_to_a_and_wait("first"))
+        self.assertEqual(self._session("A"), "Session: 42 out / 128 in")
+        # Different counts on the second turn: the total is the sum.
+        self.client.metrics = {"fake-a:latest": {
+            "eval_count": 8, "eval_duration_ns": 1000000000,
+            "prompt_eval_count": 22,
+            "ttft_s": 0.1, "total_s": 1.0}}
+        self.assertTrue(self._send_to_a_and_wait("second"))
+        self.assertEqual(self._session("A"), "Session: 50 out / 150 in")
+        # The stats line shows only the latest turn's counts.
+        self.assertIn("8 out / 22 in", self._stats("A"))
+
+    def test_send_and_relay_hop_accumulate(self):
+        self.client.replies = {"fake-a:latest": ["apple pie"],
+                               "fake-b:latest": ["banana split"]}
+        self.client.metrics = {
+            "fake-a:latest": {"eval_count": 10,
+                              "eval_duration_ns": 1000000000,
+                              "prompt_eval_count": 50,
+                              "ttft_s": 0.1, "total_s": 1.0},
+            "fake-b:latest": {"eval_count": 30,
+                              "eval_duration_ns": 1000000000,
+                              "prompt_eval_count": 75,
+                              "ttft_s": 0.2, "total_s": 1.5}}
+        self.assertTrue(self._send_to_both_and_wait("Hello, both."))
+        self.assertEqual(self._session("A"), "Session: 10 out / 50 in")
+        self.assertEqual(self._session("B"), "Session: 30 out / 75 in")
+        # A 2-turn relay: A generates once (the seed), B once (the hop).
+        self.state["start_picker"].setCurrentIndex(0)  # A starts
+        self.state["cap_spin"].setValue(2)
+        self.state["mode_picker"].setCurrentIndex(0)  # Blind
+        self.state["composer"].setPlainText("Talk to each other.")
+        self.app.processEvents()
+        self.state["relay_btn"].click()
+        self.assertTrue(self._wait_for(
+            lambda: self.state["relay_status"].text().startswith(
+                "Relay stopped"), timeout=20))
+        self.assertEqual(self._session("A"), "Session: 20 out / 100 in")
+        self.assertEqual(self._session("B"), "Session: 60 out / 150 in")
+
+    def test_clear_leaves_session_totals_untouched(self):
+        self.client.metrics = {"fake-a:latest": {
+            "eval_count": 42, "eval_duration_ns": 2000000000,
+            "prompt_eval_count": 128,
+            "ttft_s": 0.5, "total_s": 2.5}}
+        self.assertTrue(self._send_to_a_and_wait("Hello"))
+        self.assertEqual(self._session("A"), "Session: 42 out / 128 in")
+        self.state["widgets"]["A"]["clear"].click()
+        self.app.processEvents()
+        # The stats line resets to dashes, the session total stays.
+        self.assertEqual(
+            self._stats("A"),
+            "-- tok/s · -- out / -- in · first token -- · "
+            "turn -- · RAM --")
+        self.assertEqual(self._session("A"), "Session: 42 out / 128 in")
+
+    def test_failed_turn_shows_na_and_adds_nothing(self):
+        from dual_chat import build_window
+
+        class FailingClient(FakeGuiClient):
+            def chat_stream(self, model, messages, on_chunk,
+                            cancel_event, timeout=1800, on_metrics=None,
+                            on_retry=None, options=None):
+                # Partial text streams, then the turn fails -- the
+                # v0.10 shape: the partial reply stays, the counts
+                # are withheld.
+                on_chunk("partial ")
+                raise OllamaError(MSG_OLLAMA_SLOW)
+
+        window = build_window(FailingClient(), logger=TEST_LOGGER)
+        try:
+            window.show()
+            state = window._dual_chat
+            self.assertTrue(self._wait_for(
+                lambda: state["widgets"]["A"]["picker"].count() == 2))
+            state["widgets"]["A"]["picker"].setCurrentIndex(0)
+            self.app.processEvents()
+            state["composer"].setPlainText("hello")
+            state["send_a"].click()
+            pane = state["widgets"]["A"]["transcript"]
+            self.assertTrue(self._wait_for(
+                lambda: "partial" in pane.toPlainText(), timeout=10))
+            self.assertTrue(self._wait_for(
+                lambda: state["widgets"]["A"]["stats"].text().startswith(
+                    "tok/s n/a"), timeout=10))
+            self.assertEqual(
+                state["widgets"]["A"]["stats"].text(),
+                "tok/s n/a · tokens n/a · first token n/a · "
+                "turn n/a · RAM n/a")
+            self.assertEqual(
+                state["widgets"]["A"]["session_tokens"].text(),
+                "Session: 0 out / 0 in")
+        finally:
+            window.close()
+
+    def test_summarize_counts_toward_session_total_not_stats_line(self):
+        self.client.replies = {"fake-a:latest": [
+            "alpha one", "alpha two", "alpha three",
+            "They discussed fruit and picked apple pie."]}
+        self.client.metrics = {"fake-a:latest": {
+            "eval_count": 10, "eval_duration_ns": 1000000000,
+            "prompt_eval_count": 50,
+            "ttft_s": 0.1, "total_s": 1.0}}
+        self.assertTrue(self._send_to_a_and_wait("first message"))
+        self.assertTrue(self._send_to_a_and_wait("second message"))
+        self.assertTrue(self._send_to_a_and_wait("third message"))
+        self.assertEqual(self._session("A"), "Session: 30 out / 150 in")
+        # Give the summarize turn unmistakable counts, so a stats
+        # line overwritten by it would be visible.
+        self.client.metrics = {"fake-a:latest": {
+            "eval_count": 99, "eval_duration_ns": 1000000000,
+            "prompt_eval_count": 999,
+            "ttft_s": 0.1, "total_s": 1.0}}
+        convo = self.state["convo"]
+        summarize_btn = self.state["widgets"]["A"]["summarize"]
+        self.assertTrue(summarize_btn.isEnabled())
+        summarize_btn.click()
+        ok = self._wait_for(lambda: (
+            len(convo.sides["A"].history) == 5
+            and convo.sides["A"].labels[0] == SUMMARY_LABEL
+            and not self.state["state"]["busy"]), timeout=15)
+        self.assertTrue(ok, "history should fold into summary + last 4")
+        # The summarize turn's tokens count toward the session total...
+        self.assertEqual(self._session("A"), "Session: 129 out / 1149 in")
+        # ...but the stats line still shows the last real turn.
+        self.assertIn("10 out / 50 in", self._stats("A"))
+        self.assertNotIn("99 out / 999 in", self._stats("A"))
 
 
 if __name__ == "__main__":
