@@ -147,6 +147,12 @@ bash run.sh
   like "sounds good" or "I agree" -- "I disagreed" doesn't count.
 - Relayed messages carry a [relay] tag in the window so you can always
   tell what was relayed. The models never see the tag.
+- Presets: the Preset row saves the whole relay row — start side,
+  mode, turn cap, stop phrases, agreement, review — under a name,
+  and loads it back from the dropdown. Presets live in
+  duo-relay-presets.json next to the app. Nothing is saved or
+  loaded unless you ask for it. Delete preset removes the
+  selected preset, after asking first.
 
 ## Director controls
 

@@ -3,6 +3,7 @@ __pycache__/
 .venv/
 duo-debug.log
 duo-pairs.json
+duo-relay-presets.json
 duo.png
 *.zip
 .DS_Store

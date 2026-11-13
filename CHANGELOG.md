@@ -1,7 +1,17 @@
 # DUO changelog
 
 Every version, newest first. v0.1–v0.17 were built on 2026-11-12;
-v0.18–v0.20 on 2026-11-13.
+v0.18–v0.21 on 2026-11-13.
+
+## v0.21 — 2026-11-13
+
+Relay presets. The whole relay row — start side, mode, turn cap,
+stop phrases, stop-on-agreement, review-each-hop — can be saved
+under a name and loaded back from a dropdown, the same way saved
+model pairs work. Presets live in duo-relay-presets.json next to
+the app, written atomically; nothing loads by itself, and deleting
+one asks first. A preset file that won't parse earns a plain note
+instead of a crash, and a preset with bad fields is skipped.
 
 ## v0.20 — 2026-11-13
 

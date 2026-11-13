@@ -106,6 +106,11 @@ v0.20: token counts. The stats line shows how many tokens the last
   chunk, never estimated -- and each pane keeps a running session
   total underneath. A failed turn shows n/a and adds nothing;
   Clear never resets the session total.
+v0.21: relay presets. The whole relay row -- start side, mode, turn
+  cap, stop phrases, stop-on-agreement, review-each-hop -- can be
+  saved under a name and loaded back from a dropdown, the same way
+  saved model pairs work. Presets live in duo-relay-presets.json
+  next to the app, written atomically; nothing loads by itself.
 """
 
 import datetime
@@ -205,7 +210,7 @@ def make_debug_logger(log_dir=None):
         return _NullLogger()
 
 APP_NAME = "DUO"
-APP_VERSION = "0.20"
+APP_VERSION = "0.21"
 DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434"
 OLLAMA_URL_ENV = "DUAL_CHAT_OLLAMA_URL"
 
@@ -309,12 +314,19 @@ MSG_TASK_NEEDS_WORKER = "Pick which model does the task."
 MSG_TASK_NEEDS_FOLLOW_UP = "Pick what the other model does with the result."
 
 MSG_PAIR_NEEDS_NAME = "Name the pair first."
+MSG_PRESET_NEEDS_NAME = "Name the preset first."
 MSG_REVIEW_EMPTY = "Nothing to forward -- edit the text or skip this hop."
 
 # Saved model pairs live in a plain JSON file next to the app.
 # DUAL_CHAT_PAIRS_FILE points at a different file (used by the tests).
 PAIRS_ENV = "DUAL_CHAT_PAIRS_FILE"
 PAIRS_FILENAME = "duo-pairs.json"
+
+# Saved relay presets live in their own plain JSON file next to the
+# app, same shape as the pairs file. DUAL_CHAT_PRESETS_FILE points
+# at a different file (used by the tests).
+PRESETS_ENV = "DUAL_CHAT_PRESETS_FILE"
+PRESETS_FILENAME = "duo-relay-presets.json"
 
 # Attachments (Item 5): text files only, each at most 100 KB, at most
 # 5 attached at once. Contents are read at attach time, so a file
@@ -969,6 +981,114 @@ def delete_pair(path, name):
     del pairs[name]
     text = json.dumps({"pairs": pairs}, indent=2, sort_keys=True) + "\n"
     write_text_atomic(path, text, prefix=".duo-pairs-")
+    return True
+
+
+def presets_path():
+    """Where saved relay presets live: duo-relay-presets.json next
+    to the app.
+
+    DUAL_CHAT_PRESETS_FILE overrides it (the tests point it at a
+    temp file).
+    """
+    override = os.environ.get(PRESETS_ENV)
+    if override:
+        return override
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        PRESETS_FILENAME)
+
+
+def is_valid_preset(config):
+    """Whether a loaded preset config has all six relay fields,
+    typed right: start_side "A"/"B", mode "blind"/"aware", turn_cap
+    an int, stop_phrases a list of strings, and both flags bools.
+    A hand-edited cap outside 1-50 is fine -- the spinbox clamps it
+    when the preset is applied, the same way a relay clamps it.
+    """
+    if not isinstance(config, dict):
+        return False
+    if config.get("start_side") not in ("A", "B"):
+        return False
+    if config.get("mode") not in ("blind", "aware"):
+        return False
+    cap = config.get("turn_cap")
+    if isinstance(cap, bool) or not isinstance(cap, int):
+        return False
+    phrases = config.get("stop_phrases")
+    if not isinstance(phrases, list) or not all(
+            isinstance(p, str) for p in phrases):
+        return False
+    if not isinstance(config.get("stop_on_agreement"), bool):
+        return False
+    if not isinstance(config.get("review_each_hop"), bool):
+        return False
+    return True
+
+
+def load_presets(path):
+    """Saved relay presets as {name: config} from a JSON file.
+
+    Missing, unreadable, or malformed files read as no presets --
+    a bad file never stops the app from starting. Presets whose
+    fields are missing or the wrong type are skipped, so one bad
+    entry can't poison the rest.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    presets = data.get("presets") if isinstance(data, dict) else None
+    if not isinstance(presets, dict):
+        return {}
+    return {name: config for name, config in presets.items()
+            if is_valid_preset(config)}
+
+
+def presets_file_corrupt(path):
+    """Whether the presets file exists but can't be read as presets
+    at all -- bad JSON, or JSON without a "presets" object. A
+    missing file is fine (no presets saved yet); a file whose
+    entries are merely invalid is not corrupt, just empty.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        return False
+    except (OSError, ValueError):
+        return True
+    presets = data.get("presets") if isinstance(data, dict) else None
+    return not isinstance(presets, dict)
+
+
+def save_preset(path, name, config):
+    """Save one relay preset (creating or overwriting it) in the
+    JSON file.
+
+    A config is {"start_side", "mode", "turn_cap",
+    "stop_phrases", "stop_on_agreement", "review_each_hop"}.
+    The write is atomic: a failed save leaves the previous file
+    intact and raises the OSError.
+    """
+    presets = load_presets(path)
+    presets[name] = config
+    text = json.dumps({"presets": presets}, indent=2, sort_keys=True) + "\n"
+    write_text_atomic(path, text, prefix=".duo-presets-")
+
+
+def delete_preset(path, name):
+    """Remove one relay preset from the JSON file. Returns True when
+    a preset was actually removed; a missing name is a no-op
+    returning False. The rewrite is atomic: a failed delete leaves
+    the previous file intact and raises the OSError.
+    """
+    presets = load_presets(path)
+    if name not in presets:
+        return False
+    del presets[name]
+    text = json.dumps({"presets": presets}, indent=2, sort_keys=True) + "\n"
+    write_text_atomic(path, text, prefix=".duo-presets-")
     return True
 
 
@@ -2313,6 +2433,24 @@ def build_window(client=None, logger=None, deck_port=None):
     relay_row.addWidget(review_check)
     d_layout.addLayout(relay_row)
 
+    # --- relay presets -----------------------------------------------------
+    # Same layout as the saved-pairs row: a dropdown of what is saved,
+    # a name field, Save, Delete. Nothing loads by itself.
+    preset_row = QtWidgets.QHBoxLayout()
+    preset_row.addWidget(QtWidgets.QLabel("Preset:"))
+    preset_combo = QtWidgets.QComboBox()
+    preset_combo.setPlaceholderText("Saved presets")
+    preset_row.addWidget(preset_combo, stretch=1)
+    preset_name = QtWidgets.QLineEdit()
+    preset_name.setPlaceholderText("Name for this preset")
+    preset_row.addWidget(preset_name, stretch=1)
+    preset_save = QtWidgets.QPushButton("Save preset")
+    preset_row.addWidget(preset_save)
+    preset_delete = QtWidgets.QPushButton("Delete preset")
+    preset_delete.setEnabled(False)
+    preset_row.addWidget(preset_delete)
+    d_layout.addLayout(preset_row)
+
     # --- saved pairs -------------------------------------------------------
     pair_row = QtWidgets.QHBoxLayout()
     pair_row.addWidget(QtWidgets.QLabel("Pair:"))
@@ -2572,6 +2710,16 @@ def build_window(client=None, logger=None, deck_port=None):
         # nothing selected there is nothing to delete.
         pair_delete.setEnabled(pairs_idle
                                and pair_combo.currentIndex() >= 0)
+        # Relay presets wait for idle too: loading one mid-relay
+        # would change the row under a running relay, and saving
+        # one then would catch the row mid-flight.
+        presets_idle = not busy and not relay_active
+        preset_combo.setEnabled(presets_idle)
+        preset_name.setEnabled(presets_idle)
+        preset_save.setEnabled(presets_idle)
+        # Delete needs a preset selected as well as idle.
+        preset_delete.setEnabled(presets_idle
+                                 and preset_combo.currentIndex() >= 0)
         # Saving is idle-only too: the transcript is moving
         # mid-generation or mid-relay, so a save then would catch a
         # half-written turn. Loading is idle-only for the same reason:
@@ -3806,6 +3954,111 @@ def build_window(client=None, logger=None, deck_port=None):
     pair_combo.currentIndexChanged.connect(on_pair_selected)
     pair_combo.activated.connect(on_pair_selected)
 
+    # --- relay presets -------------------------------------------------------
+    # Same shape as the saved pairs above: reload the dropdown from
+    # the JSON file, save the row as it stands, load a preset back
+    # onto the row, delete with a confirmation first.
+    def refresh_preset_combo(select=None):
+        """Reload the preset dropdown from the JSON file. Nothing is
+        loaded by default -- the dropdown just lists what is saved.
+        A file that exists but won't parse earns a plain note; the
+        row itself is left exactly as it is."""
+        presets = load_presets(presets_path())
+        preset_combo.blockSignals(True)
+        preset_combo.clear()
+        names = sorted(presets)
+        preset_combo.addItems(names)
+        if select in names:
+            preset_combo.setCurrentIndex(names.index(select))
+        else:
+            preset_combo.setCurrentIndex(-1)
+        preset_combo.blockSignals(False)
+        if presets_file_corrupt(presets_path()):
+            statusbar.showMessage(
+                "Couldn't read the saved relay presets.", 5000)
+        # The Delete button follows the selection, and this rebuild
+        # runs with signals blocked, so refresh the buttons here.
+        refresh_buttons()
+        return presets
+
+    def on_preset_save():
+        name = preset_name.text().strip()
+        if not name:
+            statusbar.showMessage(MSG_PRESET_NEEDS_NAME, 3000)
+            return
+        config = {
+            "start_side": start_picker.currentText(),
+            "mode": ("aware" if mode_picker.currentText() == "Aware"
+                     else "blind"),
+            "turn_cap": cap_spin.value(),
+            "stop_phrases": parse_stop_phrases(stop_edit.text()),
+            "stop_on_agreement": agree_check.isChecked(),
+            "review_each_hop": review_check.isChecked(),
+        }
+        try:
+            save_preset(presets_path(), name, config)
+        except OSError as exc:
+            reason = exc.strerror or str(exc)
+            statusbar.showMessage(
+                "Couldn't save relay preset '%s': %s" % (name, reason),
+                5000)
+            return
+        refresh_preset_combo(select=name)
+        statusbar.showMessage("Relay preset '%s' saved." % name, 3000)
+
+    def on_preset_selected(index):
+        if index < 0:
+            return
+        name = preset_combo.currentText()
+        config = load_presets(presets_path()).get(name)
+        if config is None:
+            # Gone (or gone bad) since the dropdown was filled --
+            # say so plainly and leave the row alone.
+            statusbar.showMessage(
+                "Relay preset '%s' couldn't be loaded." % name, 5000)
+            return
+        start_picker.setCurrentText(config["start_side"])
+        mode_picker.setCurrentText(
+            "Aware" if config["mode"] == "aware" else "Blind")
+        cap_spin.setValue(config["turn_cap"])
+        stop_edit.setText(", ".join(config["stop_phrases"]))
+        agree_check.setChecked(config["stop_on_agreement"])
+        review_check.setChecked(config["review_each_hop"])
+        statusbar.showMessage("Relay preset '%s' loaded." % name, 3000)
+        refresh_buttons()
+
+    def on_preset_delete():
+        index = preset_combo.currentIndex()
+        if index < 0:
+            return
+        name = preset_combo.currentText()
+        answer = QtWidgets.QMessageBox.question(
+            window, "Delete relay preset?",
+            "Delete the saved relay preset '%s'? This can't be "
+            "undone." % name,
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.No)
+        if answer != QtWidgets.QMessageBox.Yes:
+            return
+        try:
+            delete_preset(presets_path(), name)
+        except OSError as exc:
+            reason = exc.strerror or str(exc)
+            statusbar.showMessage(
+                "Couldn't delete relay preset '%s': %s" % (name, reason),
+                5000)
+            return
+        refresh_preset_combo()
+        statusbar.showMessage("Relay preset '%s' deleted." % name, 3000)
+
+    preset_save.clicked.connect(on_preset_save)
+    preset_delete.clicked.connect(on_preset_delete)
+    # Both signals, as with pairs: currentIndexChanged covers picking
+    # a different preset, activated covers re-picking the preset that
+    # is already selected.
+    preset_combo.currentIndexChanged.connect(on_preset_selected)
+    preset_combo.activated.connect(on_preset_selected)
+
     # --- per-side buttons --------------------------------------------------
     def make_stop(side):
         def stop():
@@ -4066,6 +4319,10 @@ def build_window(client=None, logger=None, deck_port=None):
         "pair_save": pair_save, "pair_delete": pair_delete,
         "on_pair_delete": on_pair_delete,
         "refresh_pair_combo": refresh_pair_combo,
+        "preset_combo": preset_combo, "preset_name": preset_name,
+        "preset_save": preset_save, "preset_delete": preset_delete,
+        "on_preset_delete": on_preset_delete,
+        "refresh_preset_combo": refresh_preset_combo,
         "use_this": use_this, "do_forward": do_forward,
         "render_transcript": render_transcript,
         "refresh_history_list": refresh_history_list,
@@ -4172,6 +4429,7 @@ def build_window(client=None, logger=None, deck_port=None):
         panes.restoreState(saved_splitter)
 
     refresh_pair_combo()
+    refresh_preset_combo()
     load_models()
     refresh_buttons()
     return window

@@ -46,17 +46,19 @@ from dual_chat import (  # noqa: E402
     data_to_conversation, default_both_filename,
     default_conversation_filename, default_debug_filename,
     default_full_filename, default_side_filename, delete_pair,
+    delete_preset,
     format_both_transcript,
     format_full_transcript, format_ram, format_session_line,
     format_side_transcript,
-    format_stats_line, get_lan_ip, load_attachment,
-    load_conversation_file, load_pairs,
+    format_stats_line, get_lan_ip, is_valid_preset, load_attachment,
+    load_conversation_file, load_pairs, load_presets,
     make_debug_logger,
     pairs_path, parse_ollama_list_output, parse_ps_payload,
     parse_stop_phrases, parse_tags_payload, phrase_matches,
+    presets_file_corrupt, presets_path,
     render_qr_pixmap,
     sanitize_filename_part,
-    save_conversation_file, save_pair,
+    save_conversation_file, save_pair, save_preset,
     write_text_atomic,
 )
 
@@ -1510,6 +1512,164 @@ class PairsTests(unittest.TestCase):
         self.assertEqual(set(load_pairs(self.path)), {"one", "two"})
         leftovers = [n for n in os.listdir(self.tmp.name)
                      if n.startswith(".duo-pairs-")]
+        self.assertEqual(leftovers, [])
+
+
+class RelayPresetTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.tmp.name, "duo-relay-presets.json")
+        self.config = {"start_side": "B", "mode": "aware", "turn_cap": 3,
+                       "stop_phrases": ["banana", "stop now"],
+                       "stop_on_agreement": True,
+                       "review_each_hop": False}
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_missing_file_reads_as_empty(self):
+        self.assertEqual(load_presets(self.path), {})
+
+    def test_corrupt_file_reads_as_empty(self):
+        with open(self.path, "w", encoding="utf-8") as fh:
+            fh.write("{not json")
+        self.assertEqual(load_presets(self.path), {})
+        with open(self.path, "w", encoding="utf-8") as fh:
+            json.dump({"presets": ["not", "a", "dict"]}, fh)
+        self.assertEqual(load_presets(self.path), {})
+
+    def test_corrupt_file_is_detected(self):
+        self.assertFalse(presets_file_corrupt(self.path))
+        with open(self.path, "w", encoding="utf-8") as fh:
+            fh.write("{not json")
+        self.assertTrue(presets_file_corrupt(self.path))
+        with open(self.path, "w", encoding="utf-8") as fh:
+            json.dump({"presets": ["not", "a", "dict"]}, fh)
+        self.assertTrue(presets_file_corrupt(self.path))
+        # Valid JSON with an empty presets object is not corrupt.
+        with open(self.path, "w", encoding="utf-8") as fh:
+            json.dump({"presets": {}}, fh)
+        self.assertFalse(presets_file_corrupt(self.path))
+
+    def test_save_load_round_trip_exact_contents(self):
+        save_preset(self.path, "debate", self.config)
+        with open(self.path, "r", encoding="utf-8") as fh:
+            on_disk = json.load(fh)
+        self.assertEqual(on_disk, {"presets": {"debate": self.config}})
+        self.assertEqual(load_presets(self.path),
+                         {"debate": self.config})
+
+    def test_save_keeps_other_presets_and_overwrites(self):
+        save_preset(self.path, "one", self.config)
+        other = dict(self.config, start_side="A", mode="blind",
+                     turn_cap=10, stop_phrases=[],
+                     stop_on_agreement=False, review_each_hop=True)
+        save_preset(self.path, "two", other)
+        newer = dict(self.config, start_side="A", mode="aware",
+                     turn_cap=50, stop_phrases=["done"],
+                     stop_on_agreement=False, review_each_hop=True)
+        save_preset(self.path, "one", newer)
+        presets = load_presets(self.path)
+        self.assertEqual(set(presets), {"one", "two"})
+        self.assertEqual(presets["one"], newer)
+        self.assertEqual(presets["two"], other)
+
+    def test_delete_preset_removes_only_that_preset(self):
+        save_preset(self.path, "one", self.config)
+        save_preset(self.path, "two", self.config)
+        self.assertTrue(delete_preset(self.path, "one"))
+        presets = load_presets(self.path)
+        self.assertEqual(set(presets), {"two"})
+        self.assertEqual(presets["two"], self.config)
+
+    def test_delete_preset_missing_name_is_noop(self):
+        save_preset(self.path, "one", self.config)
+        self.assertFalse(delete_preset(self.path, "nope"))
+        self.assertEqual(set(load_presets(self.path)), {"one"})
+        self.assertFalse(delete_preset(self.path, "nope"))
+
+    def test_presets_path_env_override(self):
+        with mock.patch.dict(os.environ,
+                             {"DUAL_CHAT_PRESETS_FILE":
+                              "/tmp/elsewhere-presets.json"}):
+            self.assertEqual(presets_path(),
+                             "/tmp/elsewhere-presets.json")
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertTrue(presets_path().endswith(
+                "duo-relay-presets.json"))
+
+    def test_invalid_presets_are_skipped_not_fatal(self):
+        bad = [
+            dict(self.config, start_side="C"),
+            dict(self.config, mode="loud"),
+            dict(self.config, turn_cap="three"),
+            dict(self.config, turn_cap=True),
+            dict(self.config, stop_phrases="banana"),
+            dict(self.config, stop_phrases=["ok", 7]),
+            dict(self.config, stop_on_agreement="yes"),
+            dict(self.config, review_each_hop=1),
+        ]
+        del bad[0]["start_side"]  # missing field, not just wrong
+        data = {"presets": {"good": self.config}}
+        for i, config in enumerate(bad):
+            data["presets"]["bad-%d" % i] = config
+        data["presets"]["not-a-dict"] = "hello"
+        with open(self.path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh)
+        self.assertEqual(load_presets(self.path),
+                         {"good": self.config})
+        # The validator itself: every bad config fails, the good one
+        # passes, and a non-dict fails.
+        for config in bad:
+            self.assertFalse(is_valid_preset(config))
+        self.assertFalse(is_valid_preset("hello"))
+        self.assertTrue(is_valid_preset(self.config))
+
+    def test_out_of_range_cap_is_valid_and_clamped_on_apply(self):
+        # A hand-edited cap outside 1-50 is still a preset -- the
+        # spinbox clamps it when applied, like a relay clamps it.
+        config = dict(self.config, turn_cap=99)
+        self.assertTrue(is_valid_preset(config))
+        save_preset(self.path, "big", config)
+        self.assertEqual(load_presets(self.path)["big"]["turn_cap"], 99)
+
+    def test_save_leaves_no_temp_behind(self):
+        save_preset(self.path, "one", self.config)
+        leftovers = [n for n in os.listdir(self.tmp.name)
+                     if n.startswith(".duo-presets-")]
+        self.assertEqual(leftovers, [])
+        self.assertEqual(set(os.listdir(self.tmp.name)),
+                         {"duo-relay-presets.json"})
+
+    def test_save_failure_leaves_old_file_intact(self):
+        save_preset(self.path, "one", self.config)
+        with open(self.path, "rb") as fh:
+            before = fh.read()
+        with mock.patch("dual_chat.os.replace",
+                        side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                save_preset(self.path, "two", self.config)
+        with open(self.path, "rb") as fh:
+            self.assertEqual(fh.read(), before)
+        self.assertEqual(load_presets(self.path), {"one": self.config})
+        leftovers = [n for n in os.listdir(self.tmp.name)
+                     if n.startswith(".duo-presets-")]
+        self.assertEqual(leftovers, [])
+
+    def test_delete_failure_leaves_old_file_intact(self):
+        save_preset(self.path, "one", self.config)
+        save_preset(self.path, "two", self.config)
+        with open(self.path, "rb") as fh:
+            before = fh.read()
+        with mock.patch("dual_chat.os.replace",
+                        side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                delete_preset(self.path, "one")
+        with open(self.path, "rb") as fh:
+            self.assertEqual(fh.read(), before)
+        self.assertEqual(set(load_presets(self.path)), {"one", "two"})
+        leftovers = [n for n in os.listdir(self.tmp.name)
+                     if n.startswith(".duo-presets-")]
         self.assertEqual(leftovers, [])
 
 
@@ -5236,13 +5396,14 @@ class FrontDoorTests(unittest.TestCase):
 
     def test_changelog_covers_every_version(self):
         log = self._read("CHANGELOG.md")
-        for version in ["0.%d" % n for n in range(1, 21)]:
+        for version in ["0.%d" % n for n in range(1, 22)]:
             self.assertIn(version, log)
 
     def test_gitignore_covers_runtime_files(self):
         ignored = self._read(".gitignore")
         for entry in ("__pycache__/", "*.pyc", ".venv/", "duo-debug.log",
-                      "duo-pairs.json", "duo.png", "*.zip"):
+                      "duo-pairs.json", "duo-relay-presets.json",
+                      "duo.png", "*.zip"):
             self.assertIn(entry, ignored)
 
     def test_ci_workflow_runs_the_suite_offscreen(self):
@@ -6189,6 +6350,296 @@ class TokenCountGuiTests(unittest.TestCase):
         # ...but the stats line still shows the last real turn.
         self.assertIn("10 out / 50 in", self._stats("A"))
         self.assertNotIn("99 out / 999 in", self._stats("A"))
+
+
+# ---------------------------------------------------------------------------
+# Relay preset GUI tests (offscreen)
+# ---------------------------------------------------------------------------
+
+@unittest.skipUnless(os.environ.get("DUAL_CHAT_GUI_TESTS") == "1",
+                     "GUI tests need DUAL_CHAT_GUI_TESTS=1")
+class RelayPresetGuiTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        from PySide6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+        cls.client = FakeGuiClient()
+
+    def setUp(self):
+        from dual_chat import build_window
+        self.client.reset()
+        # Presets (and pairs) go to temp files so tests never touch
+        # the real ones next to the app.
+        self.tmp = tempfile.TemporaryDirectory()
+        self.presets_file = os.path.join(self.tmp.name,
+                                         "duo-relay-presets.json")
+        self.pairs_file = os.path.join(self.tmp.name, "duo-pairs.json")
+        self._env = mock.patch.dict(os.environ, {
+            "DUAL_CHAT_PRESETS_FILE": self.presets_file,
+            "DUAL_CHAT_PAIRS_FILE": self.pairs_file})
+        self._env.start()
+        self.window = build_window(self.client, logger=TEST_LOGGER)
+        self.window.show()
+        self.state = self.window._dual_chat
+        self._wait_for(lambda: self.state["widgets"]["A"]["picker"].count() == 2)
+        self._pick_models()
+
+    def tearDown(self):
+        self.window.close()
+        self._env.stop()
+        self.tmp.cleanup()
+
+    def _wait_for(self, cond, timeout=10.0):
+        from PySide6.QtTest import QTest
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            QTest.qWait(50)
+            if cond():
+                return True
+        return cond()
+
+    def _pick_models(self):
+        self.state["widgets"]["A"]["picker"].setCurrentIndex(0)
+        self.state["widgets"]["B"]["picker"].setCurrentIndex(1)
+        self.app.processEvents()
+
+    def _relay_row(self):
+        """The relay row as a plain dict, for exact comparisons."""
+        s = self.state
+        return {
+            "start_side": s["start_picker"].currentText(),
+            "mode": ("aware" if s["mode_picker"].currentText() == "Aware"
+                     else "blind"),
+            "turn_cap": s["cap_spin"].value(),
+            "stop_phrases": parse_stop_phrases(s["stop_edit"].text()),
+            "stop_on_agreement": s["agree_check"].isChecked(),
+            "review_each_hop": s["review_check"].isChecked(),
+        }
+
+    def _set_relay_row(self, config):
+        s = self.state
+        s["start_picker"].setCurrentText(config["start_side"])
+        s["mode_picker"].setCurrentText(
+            "Aware" if config["mode"] == "aware" else "Blind")
+        s["cap_spin"].setValue(config["turn_cap"])
+        s["stop_edit"].setText(", ".join(config["stop_phrases"]))
+        s["agree_check"].setChecked(config["stop_on_agreement"])
+        s["review_check"].setChecked(config["review_each_hop"])
+        self.app.processEvents()
+
+    def _seed_presets(self, *names):
+        config = {"start_side": "B", "mode": "aware", "turn_cap": 3,
+                  "stop_phrases": ["banana"],
+                  "stop_on_agreement": True, "review_each_hop": False}
+        for name in names:
+            save_preset(self.presets_file, name, config)
+        self.state["refresh_preset_combo"]()
+        self.app.processEvents()
+        return config
+
+    def _status(self):
+        return self.window.statusBar().currentMessage()
+
+    def test_nothing_loaded_by_default(self):
+        s = self.state
+        self.assertEqual(s["preset_combo"].currentIndex(), -1)
+        self.assertEqual(s["preset_combo"].count(), 0)
+        self.assertFalse(s["preset_delete"].isEnabled())
+        # The relay row sits at its defaults.
+        self.assertEqual(self._relay_row(), {
+            "start_side": "A", "mode": "blind", "turn_cap": 10,
+            "stop_phrases": [], "stop_on_agreement": False,
+            "review_each_hop": False})
+
+    def test_save_and_load_round_trip_sets_every_control(self):
+        config = {"start_side": "B", "mode": "aware", "turn_cap": 3,
+                  "stop_phrases": ["banana", "stop now"],
+                  "stop_on_agreement": True, "review_each_hop": False}
+        self._set_relay_row(config)
+        self.state["preset_name"].setText("debate")
+        self.state["preset_save"].click()
+        self.app.processEvents()
+        self.assertEqual(load_presets(self.presets_file),
+                         {"debate": config})
+        self.assertIn("Relay preset 'debate' saved.", self._status())
+        # Scramble the row, deselect, then pick the preset: the row
+        # comes back exactly.
+        self.state["preset_combo"].setCurrentIndex(-1)
+        self._set_relay_row({
+            "start_side": "A", "mode": "blind", "turn_cap": 50,
+            "stop_phrases": [], "stop_on_agreement": False,
+            "review_each_hop": True})
+        self.state["preset_combo"].setCurrentIndex(0)
+        self.app.processEvents()
+        self.assertEqual(self._relay_row(), config)
+        self.assertIn("Relay preset 'debate' loaded.", self._status())
+        # Re-picking the same preset still loads it (activated, not
+        # just currentIndexChanged): scramble, re-pick, row returns.
+        self._set_relay_row({
+            "start_side": "A", "mode": "blind", "turn_cap": 50,
+            "stop_phrases": [], "stop_on_agreement": False,
+            "review_each_hop": True})
+        self.state["preset_combo"].activated.emit(0)
+        self.app.processEvents()
+        self.assertEqual(self._relay_row(), config)
+
+    def test_save_overwrites_with_newer_values(self):
+        first = {"start_side": "A", "mode": "blind", "turn_cap": 10,
+                 "stop_phrases": [], "stop_on_agreement": False,
+                 "review_each_hop": False}
+        second = {"start_side": "B", "mode": "aware", "turn_cap": 3,
+                  "stop_phrases": ["banana"],
+                  "stop_on_agreement": True, "review_each_hop": True}
+        self._set_relay_row(first)
+        self.state["preset_name"].setText("same name")
+        self.state["preset_save"].click()
+        self.app.processEvents()
+        self._set_relay_row(second)
+        self.state["preset_save"].click()
+        self.app.processEvents()
+        self.assertEqual(load_presets(self.presets_file),
+                         {"same name": second})
+        self.assertEqual(self.state["preset_combo"].count(), 1)
+
+    def test_save_with_empty_name_asks_for_a_name(self):
+        self.state["preset_name"].setText("   ")
+        self.state["preset_save"].click()
+        self.app.processEvents()
+        self.assertIn("Name the preset first.", self._status())
+        self.assertFalse(os.path.exists(self.presets_file))
+        self.assertEqual(self.state["preset_combo"].count(), 0)
+
+    def test_delete_accept_removes_preset_from_file_and_picker(self):
+        from PySide6.QtWidgets import QMessageBox
+        self._seed_presets("one", "two")
+        self.state["preset_combo"].setCurrentIndex(0)
+        self.app.processEvents()
+        self.assertEqual(self.state["preset_combo"].currentText(), "one")
+        with mock.patch.object(
+                QMessageBox, "question",
+                return_value=QMessageBox.StandardButton.Yes):
+            self.state["preset_delete"].click()
+        self.app.processEvents()
+        self.assertEqual(set(load_presets(self.presets_file)), {"two"})
+        self.assertEqual(self.state["preset_combo"].count(), 1)
+        self.assertEqual(self.state["preset_combo"].itemText(0), "two")
+        # Nothing is selected after a delete -- never auto-pick.
+        self.assertEqual(self.state["preset_combo"].currentIndex(), -1)
+        self.assertFalse(self.state["preset_delete"].isEnabled())
+        self.assertIn("Relay preset 'one' deleted.", self._status())
+        # Delete the last one: the picker is empty, still nothing
+        # selected, Delete stays off.
+        self.state["preset_combo"].setCurrentIndex(0)
+        self.app.processEvents()
+        with mock.patch.object(
+                QMessageBox, "question",
+                return_value=QMessageBox.StandardButton.Yes):
+            self.state["preset_delete"].click()
+        self.app.processEvents()
+        self.assertEqual(load_presets(self.presets_file), {})
+        self.assertEqual(self.state["preset_combo"].count(), 0)
+        self.assertEqual(self.state["preset_combo"].currentIndex(), -1)
+        self.assertFalse(self.state["preset_delete"].isEnabled())
+
+    def test_delete_reject_keeps_preset(self):
+        from PySide6.QtWidgets import QMessageBox
+        self._seed_presets("one", "two")
+        self.state["preset_combo"].setCurrentIndex(0)
+        self.app.processEvents()
+        with mock.patch.object(
+                QMessageBox, "question",
+                return_value=QMessageBox.StandardButton.No):
+            self.state["preset_delete"].click()
+        self.app.processEvents()
+        self.assertEqual(set(load_presets(self.presets_file)),
+                         {"one", "two"})
+        self.assertEqual(self.state["preset_combo"].count(), 2)
+        self.assertEqual(self.state["preset_combo"].currentIndex(), 0)
+
+    def test_corrupt_file_shows_a_plain_note_and_changes_nothing(self):
+        config = {"start_side": "B", "mode": "aware", "turn_cap": 3,
+                  "stop_phrases": ["banana"],
+                  "stop_on_agreement": True, "review_each_hop": False}
+        self._set_relay_row(config)
+        with open(self.presets_file, "w", encoding="utf-8") as fh:
+            fh.write("{not json")
+        self.state["refresh_preset_combo"]()
+        self.app.processEvents()
+        self.assertIn("Couldn't read the saved relay presets.",
+                      self._status())
+        self.assertEqual(self.state["preset_combo"].count(), 0)
+        # The row is exactly as it was; the app still works.
+        self.assertEqual(self._relay_row(), config)
+        self.assertTrue(self.state["preset_save"].isEnabled())
+
+    def test_invalid_preset_in_file_is_skipped(self):
+        good = {"start_side": "B", "mode": "aware", "turn_cap": 3,
+                "stop_phrases": ["banana"],
+                "stop_on_agreement": True, "review_each_hop": False}
+        bad = dict(good, mode="loud")
+        with open(self.presets_file, "w", encoding="utf-8") as fh:
+            json.dump({"presets": {"good": good, "bad": bad}}, fh)
+        self.state["refresh_preset_combo"]()
+        self.app.processEvents()
+        self.assertEqual(self.state["preset_combo"].count(), 1)
+        self.assertEqual(self.state["preset_combo"].itemText(0), "good")
+        # The file itself is valid JSON, so no corrupt-file note.
+        self.assertNotIn("Couldn't read the saved relay presets.",
+                         self._status())
+
+    def test_preset_controls_wait_for_idle_during_a_relay(self):
+        self.client.replies = {"fake-a:latest": ["apple pie"],
+                               "fake-b:latest": ["banana split"]}
+        self._seed_presets("one")
+        s = self.state
+        # Idle: everything is on (Delete, with a preset selected).
+        s["preset_combo"].setCurrentIndex(0)
+        self.app.processEvents()
+        self.assertTrue(s["preset_combo"].isEnabled())
+        self.assertTrue(s["preset_save"].isEnabled())
+        self.assertTrue(s["preset_delete"].isEnabled())
+        # Start a relay and hold it at a review pause: the preset
+        # row goes off, like the pair row does. (The row is set
+        # explicitly here -- the seeded preset's stop phrase would
+        # match the scripted "banana split" reply and end the relay
+        # before it ever pauses.)
+        s["start_picker"].setCurrentIndex(0)  # A starts
+        s["cap_spin"].setValue(10)
+        s["mode_picker"].setCurrentIndex(0)  # Blind
+        s["stop_edit"].setText("")
+        s["agree_check"].setChecked(False)
+        s["review_check"].setChecked(True)
+        s["composer"].setPlainText("Talk about fruit.")
+        s["relay_btn"].click()
+        self.assertTrue(self._wait_for(
+            lambda: s["review_frame"].isVisible(), timeout=15))
+        self.assertFalse(s["preset_combo"].isEnabled())
+        self.assertFalse(s["preset_name"].isEnabled())
+        self.assertFalse(s["preset_save"].isEnabled())
+        self.assertFalse(s["preset_delete"].isEnabled())
+        # End the relay: the row comes back.
+        s["review_stop"].click()
+        self.assertTrue(self._wait_for(
+            lambda: s["relay_status"].text().startswith("Relay stopped"),
+            timeout=15))
+        self.assertTrue(s["preset_combo"].isEnabled())
+        self.assertTrue(s["preset_save"].isEnabled())
+        self.assertTrue(s["preset_delete"].isEnabled())
+
+    def test_failed_save_leaves_old_file_and_says_so(self):
+        self._seed_presets("one")
+        with open(self.presets_file, "rb") as fh:
+            before = fh.read()
+        self.state["preset_name"].setText("two")
+        with mock.patch("dual_chat.os.replace",
+                        side_effect=OSError("disk full")):
+            self.state["preset_save"].click()
+        self.app.processEvents()
+        with open(self.presets_file, "rb") as fh:
+            self.assertEqual(fh.read(), before)
+        self.assertEqual(set(load_presets(self.presets_file)), {"one"})
+        self.assertIn("Couldn't save relay preset 'two': disk full",
+                      self._status())
 
 
 if __name__ == "__main__":
