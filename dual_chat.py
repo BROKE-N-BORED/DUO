@@ -90,6 +90,12 @@ v0.17: conversation persistence. Save conversation writes the whole
   back exactly. A saved model that isn't installed anymore stays
   unpicked, with a plain note naming it. Opening replaces the
   conversation on screen, so it asks first.
+v0.18: atomic writes everywhere. The pairs file and all three
+  transcript saves now go through the same write-to-temp-then-rename
+  step the conversation save already used, so a crash or a failed
+  write can never leave a half-written file behind -- the old file
+  stays intact, and a failed save says so plainly instead of
+  crashing.
 """
 
 import datetime
@@ -189,7 +195,7 @@ def make_debug_logger(log_dir=None):
         return _NullLogger()
 
 APP_NAME = "DUO"
-APP_VERSION = "0.17"
+APP_VERSION = "0.18"
 DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434"
 OLLAMA_URL_ENV = "DUAL_CHAT_OLLAMA_URL"
 
@@ -885,25 +891,27 @@ def save_pair(path, name, setup):
 
     A setup is {"model_a", "model_b", "instruction_a",
     "instruction_b"}; models may be None when nothing is picked.
+    The write is atomic: a failed save leaves the previous file
+    intact and raises the OSError.
     """
     pairs = load_pairs(path)
     pairs[name] = setup
-    with open(path, "w", encoding="utf-8") as fh:
-        json.dump({"pairs": pairs}, fh, indent=2, sort_keys=True)
-        fh.write("\n")
+    text = json.dumps({"pairs": pairs}, indent=2, sort_keys=True) + "\n"
+    write_text_atomic(path, text, prefix=".duo-pairs-")
 
 
 def delete_pair(path, name):
     """Remove one pair from the JSON file. Returns True when a pair
     was actually removed; a missing name is a no-op returning False.
+    The rewrite is atomic: a failed delete leaves the previous file
+    intact and raises the OSError.
     """
     pairs = load_pairs(path)
     if name not in pairs:
         return False
     del pairs[name]
-    with open(path, "w", encoding="utf-8") as fh:
-        json.dump({"pairs": pairs}, fh, indent=2, sort_keys=True)
-        fh.write("\n")
+    text = json.dumps({"pairs": pairs}, indent=2, sort_keys=True) + "\n"
+    write_text_atomic(path, text, prefix=".duo-pairs-")
     return True
 
 
@@ -1165,19 +1173,19 @@ def data_to_conversation(data):
     return convo, log
 
 
-def save_conversation_file(path, convo, log):
-    """Write a conversation to ``path`` atomically: the file is
-    written to a temp file in the same folder, then renamed over the
-    target, so a crash mid-save can never leave a half-written
-    conversation behind. A failed write removes the temp file and
-    raises the OSError."""
-    text = json.dumps(conversation_to_data(convo, log),
-                      indent=2, ensure_ascii=False) + "\n"
+def write_text_atomic(path, text, prefix=".duo-"):
+    """Write ``text`` to ``path`` atomically: the content goes to a
+    temp file in the same folder first, then the temp file is renamed
+    over the target, so a crash mid-save can never leave a
+    half-written file behind. A failed write removes the temp file
+    and raises the OSError; the previous file, if any, stays intact.
+    Every file DUO writes -- pairs, transcripts, conversations --
+    goes through here (v0.18, audit T7)."""
     folder = os.path.dirname(os.path.abspath(path))
     tmp = None
     try:
         with tempfile.NamedTemporaryFile(
-                "w", encoding="utf-8", dir=folder, prefix=".duo-convo-",
+                "w", encoding="utf-8", dir=folder, prefix=prefix,
                 suffix=".tmp", delete=False) as fh:
             tmp = fh.name
             fh.write(text)
@@ -1189,6 +1197,15 @@ def save_conversation_file(path, convo, log):
                 os.unlink(tmp)
             except OSError:
                 pass
+
+
+def save_conversation_file(path, convo, log):
+    """Write a conversation to ``path`` atomically (see
+    write_text_atomic): a failed write removes the temp file and
+    raises the OSError, and the previous file, if any, stays intact."""
+    text = json.dumps(conversation_to_data(convo, log),
+                      indent=2, ensure_ascii=False) + "\n"
+    write_text_atomic(path, text, prefix=".duo-convo-")
 
 
 def load_conversation_file(path):
@@ -2986,7 +3003,9 @@ def build_window(client=None, logger=None, deck_port=None):
 
         Cancelling writes nothing and shows no error. A failed write
         gets a plain note naming the problem -- never a crash, never
-        silent. Returns True when the file was written.
+        silent -- and the previous file at that path, if any, stays
+        intact: the write is atomic. Returns True when the file was
+        written.
         """
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
             window, "Save transcript", default_name,
@@ -2994,8 +3013,7 @@ def build_window(client=None, logger=None, deck_port=None):
         if not path:
             return False
         try:
-            with open(path, "w", encoding="utf-8") as fh:
-                fh.write(text)
+            write_text_atomic(path, text)
         except OSError as exc:
             reason = exc.strerror or str(exc)
             statusbar.showMessage(
@@ -3565,7 +3583,13 @@ def build_window(client=None, logger=None, deck_port=None):
             "instruction_a": widgets["A"]["instr_edit"].toPlainText(),
             "instruction_b": widgets["B"]["instr_edit"].toPlainText(),
         }
-        save_pair(pairs_path(), name, setup)
+        try:
+            save_pair(pairs_path(), name, setup)
+        except OSError as exc:
+            reason = exc.strerror or str(exc)
+            statusbar.showMessage(
+                "Couldn't save pair '%s': %s" % (name, reason), 5000)
+            return
         refresh_pair_combo(select=name)
         statusbar.showMessage("Pair '%s' saved." % name, 3000)
 
@@ -3611,7 +3635,13 @@ def build_window(client=None, logger=None, deck_port=None):
             QtWidgets.QMessageBox.No)
         if answer != QtWidgets.QMessageBox.Yes:
             return
-        delete_pair(pairs_path(), name)
+        try:
+            delete_pair(pairs_path(), name)
+        except OSError as exc:
+            reason = exc.strerror or str(exc)
+            statusbar.showMessage(
+                "Couldn't delete pair '%s': %s" % (name, reason), 5000)
+            return
         refresh_pair_combo()
         statusbar.showMessage("Pair '%s' deleted." % name, 3000)
 

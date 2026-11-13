@@ -1,7 +1,16 @@
 # DUO changelog
 
-Every version, newest first. All of v0.1–v0.17 were built on
-2026-11-12.
+Every version, newest first. v0.1–v0.17 were built on 2026-11-12;
+v0.18 on 2026-11-13.
+
+## v0.18 — 2026-11-13
+
+Atomic writes. The saved pairs file and all three transcript saves
+(one side, both sides, full transcript) now write to a temp file
+first and rename it over the target — the same step the conversation
+save already used. A crash or a failed write can never leave a
+half-written file behind: the old file stays intact, and a failed
+save says so plainly instead of crashing.
 
 ## v0.17 — 2026-11-12
 

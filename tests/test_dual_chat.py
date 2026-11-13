@@ -54,6 +54,7 @@ from dual_chat import (  # noqa: E402
     render_qr_pixmap,
     sanitize_filename_part,
     save_conversation_file, save_pair,
+    write_text_atomic,
 )
 
 # One shared debug logger for the GUI tests, writing to a temp dir so
@@ -1394,6 +1395,52 @@ class PairsTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {}, clear=True):
             self.assertTrue(pairs_path().endswith("duo-pairs.json"))
 
+    def test_save_leaves_no_temp_behind(self):
+        save_pair(self.path, "one", {"model_a": "a", "model_b": None,
+                                     "instruction_a": "", "instruction_b": ""})
+        leftovers = [n for n in os.listdir(self.tmp.name)
+                     if n.startswith(".duo-pairs-")]
+        self.assertEqual(leftovers, [])
+        self.assertEqual(set(os.listdir(self.tmp.name)),
+                         {"duo-pairs.json"})
+
+    def test_save_failure_leaves_old_file_intact(self):
+        setup = {"model_a": "a", "model_b": None,
+                 "instruction_a": "", "instruction_b": ""}
+        save_pair(self.path, "one", setup)
+        with open(self.path, "rb") as fh:
+            before = fh.read()
+        # The rename is the step that fails: the new content is
+        # written to a temp file, then the swap itself blows up.
+        with mock.patch("dual_chat.os.replace",
+                        side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                save_pair(self.path, "two", setup)
+        with open(self.path, "rb") as fh:
+            self.assertEqual(fh.read(), before)
+        self.assertEqual(load_pairs(self.path), {"one": setup})
+        leftovers = [n for n in os.listdir(self.tmp.name)
+                     if n.startswith(".duo-pairs-")]
+        self.assertEqual(leftovers, [])
+
+    def test_delete_failure_leaves_old_file_intact(self):
+        save_pair(self.path, "one", {"model_a": "a", "model_b": None,
+                                     "instruction_a": "", "instruction_b": ""})
+        save_pair(self.path, "two", {"model_a": "b", "model_b": None,
+                                     "instruction_a": "", "instruction_b": ""})
+        with open(self.path, "rb") as fh:
+            before = fh.read()
+        with mock.patch("dual_chat.os.replace",
+                        side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                delete_pair(self.path, "one")
+        with open(self.path, "rb") as fh:
+            self.assertEqual(fh.read(), before)
+        self.assertEqual(set(load_pairs(self.path)), {"one", "two"})
+        leftovers = [n for n in os.listdir(self.tmp.name)
+                     if n.startswith(".duo-pairs-")]
+        self.assertEqual(leftovers, [])
+
 
 # ---------------------------------------------------------------------------
 # Director controls GUI tests (offscreen)
@@ -1737,6 +1784,34 @@ class DirectorGuiTests(unittest.TestCase):
         self.assertFalse(os.path.exists(self.pairs_file))
         self.assertIn("Name the pair",
                       self.window.statusBar().currentMessage())
+
+    def test_pair_save_failure_shows_plain_note(self):
+        # v0.18 (audit T7): a failed pairs save says so plainly
+        # instead of crashing, and the old pairs file stays intact.
+        save_pair(self.pairs_file, "old pair",
+                  {"model_a": "fake-a:latest", "model_b": None,
+                   "instruction_a": "", "instruction_b": ""})
+        with open(self.pairs_file, "rb") as fh:
+            before = fh.read()
+        self.state["pair_name"].setText("new pair")
+        with mock.patch("dual_chat.os.replace",
+                        side_effect=OSError("disk full")):
+            self.state["pair_save"].click()
+        self.app.processEvents()
+        message = self.window.statusBar().currentMessage()
+        self.assertTrue(
+            message.startswith("Couldn't save pair 'new pair'"),
+            message)
+        self.assertIn("disk full", message)
+        with open(self.pairs_file, "rb") as fh:
+            self.assertEqual(fh.read(), before)
+        self.assertEqual(set(load_pairs(self.pairs_file)), {"old pair"})
+        # The failed save never refreshed the picker: the new pair
+        # is not listed.
+        self.assertEqual(self.state["pair_combo"].count(), 0)
+        leftovers = [n for n in os.listdir(self.tmp.name)
+                     if n.startswith(".duo-pairs-")]
+        self.assertEqual(leftovers, [])
 
     def test_compare_use_this_sends_pick_to_other_side(self):
         self.client.replies = {"fake-a:latest": ["answer alpha"],
@@ -3036,6 +3111,30 @@ class Item7GuiTests(unittest.TestCase):
         self.assertTrue(self.window.isVisible())
         self.assertIn("hello", self.state["convo"].sides["A"].history[0]
                       ["content"])
+
+    def test_failed_overwrite_leaves_old_file_intact(self):
+        # v0.18 (audit T7): the save is atomic, so a failure at the
+        # rename step leaves the file that was already there
+        # byte-identical, with a plain note and no temp left behind.
+        self.assertTrue(self._send_to_a_and_wait("hello"))
+        path = os.path.join(self.tmp.name, "out.txt")
+        with self._save_dialog(path):
+            self.state["widgets"]["A"]["save"].click()
+        with open(path, "rb") as fh:
+            before = fh.read()
+        with mock.patch("dual_chat.os.replace",
+                        side_effect=OSError("disk full")), \
+                self._save_dialog(path):
+            self.state["widgets"]["A"]["save"].click()
+        message = self.window.statusBar().currentMessage()
+        self.assertTrue(message.startswith("Couldn't save to %s" % path),
+                        message)
+        self.assertIn("disk full", message)
+        with open(path, "rb") as fh:
+            self.assertEqual(fh.read(), before)
+        leftovers = [n for n in os.listdir(self.tmp.name)
+                     if n.startswith(".duo-")]
+        self.assertEqual(leftovers, [])
 
     def test_save_disabled_mid_generation(self):
         save_a = self.state["widgets"]["A"]["save"]
@@ -5011,6 +5110,35 @@ class WindowFinishGuiTests(unittest.TestCase):
         self.assertEqual(set(load_pairs(self.pairs_file)),
                          {"one", "two"})
         self.assertEqual(self.state["pair_combo"].count(), 2)
+
+    def test_pair_delete_failure_shows_plain_note(self):
+        # v0.18 (audit T7): a failed pairs delete says so plainly
+        # instead of crashing, and the old pairs file stays intact.
+        from PySide6.QtWidgets import QMessageBox
+        self._seed_pairs("one", "two")
+        self.state["pair_combo"].setCurrentIndex(0)
+        self.app.processEvents()
+        with open(self.pairs_file, "rb") as fh:
+            before = fh.read()
+        with mock.patch.object(
+                QMessageBox, "question",
+                return_value=QMessageBox.StandardButton.Yes), \
+                mock.patch("dual_chat.os.replace",
+                           side_effect=OSError("disk full")):
+            self.state["pair_delete"].click()
+        self.app.processEvents()
+        message = self.window.statusBar().currentMessage()
+        self.assertTrue(
+            message.startswith("Couldn't delete pair 'one'"), message)
+        self.assertIn("disk full", message)
+        with open(self.pairs_file, "rb") as fh:
+            self.assertEqual(fh.read(), before)
+        self.assertEqual(set(load_pairs(self.pairs_file)),
+                         {"one", "two"})
+        self.assertEqual(self.state["pair_combo"].count(), 2)
+        leftovers = [n for n in os.listdir(self.tmp.name)
+                     if n.startswith(".duo-pairs-")]
+        self.assertEqual(leftovers, [])
 class FrontDoorTests(unittest.TestCase):
     """v0.16 (audit T5): the front door -- CHANGELOG, .gitignore, the
     CI workflow, the .desktop launcher, and the uninstaller."""
@@ -5026,7 +5154,7 @@ class FrontDoorTests(unittest.TestCase):
 
     def test_changelog_covers_every_version(self):
         log = self._read("CHANGELOG.md")
-        for version in ["0.%d" % n for n in range(1, 18)]:
+        for version in ["0.%d" % n for n in range(1, 19)]:
             self.assertIn(version, log)
 
     def test_gitignore_covers_runtime_files(self):
@@ -5218,6 +5346,54 @@ class FrontDoorTests(unittest.TestCase):
         finally:
             shutil.rmtree(work, ignore_errors=True)
             shutil.rmtree(home, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# Atomic writes (v0.18, audit T7)
+# ---------------------------------------------------------------------------
+
+class AtomicWriteTests(unittest.TestCase):
+    """v0.18 (audit T7): every file DUO writes -- pairs, transcripts,
+    conversations -- goes through write_text_atomic: content to a
+    temp file in the same folder, then a rename over the target, so
+    a crash mid-save can never leave a half-written file behind."""
+
+    def test_round_trip_writes_exact_text(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "out.txt")
+            write_text_atomic(path, "hello\nworld\n")
+            with open(path, encoding="utf-8") as fh:
+                self.assertEqual(fh.read(), "hello\nworld\n")
+            self.assertEqual(os.listdir(tmp), ["out.txt"])
+
+    def test_failed_rename_leaves_old_file_intact(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "out.txt")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("the old file\n")
+            with mock.patch("dual_chat.os.replace",
+                            side_effect=OSError("disk full")):
+                with self.assertRaises(OSError):
+                    write_text_atomic(path, "the new file\n")
+            with open(path, encoding="utf-8") as fh:
+                self.assertEqual(fh.read(), "the old file\n")
+            self.assertEqual(os.listdir(tmp), ["out.txt"])
+
+    def test_failed_write_leaves_no_temp_behind(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "out.txt")
+            with mock.patch("dual_chat.os.replace",
+                            side_effect=OSError("disk full")):
+                with self.assertRaises(OSError):
+                    write_text_atomic(path, "never lands\n")
+            self.assertEqual(os.listdir(tmp), [])
+
+    def test_missing_folder_raises_and_writes_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "no-such-dir", "out.txt")
+            with self.assertRaises(OSError):
+                write_text_atomic(path, "never lands\n")
+            self.assertEqual(os.listdir(tmp), [])
 
 
 class ConversationFileTests(unittest.TestCase):
