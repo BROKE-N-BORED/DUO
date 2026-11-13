@@ -45,6 +45,12 @@ Everything in one app:
   writes one file with the app version, Ollama's status, the
   session log, and recent errors — ready to email when something
   breaks.
+- **Phone deck** — DUO serves a small page for your phone: press
+  Phone deck, point your phone's camera at the QR code, and the
+  conversation opens on your phone. The page follows whichever
+  model is thinking, you can send messages from the phone, and one
+  Export button downloads the full transcript. It only works on
+  your home WiFi, and anyone on that WiFi can open it.
 
 ## What you need
 
@@ -197,6 +203,26 @@ bash run.sh
   Saving is only available while nothing is generating — the
   transcript is moving mid-turn, so a save then would catch it
   half-written.
+
+## Phone deck
+
+Press Phone deck (next to the save buttons) and a QR code appears.
+Point your phone's camera at it and the deck opens in your phone's
+browser — or type the address shown under the code. The page is big
+and simple: the model that is thinking fills the screen, the other
+one sits small underneath, and it swaps on its own when the turn
+changes. Type a message, pick A, B, or Both, and Send — it goes to
+the models exactly like a message typed on the PC. Export transcript
+downloads the full transcript, the same file as Save full
+transcript on the desktop.
+
+Two things to know. The page only works while DUO is open on the
+computer, and only on your home WiFi — your phone and the computer
+have to be on the same network. And anyone on that WiFi can open
+the page and send messages, so it is as private as your WiFi is.
+There is no login and no account. Sending from the phone is blocked
+while the window is busy or a relay is running, and the page says
+so in plain words.
 
 ## Tests
 

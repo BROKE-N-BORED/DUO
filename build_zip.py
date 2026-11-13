@@ -8,11 +8,12 @@ import os
 import zipfile
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
-OUT = os.path.join(os.path.dirname(ROOT), "duo-v0.10.zip")
+OUT = os.path.join(os.path.dirname(ROOT), "duo-v0.11.zip")
 
 FILES = {
     "dual_chat.py": 0o100644,
     "debug_log.py": 0o100644,
+    "qrcodegen.py": 0o100644,
     "tests/test_dual_chat.py": 0o100644,
     "install.sh": 0o100755,
     "run.sh": 0o100755,

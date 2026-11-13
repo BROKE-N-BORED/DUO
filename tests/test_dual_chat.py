@@ -1,4 +1,4 @@
-"""Tests for DUO Items 1-10. No real Ollama needed: a fake Ollama HTTP
+"""Tests for DUO Items 1-11. No real Ollama needed: a fake Ollama HTTP
 server (and a fake client for the GUI tests) stands in for the real one.
 
 Run from the project root:  python3 -m unittest discover -s tests -v
@@ -23,21 +23,27 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from dual_chat import (  # noqa: E402
     AGREEMENT_PHRASES, APP_VERSION, AWARE_TEMPLATE, CHAT_MAX_ATTEMPTS,
-    CHAT_RETRY_DELAYS, CHAT_TIMEOUT, COMPARE_PREFIX, MAX_ATTACHMENTS,
-    MAX_ATTACHMENT_BYTES, MSG_MODEL_FAILED, MSG_OLLAMA_DOWN,
+    CHAT_RETRY_DELAYS, CHAT_TIMEOUT, COMPARE_PREFIX, DECK_PAGE_HTML,
+    DECK_PORT, MAX_ATTACHMENTS,
+    MAX_ATTACHMENT_BYTES, MSG_EMPTY, MSG_MODEL_FAILED, MSG_OLLAMA_DOWN,
     MSG_OLLAMA_NOT_INSTALLED, MSG_OLLAMA_SLOW, MSG_OLLAMA_START_FAILED,
+    MSG_PHONE_BUSY, MSG_PHONE_RELAY, MSG_PHONE_TARGET,
     TASK_CONTINUE_TEMPLATE, TASK_FOLLOW_UPS, TASK_REVIEW_TEMPLATE,
     AttachmentError, Cancelled,
-    ChatSide, Conversation, HISTORY_BUDGET_CHARS, NoModelSelected,
+    ChatSide, Conversation, DeckServer, HISTORY_BUDGET_CHARS,
+    NoModelSelected,
     OllamaClient, OllamaError, OllamaServerManager, RelaySession,
     SUMMARY_KEEP_LAST, SUMMARY_LABEL, SUMMARIZE_PROMPT, SerialRunner,
     TaskSession, attachment_tag, build_attached_message,
-    compute_turn_stats, default_both_filename, default_debug_filename,
+    build_deck_state, compute_turn_stats, default_both_filename,
+    default_debug_filename,
     default_full_filename, default_side_filename, format_both_transcript,
     format_full_transcript, format_ram, format_side_transcript,
-    format_stats_line, load_attachment, load_pairs, make_debug_logger,
+    format_stats_line, get_lan_ip, load_attachment, load_pairs,
+    make_debug_logger,
     pairs_path, parse_ollama_list_output, parse_ps_payload,
-    parse_stop_phrases, parse_tags_payload, sanitize_filename_part,
+    parse_stop_phrases, parse_tags_payload, render_qr_pixmap,
+    sanitize_filename_part,
     save_pair,
 )
 
@@ -985,6 +991,25 @@ class RelayGuiTests(unittest.TestCase):
                 "Relay on: turn 1/10, you to A")))
         self.state["relay_btn"].click()
         self.assertTrue(self._wait_for_relay_stopped())
+
+    def test_close_window_mid_relay_stops_the_relay(self):
+        # Regression: closing mid-relay used to leave the relay
+        # running in the closed window, still calling the model (and,
+        # in the suite, still appending to the shared fake client's
+        # call list long after the window was gone -- which broke
+        # later tests' exact call counts). Closing must stop the work.
+        self.client.replies = {"fake-a:latest": ["a one", "a two"],
+                               "fake-b:latest": ["b one", "b two"]}
+        self._start_relay("Go on and on.", cap=50)
+        self.assertTrue(self._wait_for(
+            lambda: len(self.client.calls) >= 1), "first turn started")
+        self.window.close()
+        calls_at_close = list(self.client.calls)
+        # Pump the loop so queued signals land, then give the relay
+        # time it would have used to place more calls (a turn takes
+        # ~0.1s with the fake client).
+        self._wait_for(lambda: False, timeout=2.0)
+        self.assertEqual(list(self.client.calls), calls_at_close)
 
     def test_close_window_mid_relay_is_quiet(self):
         # Closing while a relay runs must not crash or raise: queued
@@ -3922,6 +3947,524 @@ class DebugLogGuiTests(unittest.TestCase):
         self.assertIn("relay ended", log)
         self.assertIn("turn done", log)
         self.assertNotIn("ZEBRA GIRAFFE", log)
+
+
+# ---------------------------------------------------------------------------
+# Phone deck (v0.11)
+# ---------------------------------------------------------------------------
+
+class LanIpTests(unittest.TestCase):
+    def test_returns_a_valid_ipv4_address(self):
+        ip = get_lan_ip()
+        parts = ip.split(".")
+        self.assertEqual(len(parts), 4)
+        for part in parts:
+            self.assertTrue(part.isdigit())
+            self.assertLessEqual(int(part), 255)
+        self.assertNotEqual(ip, "0.0.0.0")
+
+    def test_prefers_a_real_address_over_loopback(self):
+        # In this sandbox there is a route, so the answer is a real
+        # LAN address, not loopback. (On a machine with no network
+        # at all the fallback is 127.0.0.1 -- that path is the
+        # except-OSError branch, not this test.)
+        self.assertNotEqual(get_lan_ip(), "127.0.0.1")
+
+
+class DeckStateTests(unittest.TestCase):
+    def _state(self, **over):
+        state = {"active": set(), "queued": set(), "relay": None,
+                 "busy": False, "summarizing": None}
+        state.update(over)
+        return state
+
+    def test_empty_conversation_shape(self):
+        convo = Conversation()
+        snap = build_deck_state(convo, self._state())
+        self.assertEqual(set(snap), {"sides", "active_side", "busy",
+                                     "relay", "version"})
+        self.assertEqual(snap["sides"]["A"],
+                         {"model": None, "messages": []})
+        self.assertEqual(snap["sides"]["B"],
+                         {"model": None, "messages": []})
+        self.assertIsNone(snap["active_side"])
+        self.assertFalse(snap["busy"])
+        self.assertIsNone(snap["relay"])
+        self.assertEqual(snap["version"], APP_VERSION)
+
+    def test_messages_carry_labels_and_display_text(self):
+        convo = Conversation()
+        convo.sides["A"].model = "fake-a:latest"
+        convo.sides["A"].add_user("File: notes.txt\nSECRET-CONTENT",
+                                  display="hello\n(Attached: notes.txt)")
+        convo.sides["A"].add_assistant("answer one")
+        snap = build_deck_state(convo, self._state())
+        msgs = snap["sides"]["A"]["messages"]
+        self.assertEqual(
+            msgs[0],
+            {"label": "You", "text": "hello\n(Attached: notes.txt)"})
+        self.assertEqual(
+            msgs[1], {"label": "fake-a:latest", "text": "answer one"})
+        # The deck shows what the window shows -- never file contents.
+        self.assertNotIn("SECRET-CONTENT", json.dumps(snap))
+
+    def test_active_side_prefers_generating_then_queued(self):
+        convo = Conversation()
+        self.assertEqual(
+            build_deck_state(
+                convo, self._state(active={"B"}))["active_side"], "B")
+        self.assertEqual(
+            build_deck_state(
+                convo, self._state(queued={"A"}))["active_side"], "A")
+        self.assertEqual(
+            build_deck_state(
+                convo,
+                self._state(active={"B"}, queued={"A"}))["active_side"],
+            "B")
+        self.assertEqual(
+            build_deck_state(
+                convo,
+                self._state(summarizing="A"))["active_side"], "A")
+
+    def test_relay_status_comes_through(self):
+        convo = Conversation()
+        session = RelaySession("A", turn_cap=10)
+        session.turns_done = 2
+        session.current_side = "B"
+        session.hop_from = "A"
+        snap = build_deck_state(convo, self._state(relay=session))
+        self.assertEqual(snap["relay"], "Relay on: turn 3/10, A to B")
+
+
+class DeckPageTests(unittest.TestCase):
+    def test_page_has_chat_target_and_export(self):
+        self.assertIn('data-t="A"', DECK_PAGE_HTML)
+        self.assertIn('data-t="B"', DECK_PAGE_HTML)
+        self.assertIn('data-t="Both"', DECK_PAGE_HTML)
+        self.assertIn('id="send"', DECK_PAGE_HTML)
+        self.assertIn('href="/transcript"', DECK_PAGE_HTML)
+        self.assertIn("Export transcript", DECK_PAGE_HTML)
+        self.assertIn('fetch("/state")', DECK_PAGE_HTML)
+        self.assertIn('fetch("/send"', DECK_PAGE_HTML)
+        self.assertIn("thinking...", DECK_PAGE_HTML)
+
+    @unittest.skipUnless(shutil.which("node"), "node not installed")
+    def test_served_script_passes_node_check(self):
+        # The page is a plain Python string: escapes in its JS can
+        # corrupt the served page while the source looks fine. Check
+        # the script that actually ships, not a grep.
+        import re
+        import subprocess
+        match = re.search(r"<script>(.*?)</script>", DECK_PAGE_HTML, re.S)
+        self.assertIsNotNone(match)
+        with tempfile.NamedTemporaryFile("w", suffix=".js",
+                                         delete=False) as fh:
+            fh.write(match.group(1))
+            path = fh.name
+        try:
+            out = subprocess.run(["node", "--check", path],
+                                 capture_output=True, text=True, timeout=30)
+            self.assertEqual(out.returncode, 0, out.stderr)
+        finally:
+            os.unlink(path)
+
+
+class QrCodeTests(unittest.TestCase):
+    def test_encoder_produces_a_valid_matrix(self):
+        import qrcodegen
+        qr = qrcodegen.QrCode.encode_text(
+            "http://192.168.1.42:8765/", qrcodegen.QrCode.Ecc.MEDIUM)
+        size = qr.get_size()
+        self.assertGreaterEqual(size, 21)
+        self.assertEqual(size % 2, 1)  # QR sizes are odd
+        # Finder patterns: solid 7x7 corners, top-left/top-right/
+        # bottom-left, with a dark centre module and a light ring.
+        for (ox, oy) in ((0, 0), (size - 7, 0), (0, size - 7)):
+            self.assertTrue(qr.get_module(ox, oy))
+            self.assertTrue(qr.get_module(ox + 6, oy))
+            self.assertTrue(qr.get_module(ox, oy + 6))
+            self.assertTrue(qr.get_module(ox + 6, oy + 6))
+            self.assertTrue(qr.get_module(ox + 3, oy + 3))
+            self.assertFalse(qr.get_module(ox + 1, oy + 1))
+
+
+class DeckServerTests(unittest.TestCase):
+    def setUp(self):
+        self.sent = []
+        self.server = DeckServer(
+            get_state=lambda: {"sides": {}, "active_side": None,
+                               "busy": False, "relay": None,
+                               "version": APP_VERSION},
+            send_message=lambda text, target: (
+                self.sent.append((text, target)) or None),
+            get_transcript=lambda: "FULL TRANSCRIPT HERE",
+            host="127.0.0.1", port=0)
+        self.assertTrue(self.server.start())
+        self.base = "http://127.0.0.1:%d" % self.server.port
+
+    def tearDown(self):
+        self.server.stop()
+
+    def _get(self, path):
+        import urllib.request
+        return urllib.request.urlopen(self.base + path, timeout=5)
+
+    def _post(self, path, payload):
+        import urllib.request
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            self.base + path, data=data,
+            headers={"Content-Type": "application/json"})
+        return urllib.request.urlopen(req, timeout=5)
+
+    def test_root_serves_the_deck_page(self):
+        resp = self._get("/")
+        self.assertEqual(resp.status, 200)
+        body = resp.read().decode("utf-8")
+        self.assertIn("<title>DUO</title>", body)
+        self.assertIn("Export transcript", body)
+
+    def test_state_json_shape(self):
+        state = json.loads(self._get("/state").read())
+        self.assertEqual(set(state), {"sides", "active_side", "busy",
+                                     "relay", "version"})
+
+    def test_send_validation(self):
+        import urllib.request
+        # Missing message.
+        res = json.loads(self._post("/send", {"target": "A"}).read())
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error"], MSG_EMPTY)
+        # Blank message.
+        res = json.loads(self._post(
+            "/send", {"text": "  ", "target": "A"}).read())
+        self.assertFalse(res["ok"])
+        # Missing target.
+        res = json.loads(self._post("/send", {"text": "hi"}).read())
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error"], MSG_PHONE_TARGET)
+        # Bad target.
+        res = json.loads(self._post(
+            "/send", {"text": "hi", "target": "C"}).read())
+        self.assertFalse(res["ok"])
+        # Malformed JSON.
+        req = urllib.request.Request(
+            self.base + "/send", data=b"{not json",
+            headers={"Content-Type": "application/json"})
+        res = json.loads(urllib.request.urlopen(req, timeout=5).read())
+        self.assertFalse(res["ok"])
+        # Nothing reached the callback.
+        self.assertEqual(self.sent, [])
+
+    def test_send_reaches_callback(self):
+        res = json.loads(self._post(
+            "/send", {"text": "hello", "target": "Both"}).read())
+        self.assertTrue(res["ok"])
+        self.assertEqual(self.sent, [("hello", "Both")])
+
+    def test_send_error_passes_through(self):
+        self.server.send_message = lambda text, target: "NOPE"
+        res = json.loads(self._post(
+            "/send", {"text": "hi", "target": "A"}).read())
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error"], "NOPE")
+
+    def test_transcript_download(self):
+        resp = self._get("/transcript")
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(resp.read().decode("utf-8"),
+                         "FULL TRANSCRIPT HERE")
+        self.assertIn("attachment;", resp.headers["Content-Disposition"])
+        self.assertIn("duo-full-", resp.headers["Content-Disposition"])
+
+    def test_unknown_paths_404(self):
+        import urllib.error
+        for path in ("/nope", "/state/x"):
+            with self.assertRaises(urllib.error.HTTPError) as cm:
+                self._get(path)
+            self.assertEqual(cm.exception.code, 404)
+
+    def test_port_fallback_when_busy(self):
+        # Occupy a port, then start a server on it: it must move to
+        # the next free port instead of failing.
+        blocker = socket.socket()
+        blocker.bind(("127.0.0.1", 0))
+        blocker.listen(1)
+        port = blocker.getsockname()[1]
+        try:
+            other = DeckServer(lambda: {}, lambda t, g: None, lambda: "",
+                               host="127.0.0.1", port=port)
+            self.assertTrue(other.start())
+            self.assertNotEqual(other.port, port)
+            other.stop()
+        finally:
+            blocker.close()
+
+    def test_stop_closes_the_port(self):
+        import urllib.error
+        port = self.server.port
+        self.server.stop()
+        with self.assertRaises(urllib.error.URLError):
+            urllib.request.urlopen(
+                "http://127.0.0.1:%d/" % port, timeout=5)
+
+
+@unittest.skipUnless(os.environ.get("DUAL_CHAT_GUI_TESTS") == "1",
+                     "GUI tests run with DUAL_CHAT_GUI_TESTS=1")
+class DeckGuiTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        from PySide6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+        cls.client = FakeGuiClient()
+
+    def setUp(self):
+        from dual_chat import build_window
+        self.client.reset()
+        self.window = build_window(self.client, logger=TEST_LOGGER,
+                                   deck_port=0)
+        self.window.show()
+        self.state = self.window._dual_chat
+        self._wait_for(
+            lambda: self.state["widgets"]["A"]["picker"].count() == 2)
+        self.base = "http://127.0.0.1:%d" % self.state["deck_server"].port
+
+    def tearDown(self):
+        dialog = getattr(self.window, "_phone_deck_dialog", None)
+        if dialog is not None:
+            dialog.close()
+        self.window.close()
+
+    def _wait_for(self, cond, timeout=10.0):
+        from PySide6.QtTest import QTest
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            QTest.qWait(50)
+            if cond():
+                return True
+        return cond()
+
+    def _pick_models(self):
+        self.state["widgets"]["A"]["picker"].setCurrentIndex(0)
+        self.state["widgets"]["B"]["picker"].setCurrentIndex(1)
+        self.app.processEvents()
+
+    def _request(self, method, path, payload=None):
+        """One HTTP request in a worker thread while the test thread
+        pumps the event loop -- a phone send waits on the GUI thread,
+        so a blocking call from the test thread would deadlock."""
+        import urllib.request
+        result = {}
+
+        def run():
+            try:
+                if payload is None:
+                    resp = urllib.request.urlopen(
+                        self.base + path, timeout=20)
+                else:
+                    data = json.dumps(payload).encode("utf-8")
+                    req = urllib.request.Request(
+                        self.base + path, data=data,
+                        headers={"Content-Type": "application/json"})
+                    resp = urllib.request.urlopen(req, timeout=20)
+                result["body"] = resp.read()
+                result["headers"] = resp.headers
+                result["status"] = resp.status
+            except Exception as exc:  # noqa: BLE001 - surfaced below
+                result["error"] = exc
+
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        ok = self._wait_for(lambda: not thread.is_alive(), timeout=25)
+        self.assertTrue(ok, "deck request timed out: %s %s"
+                        % (method, path))
+        if "error" in result:
+            raise result["error"]
+        return result
+
+    def _get_json(self, path):
+        return json.loads(self._request("GET", path)["body"])
+
+    def _post_send(self, payload):
+        return json.loads(self._request("POST", "/send", payload)["body"])
+
+    def test_server_starts_with_the_app(self):
+        server = self.state["deck_server"]
+        self.assertIsNotNone(server)
+        self.assertTrue(server.running)
+        self.assertGreater(server.port, 0)
+        self.assertTrue(server.url.startswith("http://"))
+        self.assertTrue(server.url.endswith(":%d/" % server.port))
+
+    def test_state_shape_from_the_real_window(self):
+        state = self._get_json("/state")
+        self.assertEqual(set(state), {"sides", "active_side", "busy",
+                                     "relay", "version"})
+        self.assertIsNone(state["sides"]["A"]["model"])
+        self.assertEqual(state["sides"]["A"]["messages"], [])
+        self.assertIsNone(state["active_side"])
+        self.assertIsNone(state["relay"])
+
+    def test_state_follows_a_send(self):
+        self._pick_models()
+        self.assertTrue(
+            self._post_send({"text": "Deck hello", "target": "A"})["ok"])
+        self.assertTrue(self._wait_for(lambda: (
+            "Reply from fake-a:latest." in
+            self.state["widgets"]["A"]["transcript"].toPlainText()),
+            timeout=15))
+        state = self._get_json("/state")
+        msgs = state["sides"]["A"]["messages"]
+        self.assertEqual(msgs[0], {"label": "You", "text": "Deck hello"})
+        self.assertEqual(msgs[1]["label"], "fake-a:latest")
+        self.assertIn("Reply from fake-a:latest.", msgs[1]["text"])
+        self.assertEqual(state["sides"]["A"]["model"], "fake-a:latest")
+
+    def test_phone_send_reaches_the_right_side(self):
+        self._pick_models()
+        self.client.calls.clear()
+        res = self._post_send({"text": "Just for A.", "target": "A"})
+        self.assertTrue(res["ok"])
+        self.assertTrue(self._wait_for(lambda: (
+            "Reply from fake-a:latest." in
+            self.state["widgets"]["A"]["transcript"].toPlainText()
+            and len(self.state["convo"].sides["A"].history) == 2),
+            timeout=15))
+        self.assertEqual(self.client.calls, ["fake-a:latest"])
+        self.assertEqual(self.state["convo"].sides["B"].history, [])
+        self.assertEqual(
+            [m["content"] for m in self.state["convo"].sides["A"].history],
+            ["Just for A.", "Reply from fake-a:latest."])
+
+    def test_phone_send_to_both(self):
+        self._pick_models()
+        res = self._post_send({"text": "Both, please.", "target": "Both"})
+        self.assertTrue(res["ok"])
+        self.assertTrue(self._wait_for(lambda: (
+            len(self.state["convo"].sides["A"].history) == 2
+            and len(self.state["convo"].sides["B"].history) == 2),
+            timeout=15))
+        self.assertEqual(self.client.calls,
+                         ["fake-a:latest", "fake-b:latest"])
+
+    def test_phone_send_validation(self):
+        # Nothing picked yet: the model error comes back plainly.
+        res = self._post_send({"text": "hi", "target": "A"})
+        self.assertFalse(res["ok"])
+        self.assertIn("Pick a model", res["error"])
+        self._pick_models()
+        # Empty message.
+        res = self._post_send({"text": "   ", "target": "A"})
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error"], MSG_EMPTY)
+        # No target.
+        res = self._post_send({"text": "hi"})
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error"], MSG_PHONE_TARGET)
+        # Nothing was sent.
+        self.assertEqual(self.client.calls, [])
+
+    def test_phone_send_rejected_when_busy(self):
+        self._pick_models()
+        self.state["state"]["busy"] = True
+        try:
+            res = self._post_send({"text": "hi", "target": "A"})
+        finally:
+            self.state["state"]["busy"] = False
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error"], MSG_PHONE_BUSY)
+        self.assertEqual(self.client.calls, [])
+
+    def test_phone_send_rejected_during_relay(self):
+        self._pick_models()
+        session = RelaySession("A", turn_cap=10)
+        self.state["state"]["relay"] = session
+        try:
+            res = self._post_send({"text": "hi", "target": "A"})
+        finally:
+            self.state["state"]["relay"] = None
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error"], MSG_PHONE_RELAY)
+        self.assertEqual(self.client.calls, [])
+
+    def test_phone_send_carries_no_desktop_attachments(self):
+        self._pick_models()
+        with tempfile.NamedTemporaryFile("w", suffix=".txt",
+                                         delete=False) as fh:
+            fh.write("DESKTOP-SECRET-CONTENT")
+            path = fh.name
+        try:
+            self.state["add_attachments"]([path])
+            self.assertEqual(len(self.state["state"]["attachments"]), 1)
+            res = self._post_send({"text": "Phone hello", "target": "A"})
+            self.assertTrue(res["ok"])
+            self.assertTrue(self._wait_for(lambda: (
+                len(self.state["convo"].sides["A"].history) == 2),
+                timeout=15))
+            sent = self.client.messages_seen[-1]
+            self.assertNotIn("DESKTOP-SECRET-CONTENT", json.dumps(sent))
+            # And the desktop attachment is still pending, untouched.
+            self.assertEqual(len(self.state["state"]["attachments"]), 1)
+        finally:
+            os.unlink(path)
+
+    def test_transcript_download_matches_desktop_export(self):
+        self._pick_models()
+        self.assertTrue(
+            self._post_send({"text": "One", "target": "Both"})["ok"])
+        self.assertTrue(self._wait_for(lambda: (
+            len(self.state["convo"].sides["A"].history) == 2
+            and len(self.state["convo"].sides["B"].history) == 2),
+            timeout=15))
+        body = self._request("GET", "/transcript")["body"].decode("utf-8")
+        expected = format_full_transcript(
+            list(self.state["state"]["full_log"]))
+
+        def _norm(text):
+            # The header carries a minute stamp; normalize it so a
+            # test straddling a minute boundary can't flake.
+            lines = text.split("\n")
+            lines[0] = "HEADER"
+            return "\n".join(lines)
+
+        self.assertEqual(_norm(body), _norm(expected))
+        self.assertRegex(body.split("\n")[0],
+                         r"^DUO transcript -- saved "
+                         r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}$")
+
+    def test_qr_dialog_shows_code_and_url(self):
+        from PySide6.QtWidgets import QLabel
+        self.state["phone_btn"].click()
+        self.app.processEvents()
+        dialog = getattr(self.window, "_phone_deck_dialog", None)
+        self.assertIsNotNone(dialog)
+        self.assertTrue(dialog.isVisible())
+        labels = dialog.findChildren(QLabel)
+        pixmaps = [lbl.pixmap() for lbl in labels
+                   if lbl.pixmap() is not None
+                   and not lbl.pixmap().isNull()]
+        self.assertEqual(len(pixmaps), 1)
+        self.assertFalse(pixmaps[0].isNull())
+        self.assertGreater(pixmaps[0].width(), 100)
+        texts = [lbl.text() for lbl in labels]
+        self.assertIn(self.state["deck_server"].url, texts)
+        dialog.close()
+
+    def test_qr_pixmap_renders(self):
+        pixmap = render_qr_pixmap("http://192.168.1.42:8765/")
+        self.assertIsNotNone(pixmap)
+        self.assertFalse(pixmap.isNull())
+        self.assertEqual(pixmap.width(), pixmap.height())
+        self.assertGreater(pixmap.width(), 100)
+
+    def test_server_stops_when_the_window_closes(self):
+        import urllib.error
+        port = self.state["deck_server"].port
+        self.window.close()
+        self.app.processEvents()
+        with self.assertRaises(urllib.error.URLError):
+            urllib.request.urlopen(
+                "http://127.0.0.1:%d/" % port, timeout=5)
 
 
 if __name__ == "__main__":
