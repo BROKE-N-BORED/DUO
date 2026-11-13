@@ -1,7 +1,17 @@
 # DUO changelog
 
-Every version, newest first. All of v0.1–v0.16 were built on
+Every version, newest first. All of v0.1–v0.17 were built on
 2026-11-12.
+
+## v0.17 — 2026-11-12
+
+Conversation persistence. Save conversation writes the whole
+conversation to a JSON file — both sides' histories with their
+labels, both models, both instruction fields, and the interleaved
+full-transcript log — and Open conversation loads it back exactly.
+A saved model that isn't installed anymore stays unpicked, with a
+plain note naming it. Opening replaces the conversation on screen,
+so it asks first.
 
 ## v0.16 — 2026-11-12
 

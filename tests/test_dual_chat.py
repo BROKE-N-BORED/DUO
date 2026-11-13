@@ -24,7 +24,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from dual_chat import (  # noqa: E402
     AGREEMENT_PHRASES, APP_VERSION, AWARE_TEMPLATE, CHAT_MAX_ATTEMPTS,
-    CHAT_RETRY_DELAYS, CHAT_TIMEOUT, COMPARE_PREFIX, DECK_PAGE_HTML,
+    CHAT_RETRY_DELAYS, CHAT_TIMEOUT, COMPARE_PREFIX,
+    CONVERSATION_FORMAT_VERSION, DECK_PAGE_HTML,
     DECK_PORT, MAX_ATTACHMENTS,
     MAX_ATTACHMENT_BYTES, MSG_EMPTY, MSG_MODEL_FAILED, MSG_OLLAMA_DOWN,
     MSG_OLLAMA_NOT_INSTALLED, MSG_OLLAMA_SLOW, MSG_OLLAMA_START_FAILED,
@@ -33,23 +34,26 @@ from dual_chat import (  # noqa: E402
     SETTING_SPLITTER_STATE, SETTING_WINDOW_GEOMETRY,
     TASK_CONTINUE_TEMPLATE, TASK_FOLLOW_UPS, TASK_REVIEW_TEMPLATE,
     AttachmentError, Cancelled,
-    ChatSide, Conversation, DeckServer, HISTORY_BUDGET_CHARS,
+    ChatSide, Conversation, ConversationError, DeckServer,
+    HISTORY_BUDGET_CHARS,
     NoModelSelected,
     OllamaClient, OllamaError, OllamaServerManager, RelaySession,
     SUMMARY_KEEP_LAST, SUMMARY_LABEL, SUMMARIZE_PROMPT, SerialRunner,
     TaskSession, attachment_tag, build_attached_message,
-    build_deck_state, compute_turn_stats, default_both_filename,
-    default_debug_filename,
+    build_deck_state, compute_turn_stats, conversation_to_data,
+    data_to_conversation, default_both_filename,
+    default_conversation_filename, default_debug_filename,
     default_full_filename, default_side_filename, delete_pair,
     format_both_transcript,
     format_full_transcript, format_ram, format_side_transcript,
-    format_stats_line, get_lan_ip, load_attachment, load_pairs,
+    format_stats_line, get_lan_ip, load_attachment,
+    load_conversation_file, load_pairs,
     make_debug_logger,
     pairs_path, parse_ollama_list_output, parse_ps_payload,
     parse_stop_phrases, parse_tags_payload, phrase_matches,
     render_qr_pixmap,
     sanitize_filename_part,
-    save_pair,
+    save_conversation_file, save_pair,
 )
 
 # One shared debug logger for the GUI tests, writing to a temp dir so
@@ -5022,7 +5026,7 @@ class FrontDoorTests(unittest.TestCase):
 
     def test_changelog_covers_every_version(self):
         log = self._read("CHANGELOG.md")
-        for version in ["0.%d" % n for n in range(1, 17)]:
+        for version in ["0.%d" % n for n in range(1, 18)]:
             self.assertIn(version, log)
 
     def test_gitignore_covers_runtime_files(self):
@@ -5214,6 +5218,378 @@ class FrontDoorTests(unittest.TestCase):
         finally:
             shutil.rmtree(work, ignore_errors=True)
             shutil.rmtree(home, ignore_errors=True)
+
+
+class ConversationFileTests(unittest.TestCase):
+    """v0.17 (audit T6): the saved-conversation file format -- both
+    sides' histories with labels, both models, both instruction
+    fields, and the interleaved full-transcript log, written
+    atomically and validated strictly on load."""
+
+    def _make_convo(self):
+        convo = Conversation()
+        a = convo.sides["A"]
+        a.model = "fake-a:latest"
+        a.instruction = "Be brief."
+        a.add_user("hello", label="You")
+        a.add_assistant("Reply from A.", label="fake-a:latest")
+        a.add_user("alpha one", label="You [relay from Model B]")
+        b = convo.sides["B"]
+        b.model = "fake-b:latest"
+        b.instruction = ""
+        # A message carrying an attached file: the full content
+        # holds the file, the display text is what the window shows.
+        b.add_user("File: notes.txt\nline one\n\nread this",
+                   label="You",
+                   display="read this\n(Attached: notes.txt)")
+        b.add_assistant("Reply from B.", label="fake-b:latest")
+        log = [("A", "You", "hello"),
+               ("A", "fake-a:latest", "Reply from A."),
+               ("B", "You", "read this\n(Attached: notes.txt)"),
+               ("B", "fake-b:latest", "Reply from B."),
+               ("A", "You [relay from Model B]", "alpha one")]
+        return convo, log
+
+    def test_save_writes_valid_json(self):
+        convo, log = self._make_convo()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "saved.json")
+            save_conversation_file(path, convo, log)
+            with open(path, encoding="utf-8") as fh:
+                data = json.load(fh)
+        self.assertEqual(data["version"], CONVERSATION_FORMAT_VERSION)
+        a = data["sides"]["A"]
+        self.assertEqual(a["model"], "fake-a:latest")
+        self.assertEqual(a["instruction"], "Be brief.")
+        self.assertEqual(
+            [e["role"] for e in a["entries"]],
+            ["user", "assistant", "user"])
+        self.assertEqual(
+            [e["label"] for e in a["entries"]],
+            ["You", "fake-a:latest", "You [relay from Model B]"])
+        self.assertEqual(a["entries"][2]["content"], "alpha one")
+        b = data["sides"]["B"]
+        self.assertEqual(b["model"], "fake-b:latest")
+        self.assertEqual(b["instruction"], "")
+        self.assertEqual(b["entries"][0]["content"],
+                         "File: notes.txt\nline one\n\nread this")
+        self.assertEqual(b["entries"][0]["display"],
+                         "read this\n(Attached: notes.txt)")
+        self.assertIsNone(b["entries"][1]["display"])
+        self.assertEqual(data["log"], [list(item) for item in log])
+
+    def test_round_trip_restores_everything(self):
+        convo, log = self._make_convo()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "saved.json")
+            save_conversation_file(path, convo, log)
+            restored, restored_log = load_conversation_file(path)
+        for side in ("A", "B"):
+            self.assertEqual(restored.sides[side].history,
+                             convo.sides[side].history)
+            self.assertEqual(restored.sides[side].labels,
+                             convo.sides[side].labels)
+            self.assertEqual(restored.sides[side].display,
+                             convo.sides[side].display)
+            self.assertEqual(restored.sides[side].instruction,
+                             convo.sides[side].instruction)
+            self.assertEqual(restored.sides[side].model,
+                             convo.sides[side].model)
+        self.assertEqual(restored_log, log)
+
+    def test_default_filename(self):
+        self.assertEqual(
+            default_conversation_filename(datetime.date(2026, 11, 12)),
+            "duo-conversation-2026-11-12.json")
+
+    def test_corrupt_json_raises(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "bad.json")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("{not json")
+            with self.assertRaises(ConversationError):
+                load_conversation_file(path)
+
+    def test_wrong_version_raises(self):
+        convo, log = self._make_convo()
+        data = conversation_to_data(convo, log)
+        data["version"] = 99
+        with self.assertRaises(ConversationError):
+            data_to_conversation(data)
+
+    def test_missing_keys_raise(self):
+        convo, log = self._make_convo()
+        good = conversation_to_data(convo, log)
+
+        def broken(mutate):
+            data = copy.deepcopy(good)
+            mutate(data)
+            return data
+
+        cases = [
+            lambda d: d.pop("sides"),
+            lambda d: d.pop("log"),
+            lambda d: d["sides"].pop("B"),
+            lambda d: d["sides"]["A"].pop("entries"),
+            lambda d: d["sides"]["A"]["entries"][0].pop("content"),
+            lambda d: d["sides"]["A"]["entries"][0].update(role="system"),
+            lambda d: d["log"].append(["C", "You", "nope"]),
+        ]
+        for mutate in cases:
+            with self.assertRaises(ConversationError):
+                data_to_conversation(broken(mutate))
+
+    def test_atomic_write_leaves_no_temp_behind(self):
+        convo, log = self._make_convo()
+        with tempfile.TemporaryDirectory() as tmp:
+            before = set(os.listdir(tmp))
+            path = os.path.join(tmp, "saved.json")
+            save_conversation_file(path, convo, log)
+            after = set(os.listdir(tmp))
+            self.assertEqual(after - before, {"saved.json"})
+            self.assertFalse([n for n in after
+                              if n.startswith(".duo-convo-")])
+
+    def test_save_overwrites_cleanly(self):
+        convo, log = self._make_convo()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "saved.json")
+            save_conversation_file(path, convo, log)
+            convo.sides["A"].add_user("second save", label="You")
+            save_conversation_file(path, convo, log)
+            restored, _ = load_conversation_file(path)
+            self.assertEqual(
+                restored.sides["A"].history[-1]["content"],
+                "second save")
+
+
+@unittest.skipUnless(os.environ.get("DUAL_CHAT_GUI_TESTS") == "1",
+                     "GUI tests run with DUAL_CHAT_GUI_TESTS=1")
+class ConversationGuiTests(unittest.TestCase):
+    """v0.17 (audit T6): Save conversation / Open conversation in
+    the window -- round-trip through the buttons, the missing-model
+    note, the replace confirmation, and bad files that change
+    nothing."""
+    @classmethod
+    def setUpClass(cls):
+        from PySide6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+        cls.client = FakeGuiClient()
+
+    def setUp(self):
+        from dual_chat import build_window
+        self.client.reset()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.pairs_file = os.path.join(self.tmp.name, "duo-pairs.json")
+        self._env = mock.patch.dict(
+            os.environ, {"DUAL_CHAT_PAIRS_FILE": self.pairs_file})
+        self._env.start()
+        self.window = build_window(self.client, logger=TEST_LOGGER)
+        self.window.show()
+        self.state = self.window._dual_chat
+        self._wait_for(lambda: self.state["widgets"]["A"]["picker"].count() == 2)
+        self._pick_models()
+
+    def tearDown(self):
+        self.window.close()
+        self._env.stop()
+        self.tmp.cleanup()
+
+    def _wait_for(self, cond, timeout=10.0):
+        from PySide6.QtTest import QTest
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            QTest.qWait(50)
+            if cond():
+                return True
+        return cond()
+
+    def _pick_models(self):
+        self.state["widgets"]["A"]["picker"].setCurrentIndex(0)
+        self.state["widgets"]["B"]["picker"].setCurrentIndex(1)
+        self.app.processEvents()
+
+    def _send_both_and_wait(self, text):
+        self.state["composer"].setPlainText(text)
+        self.state["send_both"].click()
+        return self._wait_for(lambda: (
+            len(self.state["convo"].sides["A"].history) >= 2
+            and len(self.state["convo"].sides["B"].history) >= 2
+            and not self.state["state"]["busy"]), timeout=15)
+
+    def _send_to_a_and_wait(self, text):
+        self.state["composer"].setPlainText(text)
+        self.state["send_a"].click()
+        return self._wait_for(lambda: (
+            len(self.state["convo"].sides["A"].history) >= 2
+            and not self.state["state"]["busy"]), timeout=15)
+
+    def _save_dialog(self, path):
+        """Patch the save dialog to return ``path`` ("" cancels)."""
+        from PySide6 import QtWidgets
+        return mock.patch.object(
+            QtWidgets.QFileDialog, "getSaveFileName",
+            return_value=(path, "DUO conversation files (*.json)"))
+
+    def _open_dialog(self, path):
+        """Patch the open dialog to return ``path`` ("" cancels)."""
+        from PySide6 import QtWidgets
+        return mock.patch.object(
+            QtWidgets.QFileDialog, "getOpenFileName",
+            return_value=(path, "DUO conversation files (*.json)"))
+
+    def _answer(self, button):
+        from PySide6.QtWidgets import QMessageBox
+        return mock.patch.object(QMessageBox, "question",
+                                 return_value=button)
+
+    def _read(self, path):
+        with open(path, encoding="utf-8") as fh:
+            return fh.read()
+
+    def _snapshot(self):
+        convo = self.state["convo"]
+        return {
+            side: (copy.deepcopy(convo.sides[side].history),
+                   list(convo.sides[side].labels),
+                   list(convo.sides[side].display),
+                   convo.sides[side].instruction,
+                   convo.sides[side].model)
+            for side in ("A", "B")}
+
+    def _assert_snapshot(self, snap):
+        convo = self.state["convo"]
+        for side in ("A", "B"):
+            history, labels, display, instruction, model = snap[side]
+            self.assertEqual(convo.sides[side].history, history)
+            self.assertEqual(convo.sides[side].labels, labels)
+            self.assertEqual(convo.sides[side].display, display)
+            self.assertEqual(convo.sides[side].instruction, instruction)
+            self.assertEqual(convo.sides[side].model, model)
+
+    def test_buttons_enabled_when_idle(self):
+        self.assertTrue(self.state["save_convo"].isEnabled())
+        self.assertTrue(self.state["open_convo"].isEnabled())
+        self.assertEqual(self.state["save_convo"].text(),
+                         "Save conversation")
+        self.assertEqual(self.state["open_convo"].text(),
+                         "Open conversation")
+
+    def test_save_then_open_restores_everything(self):
+        from PySide6.QtWidgets import QMessageBox
+        self.state["widgets"]["A"]["instr_edit"].setPlainText("Be brief.")
+        self.app.processEvents()
+        self.assertTrue(self._send_both_and_wait("hello both"))
+        snap = self._snapshot()
+        full_before = format_full_transcript(
+            self.state["state"]["full_log"])
+        path = os.path.join(self.tmp.name, "saved.json")
+        with self._save_dialog(path):
+            self.state["save_convo"].click()
+        self.assertEqual(self.window.statusBar().currentMessage(),
+                         "Conversation saved to %s" % path)
+        with open(path, encoding="utf-8") as fh:
+            self.assertEqual(json.load(fh)["version"],
+                             CONVERSATION_FORMAT_VERSION)
+        # Clear both panes, then open the file back.
+        self.state["widgets"]["A"]["clear"].click()
+        self.state["widgets"]["B"]["clear"].click()
+        self.app.processEvents()
+        self.assertEqual(self.state["convo"].sides["A"].history, [])
+        self.assertEqual(self.state["convo"].sides["B"].history, [])
+        self.assertEqual(self.state["state"]["full_log"], [])
+        with self._open_dialog(path), self._answer(
+                QMessageBox.StandardButton.Yes):
+            self.state["open_convo"].click()
+        self.app.processEvents()
+        self._assert_snapshot(snap)
+        self.assertEqual(
+            self.state["widgets"]["A"]["instr_edit"].toPlainText(),
+            "Be brief.")
+        # The panes show the loaded conversation, and the full
+        # transcript is the same interleaved log as before.
+        self.assertIn("hello both",
+                      self.state["widgets"]["A"]["transcript"].toPlainText())
+        self.assertIn("Reply from fake-b:latest.",
+                      self.state["widgets"]["B"]["transcript"].toPlainText())
+        self.assertEqual(
+            format_full_transcript(self.state["state"]["full_log"]),
+            full_before)
+
+    def test_open_missing_model_leaves_picker_blank(self):
+        convo = Conversation()
+        convo.sides["A"].model = "gone-model:latest"
+        convo.sides["A"].add_user("hello", label="You")
+        convo.sides["B"].model = "fake-b:latest"
+        convo.sides["B"].add_user("hello", label="You")
+        path = os.path.join(self.tmp.name, "gone.json")
+        save_conversation_file(path, convo, [("A", "You", "hello"),
+                                             ("B", "You", "hello")])
+        with self._open_dialog(path):
+            self.state["open_convo"].click()
+        self.app.processEvents()
+        # A stays unpicked; B loads fine.
+        self.assertEqual(
+            self.state["widgets"]["A"]["picker"].currentIndex(), -1)
+        self.assertIsNone(self.state["convo"].sides["A"].model)
+        self.assertEqual(self.state["convo"].sides["B"].model,
+                         "fake-b:latest")
+        self.assertEqual(self.state["convo"].sides["A"].history,
+                         [{"role": "user", "content": "hello"}])
+        message = self.window.statusBar().currentMessage()
+        self.assertIn("not installed", message)
+        self.assertIn("gone-model:latest", message)
+
+    def test_open_corrupt_file_changes_nothing(self):
+        self.assertTrue(self._send_to_a_and_wait("hello"))
+        snap = self._snapshot()
+        path = os.path.join(self.tmp.name, "bad.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("{not json")
+        with self._open_dialog(path):
+            self.state["open_convo"].click()
+        self.app.processEvents()
+        self._assert_snapshot(snap)
+        self.assertIn("Couldn't open that file",
+                      self.window.statusBar().currentMessage())
+
+    def test_open_reject_keeps_current_conversation(self):
+        from PySide6.QtWidgets import QMessageBox
+        self.assertTrue(self._send_to_a_and_wait("hello"))
+        snap = self._snapshot()
+        convo = Conversation()
+        convo.sides["A"].model = "fake-a:latest"
+        convo.sides["A"].add_user("other chat", label="You")
+        path = os.path.join(self.tmp.name, "other.json")
+        save_conversation_file(path, convo, [("A", "You", "other chat")])
+        with self._open_dialog(path), self._answer(
+                QMessageBox.StandardButton.No):
+            self.state["open_convo"].click()
+        self.app.processEvents()
+        self._assert_snapshot(snap)
+
+    def test_open_empty_panes_asks_nothing(self):
+        from PySide6.QtWidgets import QMessageBox
+        convo = Conversation()
+        convo.sides["A"].model = "fake-a:latest"
+        convo.sides["A"].add_user("fresh load", label="You")
+        path = os.path.join(self.tmp.name, "fresh.json")
+        save_conversation_file(path, convo, [("A", "You", "fresh load")])
+        with self._open_dialog(path), mock.patch.object(
+                QMessageBox, "question",
+                side_effect=AssertionError("must not ask")):
+            self.state["open_convo"].click()
+        self.app.processEvents()
+        self.assertEqual(
+            self.state["convo"].sides["A"].history,
+            [{"role": "user", "content": "fresh load"}])
+
+    def test_save_cancel_writes_nothing(self):
+        self.assertTrue(self._send_to_a_and_wait("hello"))
+        before = set(os.listdir(self.tmp.name))
+        with self._save_dialog(""):
+            self.state["save_convo"].click()
+        self.assertEqual(set(os.listdir(self.tmp.name)), before)
 
 
 if __name__ == "__main__":

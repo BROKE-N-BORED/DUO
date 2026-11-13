@@ -35,6 +35,10 @@ Everything in one app:
 - **Transcripts** — save either side, or both, to a plain text file,
   or save the full transcript: the whole conversation as it happened,
   both sides interleaved in time order.
+- **Conversation save** — Save conversation keeps the whole
+  conversation in a file you can open again later: both sides'
+  histories, both models, and both instruction fields. Open
+  conversation loads it back exactly as it was.
 - **Readable chat** — messages in the window are separated by a blank
   line, with the sender's name in bold, so a long reply never runs
   into the next message.
@@ -112,8 +116,10 @@ bash run.sh
   Shift+Enter still adding a new line. The tick is remembered between
   runs. Long pastes stay whole — the message box never drops text.
 - Stop ends the turn in progress on that side. Clear wipes that side's
-  conversation. Conversations are not saved between runs — use the
-  Save buttons to keep a transcript as a text file.
+  conversation. Conversations are not saved automatically — Save
+  conversation (next to the save buttons) keeps the whole
+  conversation in a file you can open again later, and the Save
+  buttons keep a transcript as a text file.
 - The window remembers its size, position, and the split between
   the panes, so it opens where you left it.
 - If Ollama isn't running, the pane says so in plain words.
@@ -235,6 +241,16 @@ bash run.sh
   Saving is only available while nothing is generating — the
   transcript is moving mid-turn, so a save then would catch it
   half-written.
+- Save conversation, next to Save both, saves the whole conversation
+  to a file you can open again later: both sides' histories with
+  their labels, both models, both instruction fields, and the
+  interleaved full transcript — including the full text of any
+  attached files, so the conversation comes back exactly as it was.
+  Open conversation loads it back. Opening replaces the conversation
+  on screen, so it asks first when either pane already has messages.
+  If a saved model isn't installed anymore, that side stays
+  unpicked and the window says so in plain words. A file that isn't
+  a DUO conversation gets a plain error and changes nothing.
 
 ## Phone deck
 

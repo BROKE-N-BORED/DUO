@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""DUO 0.16 - two Ollama models side by side in one desktop window.
+"""DUO 0.17 - two Ollama models side by side in one desktop window.
 
 Item 1: the shell, the model pickers, and send-to-A/B/both.
 Item 2: the auto-relay AI-to-AI loop. The user types a seed message, picks
@@ -83,6 +83,13 @@ v0.16: the front door. A CHANGELOG and .gitignore, a CI workflow
   installer puts in the app menu (with an icon drawn from the
   window icon), and an uninstaller that asks first. The license is
   still to be decided.
+v0.17: conversation persistence. Save conversation writes the whole
+  conversation -- both sides' histories with their labels, both
+  models, both instruction fields, and the interleaved full-transcript
+  log -- to a JSON file, atomically, and Open conversation loads it
+  back exactly. A saved model that isn't installed anymore stays
+  unpicked, with a plain note naming it. Opening replaces the
+  conversation on screen, so it asks first.
 """
 
 import datetime
@@ -94,6 +101,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -181,7 +189,7 @@ def make_debug_logger(log_dir=None):
         return _NullLogger()
 
 APP_NAME = "DUO"
-APP_VERSION = "0.16"
+APP_VERSION = "0.17"
 DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434"
 OLLAMA_URL_ENV = "DUAL_CHAT_OLLAMA_URL"
 
@@ -990,6 +998,13 @@ def default_debug_filename(today=None):
     return "duo-debug-report-%s.txt" % day
 
 
+def default_conversation_filename(today=None):
+    """Suggested filename for a saved conversation, e.g.
+    "duo-conversation-2026-11-12.json"."""
+    day = (today or datetime.date.today()).strftime("%Y-%m-%d")
+    return "duo-conversation-%s.json" % day
+
+
 def _saved_stamp(when):
     moment = when or datetime.datetime.now()
     return moment.strftime("%Y-%m-%d %H:%M")
@@ -1045,6 +1060,147 @@ def format_full_transcript(log, when=None):
     blocks = ["%s -- %s: %s" % (side, label, text)
               for side, label, text in log]
     return "\n\n".join([header] + blocks) + "\n"
+
+
+# Conversation persistence (v0.17, audit T6): save the whole
+# conversation to a JSON file and load it back. The file carries both
+# sides' full histories -- every entry's role, content, label, and
+# short display text -- plus both models, both instruction fields,
+# and the interleaved full-transcript log, so a load restores exactly
+# what was saved. The full content is saved, not just the display
+# text: a message carrying attached files must come back with the
+# file contents intact, or the next turn would send the model a
+# different conversation than the one saved. The format is versioned;
+# a file from a different version is refused rather than half-loaded.
+
+CONVERSATION_FORMAT_VERSION = 1
+
+
+class ConversationError(Exception):
+    """A saved conversation file is unreadable or the wrong format."""
+
+
+def conversation_to_data(convo, log):
+    """Serialize a conversation: both sides plus the full log."""
+    data = {"version": CONVERSATION_FORMAT_VERSION, "sides": {}}
+    for side in ("A", "B"):
+        side_obj = convo.sides[side]
+        data["sides"][side] = {
+            "model": side_obj.model,
+            "instruction": side_obj.instruction,
+            "entries": [
+                {"role": entry["role"], "content": entry["content"],
+                 "label": side_obj.labels[i],
+                 "display": side_obj.display[i]}
+                for i, entry in enumerate(side_obj.history)],
+        }
+    data["log"] = [[side, label, text] for side, label, text in log]
+    return data
+
+
+def data_to_conversation(data):
+    """Validate saved data and build (Conversation, log) from it.
+
+    Raises ConversationError on anything wrong -- not a dict, the
+    wrong version, missing keys, or entries that are not shaped like
+    entries. Everything is checked before anything is built, so a
+    bad file can never leave a half-loaded conversation behind.
+    """
+    def _bad():
+        raise ConversationError("this is not a DUO conversation file")
+
+    if not isinstance(data, dict):
+        _bad()
+    if data.get("version") != CONVERSATION_FORMAT_VERSION:
+        raise ConversationError(
+            "this conversation file is from a different version of DUO")
+    sides = data.get("sides")
+    if not isinstance(sides, dict):
+        _bad()
+    convo = Conversation()
+    for side in ("A", "B"):
+        saved = sides.get(side)
+        if not isinstance(saved, dict):
+            _bad()
+        model = saved.get("model")
+        if model is not None and not isinstance(model, str):
+            _bad()
+        instruction = saved.get("instruction")
+        if not isinstance(instruction, str):
+            _bad()
+        entries = saved.get("entries")
+        if not isinstance(entries, list):
+            _bad()
+        side_obj = convo.sides[side]
+        side_obj.model = model
+        side_obj.instruction = instruction
+        for entry in entries:
+            if not isinstance(entry, dict):
+                _bad()
+            role = entry.get("role")
+            content = entry.get("content")
+            label = entry.get("label")
+            display = entry.get("display")
+            if role not in ("user", "assistant"):
+                _bad()
+            if (not isinstance(content, str)
+                    or not isinstance(label, str)
+                    or (display is not None
+                        and not isinstance(display, str))):
+                _bad()
+            side_obj.history.append({"role": role, "content": content})
+            side_obj.labels.append(label)
+            side_obj.display.append(display)
+    raw_log = data.get("log")
+    if not isinstance(raw_log, list):
+        _bad()
+    log = []
+    for item in raw_log:
+        if (not isinstance(item, list) or len(item) != 3
+                or item[0] not in ("A", "B")
+                or not isinstance(item[1], str)
+                or not isinstance(item[2], str)):
+            _bad()
+        log.append((item[0], item[1], item[2]))
+    return convo, log
+
+
+def save_conversation_file(path, convo, log):
+    """Write a conversation to ``path`` atomically: the file is
+    written to a temp file in the same folder, then renamed over the
+    target, so a crash mid-save can never leave a half-written
+    conversation behind. A failed write removes the temp file and
+    raises the OSError."""
+    text = json.dumps(conversation_to_data(convo, log),
+                      indent=2, ensure_ascii=False) + "\n"
+    folder = os.path.dirname(os.path.abspath(path))
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile(
+                "w", encoding="utf-8", dir=folder, prefix=".duo-convo-",
+                suffix=".tmp", delete=False) as fh:
+            tmp = fh.name
+            fh.write(text)
+        os.replace(tmp, path)
+        tmp = None
+    finally:
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+
+def load_conversation_file(path):
+    """Read a saved conversation file. Returns (Conversation, log).
+    Raises ConversationError for bad JSON or a bad format, OSError
+    for a file that can't be read."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except json.JSONDecodeError:
+        raise ConversationError("this is not a DUO conversation file")
+    return data_to_conversation(data)
 
 
 def phrase_matches(phrase, text):
@@ -2005,6 +2161,10 @@ def build_window(client=None, logger=None, deck_port=None):
     btn_row.addWidget(save_both)
     save_full = QtWidgets.QPushButton("Save full transcript")
     btn_row.addWidget(save_full)
+    save_convo = QtWidgets.QPushButton("Save conversation")
+    btn_row.addWidget(save_convo)
+    open_convo = QtWidgets.QPushButton("Open conversation")
+    btn_row.addWidget(open_convo)
     debug_btn = QtWidgets.QPushButton("Debug report")
     btn_row.addWidget(debug_btn)
     phone_btn = QtWidgets.QPushButton("Phone deck")
@@ -2294,10 +2454,14 @@ def build_window(client=None, logger=None, deck_port=None):
                                and pair_combo.currentIndex() >= 0)
         # Saving is idle-only too: the transcript is moving
         # mid-generation or mid-relay, so a save then would catch a
-        # half-written turn.
+        # half-written turn. Loading is idle-only for the same reason:
+        # swapping the conversation under a running turn would strand
+        # the reply in the wrong history.
         save_idle = not busy and not relay_active
         save_both.setEnabled(save_idle)
         save_full.setEnabled(save_idle)
+        save_convo.setEnabled(save_idle)
+        open_convo.setEnabled(save_idle)
         # Run Task: idle only, and only once the task text and both
         # pickers are set. Nothing is pre-selected, ever. The task
         # setup itself can't change mid-task.
@@ -2865,6 +3029,109 @@ def build_window(client=None, logger=None, deck_port=None):
         save_text_to_file(
             format_full_transcript(state["full_log"]),
             default_full_filename())
+
+    # --- conversation save/load (v0.17) -----------------------------------
+    def do_save_conversation():
+        """Save the whole conversation to a JSON file: both sides'
+        histories with their labels, both models, both instruction
+        fields, and the interleaved full-transcript log. Written
+        atomically, so a crash mid-save leaves no half-written file."""
+        if state["busy"] or state.get("relay") is not None:
+            return
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            window, "Save conversation", default_conversation_filename(),
+            "DUO conversation files (*.json)")
+        if not path:
+            return
+        try:
+            save_conversation_file(path, convo, state["full_log"])
+        except OSError as exc:
+            reason = exc.strerror or str(exc)
+            statusbar.showMessage(
+                "Couldn't save to %s: %s" % (path, reason), 5000)
+            return
+        statusbar.showMessage("Conversation saved to %s" % path, 5000)
+
+    def _apply_conversation(new_convo, new_log):
+        """Swap the loaded conversation into the window: both panes'
+        histories, labels, instructions, and models, plus the
+        full-transcript log. Models that are no longer installed stay
+        unpicked -- the picker is left blank for that side. Returns
+        the list of missing model names."""
+        missing = []
+        for side in ("A", "B"):
+            new_side = new_convo.sides[side]
+            side_obj = convo.sides[side]
+            side_obj.history = list(new_side.history)
+            side_obj.labels = list(new_side.labels)
+            side_obj.display = list(new_side.display)
+            side_obj.instruction = new_side.instruction
+            widgets[side]["instr_edit"].setPlainText(new_side.instruction)
+            # The model is set explicitly, not through the picker's
+            # signal: re-picking the model that is already selected
+            # fires no change, and the load must not depend on one.
+            picker = widgets[side]["picker"]
+            model = new_side.model
+            if model and picker.findText(model) >= 0:
+                picker.setCurrentIndex(picker.findText(model))
+                side_obj.model = model
+            else:
+                picker.setCurrentIndex(-1)
+                side_obj.model = None
+                if model:
+                    missing.append(model)
+            render_transcript(side)
+            refresh_history_list(side)
+            # The loaded conversation has no turn stats yet.
+            state["stats"][side] = None
+            refresh_stats_label(side)
+            set_status(side, "Idle")
+        state["full_log"] = list(new_log)
+        # A loaded conversation ends any compare offer: the replies
+        # it refers to are gone.
+        state["compare"] = {}
+        state["compare_round"] = False
+        refresh_buttons()
+        return missing
+
+    def do_open_conversation():
+        """Load a saved conversation back into the window. The file
+        is read and validated before anything changes, so a bad file
+        leaves the current conversation untouched; and opening
+        replaces the conversation on screen, so it asks first when
+        either pane already has messages."""
+        if state["busy"] or state.get("relay") is not None:
+            return
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            window, "Open conversation", "",
+            "DUO conversation files (*.json)")
+        if not path:
+            return
+        try:
+            new_convo, new_log = load_conversation_file(path)
+        except (ConversationError, OSError) as exc:
+            statusbar.showMessage(
+                "Couldn't open that file: %s" % exc, 5000)
+            return
+        if convo.sides["A"].history or convo.sides["B"].history:
+            answer = QtWidgets.QMessageBox.question(
+                window, "Open conversation?",
+                "Opening a conversation replaces the one on screen.",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                QtWidgets.QMessageBox.No)
+            if answer != QtWidgets.QMessageBox.Yes:
+                return
+        missing = _apply_conversation(new_convo, new_log)
+        if missing:
+            statusbar.showMessage(
+                "Conversation opened, but not installed: %s."
+                % ", ".join(missing), 5000)
+        else:
+            statusbar.showMessage(
+                "Conversation opened from %s" % path, 5000)
+
+    save_convo.clicked.connect(do_save_conversation)
+    open_convo.clicked.connect(do_open_conversation)
 
     # --- debug report ------------------------------------------------------
     def do_debug_report():
@@ -3632,6 +3899,9 @@ def build_window(client=None, logger=None, deck_port=None):
         "save_both": save_both, "do_save": do_save,
         "do_save_both": do_save_both,
         "save_full": save_full, "do_save_full": do_save_full,
+        "save_convo": save_convo, "open_convo": open_convo,
+        "do_save_conversation": do_save_conversation,
+        "do_open_conversation": do_open_conversation,
         "save_text_to_file": save_text_to_file,
         "debug_btn": debug_btn, "do_debug_report": do_debug_report,
         "debug_logger": logger,
