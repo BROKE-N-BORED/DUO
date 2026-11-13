@@ -8,12 +8,12 @@ Or start a relay: type a seed message, press Start Relay, and the two
 models talk to each other — each reply is handed to the other model,
 one turn at a time, until the turn cap or a stop condition.
 
-This is Item 6 of the project: the shell, the model pickers,
+This is Item 7 of the project: the shell, the model pickers,
 send-to-A/B/both, the auto-relay loop, the director controls
 (history editing, hop review, instructions, saved pairs, compare
 mode), long-loop support (summarize, budget nudge, per-turn
-speed and RAM readout), file upload, and tasks. The rest
-comes later.
+speed and RAM readout), file upload, tasks, and transcript
+save/export. The rest comes later.
 
 ## What you need
 
@@ -47,7 +47,8 @@ bash run.sh
   after the other — A first, then B — so the PC never runs two models
   at the same time.
 - Stop ends the turn in progress on that side. Clear wipes that side's
-  conversation. Conversations are not saved between runs yet.
+  conversation. Conversations are not saved between runs — use the
+  Save buttons to keep a transcript as a text file.
 - If Ollama isn't running, the pane says so in plain words.
 
 ## Relay
@@ -143,6 +144,23 @@ bash run.sh
 - The per-side Stop button cancels a running task. Attachments never
   ride on tasks — tasks are text-only; attached files stay put for
   the next normal send.
+
+## Transcripts
+
+- Save: each pane has a Save button that saves that side's
+  conversation to a plain text file you pick. Save both, next to the
+  send buttons, saves both sides in one file — the Model A section
+  first, then Model B.
+- The file reads like the window: a header line naming DUO, the model,
+  and when it was saved, then each message in order with its labels
+  ([relay], [task], [task handoff], the summary entry), one blank
+  line between messages. Attached file contents are never pasted in —
+  the file carries the same short "(Attached: ...)" tag the window
+  shows.
+- An empty transcript still saves: the header plus "No messages yet.".
+  Saving is only available while nothing is generating — the
+  transcript is moving mid-turn, so a save then would catch it
+  half-written.
 
 ## Tests
 

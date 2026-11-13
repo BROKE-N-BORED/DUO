@@ -1,9 +1,10 @@
-"""Tests for DUO Items 1-6. No real Ollama needed: a fake Ollama HTTP
+"""Tests for DUO Items 1-7. No real Ollama needed: a fake Ollama HTTP
 server (and a fake client for the GUI tests) stands in for the real one.
 
 Run from the project root:  python3 -m unittest discover -s tests -v
 """
 import copy
+import datetime
 import json
 import os
 import sys
@@ -23,10 +24,12 @@ from dual_chat import (  # noqa: E402
     Conversation, HISTORY_BUDGET_CHARS, NoModelSelected, OllamaClient,
     OllamaError, RelaySession, SUMMARY_KEEP_LAST, SUMMARY_LABEL,
     SUMMARIZE_PROMPT, SerialRunner, TaskSession, attachment_tag,
-    build_attached_message, compute_turn_stats, format_ram,
-    format_stats_line, load_attachment, load_pairs, pairs_path,
-    parse_ollama_list_output, parse_ps_payload, parse_stop_phrases,
-    parse_tags_payload, save_pair,
+    build_attached_message, compute_turn_stats, default_both_filename,
+    default_side_filename, format_both_transcript, format_ram,
+    format_side_transcript, format_stats_line, load_attachment,
+    load_pairs, pairs_path, parse_ollama_list_output, parse_ps_payload,
+    parse_stop_phrases, parse_tags_payload, sanitize_filename_part,
+    save_pair,
 )
 
 
@@ -2546,6 +2549,332 @@ class Item6GuiTests(unittest.TestCase):
         self.assertEqual([att["name"] for att in
                           self.state["state"]["attachments"]],
                          ["notes.txt"])
+
+
+# ---------------------------------------------------------------------------
+# Transcripts (Item 7): pure logic, no Qt
+# ---------------------------------------------------------------------------
+
+class TranscriptFormatTests(unittest.TestCase):
+    WHEN = datetime.datetime(2026, 11, 12, 19, 30)
+    DAY = datetime.date(2026, 11, 12)
+
+    def _side(self, name="A", model="fake-a:latest"):
+        side = ChatSide(name)
+        side.model = model
+        return side
+
+    def test_side_export_exact(self):
+        side = self._side()
+        side.add_user("hello")
+        side.add_assistant("hi there")
+        self.assertEqual(
+            format_side_transcript(side, self.WHEN),
+            "DUO transcript -- Model A (fake-a:latest)"
+            " -- saved 2026-11-12 19:30\n\n"
+            "You: hello\n\n"
+            "fake-a:latest: hi there\n")
+
+    def test_labels_included(self):
+        side = self._side()
+        side.add_user("rain is lovely", label="You [relay from Model B]")
+        side.add_assistant("I agree")
+        side.add_user("count the stars", label="You [task]")
+        side.add_assistant("counted them")
+        side.add_user("Here is the result of a task. Review it and say "
+                      "what is good, what is wrong, and what you would "
+                      "change:\n\ncounted them",
+                      label="You [task handoff]",
+                      display="Task result from Model B, for review.")
+        side.add_assistant("looks good")
+        text = format_side_transcript(side, self.WHEN)
+        self.assertIn("You [relay from Model B]: rain is lovely", text)
+        self.assertIn("You [task]: count the stars", text)
+        self.assertIn("You [task handoff]: "
+                      "Task result from Model B, for review.", text)
+        # The handoff shows the short note, not the full framed text.
+        self.assertNotIn("what is good, what is wrong", text)
+
+    def test_summary_entry_included(self):
+        side = self._side()
+        for i in range(5):
+            side.add_user("user %d" % i)
+        self.assertTrue(side.summarize("we talked about rain"))
+        text = format_side_transcript(side, self.WHEN)
+        self.assertIn("Summary of earlier messages: "
+                      "Earlier in this conversation: "
+                      "we talked about rain", text)
+        # The folded message is gone; the last four stay.
+        self.assertNotIn("user 0", text)
+        self.assertIn("You: user 4", text)
+
+    def test_file_contents_never_pasted_in(self):
+        side = self._side()
+        full = build_attached_message(
+            [("notes.txt", "SECRET FILE CONTENTS")], "please read this")
+        side.add_user(full, display="please read this\n"
+                                    "(Attached: notes.txt)")
+        text = format_side_transcript(side, self.WHEN)
+        self.assertNotIn("SECRET FILE CONTENTS", text)
+        self.assertNotIn("File: notes.txt", text)
+        self.assertIn("You: please read this\n(Attached: notes.txt)", text)
+
+    def test_empty_transcript(self):
+        self.assertEqual(
+            format_side_transcript(self._side(), self.WHEN),
+            "DUO transcript -- Model A (fake-a:latest)"
+            " -- saved 2026-11-12 19:30\n\n"
+            "No messages yet.\n")
+
+    def test_no_model_named_in_header(self):
+        side = ChatSide("B")
+        text = format_side_transcript(side, self.WHEN)
+        self.assertTrue(
+            text.startswith("DUO transcript -- Model B (no model picked)"
+                            " -- saved 2026-11-12 19:30\n\n"))
+
+    def test_both_sections_in_order(self):
+        convo = Conversation()
+        convo.sides["A"].model = "fake-a:latest"
+        convo.sides["B"].model = "fake-b:latest"
+        convo.sides["A"].add_user("a one")
+        convo.sides["A"].add_assistant("a two")
+        convo.sides["B"].add_user("b one")
+        self.assertEqual(
+            format_both_transcript(convo, self.WHEN),
+            "DUO transcript -- saved 2026-11-12 19:30\n\n"
+            "Model A (fake-a:latest)\n\n"
+            "You: a one\n\n"
+            "fake-a:latest: a two\n\n"
+            "Model B (fake-b:latest)\n\n"
+            "You: b one\n")
+
+    def test_both_empty_side(self):
+        convo = Conversation()
+        convo.sides["A"].model = "fake-a:latest"
+        convo.sides["B"].model = "fake-b:latest"
+        convo.sides["B"].add_user("b one")
+        self.assertEqual(
+            format_both_transcript(convo, self.WHEN),
+            "DUO transcript -- saved 2026-11-12 19:30\n\n"
+            "Model A (fake-a:latest)\n\n"
+            "No messages yet.\n\n"
+            "Model B (fake-b:latest)\n\n"
+            "You: b one\n")
+
+    def test_side_filename_sanitizes_model(self):
+        self.assertEqual(
+            default_side_filename("A", "qwen3.5:2b", self.DAY),
+            "duo-model-a-qwen3.5-2b-2026-11-12.txt")
+        self.assertEqual(
+            default_side_filename("B", "fake-b:latest", self.DAY),
+            "duo-model-b-fake-b-latest-2026-11-12.txt")
+
+    def test_side_filename_without_model(self):
+        self.assertEqual(
+            default_side_filename("A", None, self.DAY),
+            "duo-model-a-2026-11-12.txt")
+
+    def test_both_filename(self):
+        self.assertEqual(default_both_filename(self.DAY),
+                         "duo-both-2026-11-12.txt")
+
+    def test_sanitize_filename_part(self):
+        self.assertEqual(sanitize_filename_part("a/b\\c:d*e"), "a-b-c-d-e")
+        self.assertEqual(sanitize_filename_part("qwen3.5:2b"), "qwen3.5-2b")
+        self.assertEqual(sanitize_filename_part("plain-name_1"), "plain-name_1")
+
+
+# ---------------------------------------------------------------------------
+# Transcripts (Item 7): GUI
+# ---------------------------------------------------------------------------
+
+@unittest.skipUnless(os.environ.get("DUAL_CHAT_GUI_TESTS") == "1",
+                     "GUI tests run with DUAL_CHAT_GUI_TESTS=1")
+class Item7GuiTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        from PySide6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+        cls.client = FakeGuiClient()
+
+    def setUp(self):
+        from dual_chat import build_window
+        self.client.reset()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.pairs_file = os.path.join(self.tmp.name, "duo-pairs.json")
+        self._env = mock.patch.dict(
+            os.environ, {"DUAL_CHAT_PAIRS_FILE": self.pairs_file})
+        self._env.start()
+        self.window = build_window(self.client)
+        self.window.show()
+        self.state = self.window._dual_chat
+        self._wait_for(lambda: self.state["widgets"]["A"]["picker"].count() == 2)
+        self._pick_models()
+
+    def tearDown(self):
+        self.window.close()
+        self._env.stop()
+        self.tmp.cleanup()
+
+    def _wait_for(self, cond, timeout=10.0):
+        from PySide6.QtTest import QTest
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            QTest.qWait(50)
+            if cond():
+                return True
+        return cond()
+
+    def _pick_models(self):
+        self.state["widgets"]["A"]["picker"].setCurrentIndex(0)
+        self.state["widgets"]["B"]["picker"].setCurrentIndex(1)
+        self.app.processEvents()
+
+    def _send_to_a_and_wait(self, text):
+        self.state["composer"].setPlainText(text)
+        self.state["send_a"].click()
+        return self._wait_for(lambda: (
+            len(self.state["convo"].sides["A"].history) >= 2
+            and not self.state["state"]["busy"]), timeout=15)
+
+    def _send_both_and_wait(self, text):
+        self.state["composer"].setPlainText(text)
+        self.state["send_both"].click()
+        return self._wait_for(lambda: (
+            len(self.state["convo"].sides["A"].history) >= 2
+            and len(self.state["convo"].sides["B"].history) >= 2
+            and not self.state["state"]["busy"]), timeout=15)
+
+    def _start_relay(self, seed, cap=10):
+        self.state["start_picker"].setCurrentIndex(0)
+        self.state["cap_spin"].setValue(cap)
+        self.state["mode_picker"].setCurrentIndex(0)  # Blind
+        self.state["composer"].setPlainText(seed)
+        self.app.processEvents()
+        self.state["relay_btn"].click()
+
+    def _wait_for_relay_stopped(self, timeout=15.0):
+        return self._wait_for(lambda: self.state["relay_status"].text()
+                              .startswith("Relay stopped"), timeout=timeout)
+
+    def _save_dialog(self, path):
+        """Patch the save dialog to return ``path`` ("" cancels)."""
+        from PySide6 import QtWidgets
+        return mock.patch.object(
+            QtWidgets.QFileDialog, "getSaveFileName",
+            return_value=(path, "Text files (*.txt)"))
+
+    def _read(self, path):
+        with open(path, encoding="utf-8") as fh:
+            return fh.read()
+
+    def test_save_side_writes_exact_file(self):
+        self.assertTrue(self._send_to_a_and_wait("hello"))
+        path = os.path.join(self.tmp.name, "out.txt")
+        with self._save_dialog(path):
+            self.state["widgets"]["A"]["save"].click()
+        text = self._read(path)
+        lines = text.split("\n")
+        self.assertRegex(
+            lines[0],
+            r"^DUO transcript -- Model A \(fake-a:latest\)"
+            r" -- saved \d{4}-\d{2}-\d{2} \d{2}:\d{2}$")
+        self.assertEqual(
+            "\n".join(lines[1:]),
+            "\nYou: hello\n\n"
+            "fake-a:latest: Reply from fake-a:latest.\n")
+        self.assertEqual(self.window.statusBar().currentMessage(),
+                         "Saved to %s" % path)
+
+    def test_save_both_writes_both_sections(self):
+        self.assertTrue(self._send_both_and_wait("which is better?"))
+        path = os.path.join(self.tmp.name, "both.txt")
+        with self._save_dialog(path):
+            self.state["save_both"].click()
+        text = self._read(path)
+        self.assertRegex(
+            text.split("\n")[0],
+            r"^DUO transcript -- saved \d{4}-\d{2}-\d{2} \d{2}:\d{2}$")
+        a_at = text.index("Model A (fake-a:latest)")
+        b_at = text.index("Model B (fake-b:latest)")
+        self.assertLess(a_at, b_at)
+        self.assertIn("You: which is better?", text)
+        self.assertIn("fake-a:latest: Reply from fake-a:latest.", text)
+        self.assertIn("fake-b:latest: Reply from fake-b:latest.", text)
+        self.assertEqual(text.count("which is better?"), 2)
+
+    def test_save_empty_transcript(self):
+        path = os.path.join(self.tmp.name, "empty.txt")
+        with self._save_dialog(path):
+            self.state["widgets"]["A"]["save"].click()
+        text = self._read(path)
+        lines = text.split("\n")
+        self.assertRegex(
+            lines[0],
+            r"^DUO transcript -- Model A \(fake-a:latest\)"
+            r" -- saved \d{4}-\d{2}-\d{2} \d{2}:\d{2}$")
+        self.assertEqual("\n".join(lines[1:]), "\nNo messages yet.\n")
+
+    def test_cancel_writes_nothing(self):
+        self.assertTrue(self._send_to_a_and_wait("hello"))
+        before = set(os.listdir(self.tmp.name))
+        with self._save_dialog(""):
+            self.state["widgets"]["A"]["save"].click()
+        self.assertEqual(set(os.listdir(self.tmp.name)), before)
+
+    def test_write_failure_shows_plain_note(self):
+        self.assertTrue(self._send_to_a_and_wait("hello"))
+        bad = os.path.join(self.tmp.name, "no-such-dir", "out.txt")
+        with self._save_dialog(bad):
+            self.state["widgets"]["A"]["save"].click()
+        message = self.window.statusBar().currentMessage()
+        self.assertTrue(message.startswith("Couldn't save to %s" % bad),
+                        message)
+        self.assertIn("No such file or directory", message)
+        # No crash: the window is still alive and the transcript intact.
+        self.assertTrue(self.window.isVisible())
+        self.assertIn("hello", self.state["convo"].sides["A"].history[0]
+                      ["content"])
+
+    def test_save_disabled_mid_generation(self):
+        save_a = self.state["widgets"]["A"]["save"]
+        save_b = self.state["widgets"]["B"]["save"]
+        self.assertTrue(save_a.isEnabled())
+        self.assertTrue(self.state["save_both"].isEnabled())
+        self.client.delay = 0.5
+        self.client.replies = {"fake-a:latest": ["one two three four five"]}
+        self.state["composer"].setPlainText("slow one")
+        self.state["send_a"].click()
+        self.assertTrue(self._wait_for(
+            lambda: self.state["state"]["busy"], timeout=5))
+        self.assertFalse(save_a.isEnabled())
+        self.assertFalse(save_b.isEnabled())
+        self.assertFalse(self.state["save_both"].isEnabled())
+        self.assertTrue(self._wait_for(
+            lambda: not self.state["state"]["busy"], timeout=15))
+        self.assertTrue(save_a.isEnabled())
+        self.assertTrue(self.state["save_both"].isEnabled())
+
+    def test_save_disabled_mid_relay(self):
+        save_a = self.state["widgets"]["A"]["save"]
+        self.assertTrue(save_a.isEnabled())
+        self.client.replies = {"fake-a:latest": [" ".join(["word"] * 100)],
+                               "fake-b:latest": ["short"]}
+        self._start_relay("Go on.", cap=10)
+        self.assertTrue(self._wait_for(
+            lambda: self.state["state"].get("relay") is not None,
+            timeout=5))
+        self.assertFalse(save_a.isEnabled())
+        self.assertFalse(
+            self.state["widgets"]["B"]["save"].isEnabled())
+        self.assertFalse(self.state["save_both"].isEnabled())
+        self.state["relay_btn"].click()
+        self.assertTrue(self._wait_for_relay_stopped())
+        self.assertTrue(self._wait_for(
+            lambda: not self.state["state"]["busy"], timeout=10))
+        self.assertTrue(save_a.isEnabled())
+        self.assertTrue(self.state["save_both"].isEnabled())
 
 
 if __name__ == "__main__":

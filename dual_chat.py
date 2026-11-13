@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""DUO (Item 6) - two Ollama models side by side in one desktop window.
+"""DUO (Item 7) - two Ollama models side by side in one desktop window.
 
 Item 1: the shell, the model pickers, and send-to-A/B/both.
 Item 2: the auto-relay AI-to-AI loop. The user types a seed message, picks
@@ -36,10 +36,18 @@ Item 6: tasks. Hand a job to one model: it answers, and then the
   -- one round, no loop. The task shows as "You [task]" in the
   worker's pane and the handoff as "You [task handoff]" in the
   other pane; the tags never reach the models.
+Item 7: transcripts. Save one side's conversation, or both sides in
+  one file, as plain text that reads like the window: a header line
+  naming DUO, the model, and when the file was saved, then each
+  message in order with its labels, one blank line between messages.
+  Attached file contents are never pasted in -- the short tag is all
+  the file carries. Saving is idle-only: never mid-generation or
+  mid-relay, when the transcript is moving.
 
-NOT in Item 6 (later items): export, provider APIs.
+NOT in Item 7 (later items): provider APIs.
 """
 
+import datetime
 import json
 import os
 import queue
@@ -547,6 +555,80 @@ def attachment_tag(names):
     return "(Attached: %s)" % ", ".join(names)
 
 
+# Transcripts (Item 7): plain-text export. The file reads like the
+# window -- the same labels and short display texts, one blank line
+# between messages. Attached file contents are never pasted in; the
+# short "(Attached: ...)" tag is all the file carries.
+
+def sanitize_filename_part(text):
+    """Make a model name safe for a filename: keep letters, digits,
+    '.', '-' and '_'; everything else becomes '-'."""
+    cleaned = "".join(
+        ch if (ch.isalnum() or ch in "._-") else "-" for ch in text)
+    return cleaned.strip(".-") or "model"
+
+
+def default_side_filename(side, model, today=None):
+    """Suggested filename for one side's export, e.g.
+    "duo-model-a-fake-a-latest-2026-11-12.txt". No model picked ->
+    "duo-model-a-2026-11-12.txt"."""
+    day = (today or datetime.date.today()).strftime("%Y-%m-%d")
+    base = "duo-model-%s" % side.lower()
+    if model:
+        base += "-" + sanitize_filename_part(model)
+    return "%s-%s.txt" % (base, day)
+
+
+def default_both_filename(today=None):
+    """Suggested filename for the combined export, e.g.
+    "duo-both-2026-11-12.txt"."""
+    day = (today or datetime.date.today()).strftime("%Y-%m-%d")
+    return "duo-both-%s.txt" % day
+
+
+def _saved_stamp(when):
+    moment = when or datetime.datetime.now()
+    return moment.strftime("%Y-%m-%d %H:%M")
+
+
+def _side_blocks(side_obj):
+    """One text block per message, exactly as the window shows it:
+    "label: display text", with the short display text (attachment
+    tag, handoff note) instead of the full contents."""
+    return ["%s: %s" % (label, side_obj.display_text(i))
+            for i, label in enumerate(side_obj.labels)]
+
+
+def format_side_transcript(side_obj, when=None):
+    """The plain-text export for one side: a header line naming DUO,
+    the model, and when the file was saved, then each message in order,
+    one blank line between messages. An empty transcript gets the
+    header plus "No messages yet."."""
+    model = side_obj.model or "no model picked"
+    header = ("DUO transcript -- Model %s (%s) -- saved %s"
+              % (side_obj.name, model, _saved_stamp(when)))
+    if not side_obj.history:
+        return header + "\n\nNo messages yet.\n"
+    return "\n\n".join([header] + _side_blocks(side_obj)) + "\n"
+
+
+def format_both_transcript(convo, when=None):
+    """The combined export: one header line naming DUO and when the
+    file was saved, then a "Model A" section and a "Model B" section,
+    each in message order. Each section names its model; an empty
+    side gets "No messages yet."."""
+    parts = ["DUO transcript -- saved %s" % _saved_stamp(when)]
+    for side in ("A", "B"):
+        side_obj = convo.sides[side]
+        model = side_obj.model or "no model picked"
+        parts.append("Model %s (%s)" % (side, model))
+        if not side_obj.history:
+            parts.append("No messages yet.")
+        else:
+            parts.extend(_side_blocks(side_obj))
+    return "\n\n".join(parts) + "\n"
+
+
 class RelaySession:
     """One relay run: config, turn counting, framing, stop checks.
 
@@ -950,6 +1032,8 @@ def build_window(client=None):
         bottom.addWidget(stop)
         clear = QtWidgets.QPushButton("Clear")
         bottom.addWidget(clear)
+        save = QtWidgets.QPushButton("Save")
+        bottom.addWidget(save)
         hist_toggle = QtWidgets.QPushButton("History ▸")
         hist_toggle.setCheckable(True)
         hist_toggle.setFlat(True)
@@ -959,6 +1043,7 @@ def build_window(client=None):
         widgets[side] = {
             "picker": picker, "refresh": refresh, "transcript": transcript,
             "status": status, "stop": stop, "clear": clear,
+            "save": save,
             "instr_toggle": instr_toggle, "instr_edit": instr_edit,
             "use_this": use_this, "hist_toggle": hist_toggle,
             "hist_frame": hist_frame, "hist_list": hist_list,
@@ -1015,6 +1100,8 @@ def build_window(client=None):
     for btn in (send_a, send_b, send_both):
         btn.setEnabled(False)
         btn_row.addWidget(btn)
+    save_both = QtWidgets.QPushButton("Save both")
+    btn_row.addWidget(save_both)
     d_layout.addLayout(btn_row)
 
     # --- relay row ---------------------------------------------------------
@@ -1217,6 +1304,11 @@ def build_window(client=None):
         pair_combo.setEnabled(pairs_idle)
         pair_name.setEnabled(pairs_idle)
         pair_save.setEnabled(pairs_idle)
+        # Saving is idle-only too: the transcript is moving
+        # mid-generation or mid-relay, so a save then would catch a
+        # half-written turn.
+        save_idle = not busy and not relay_active
+        save_both.setEnabled(save_idle)
         # Run Task: idle only, and only once the task text and both
         # pickers are set. Nothing is pre-selected, ever. The task
         # setup itself can't change mid-task.
@@ -1241,6 +1333,7 @@ def build_window(client=None):
             w["clear"].setEnabled(not relay_active
                                   and side not in state["active"]
                                   and side not in state["queued"])
+            w["save"].setEnabled(save_idle)
             w["use_this"].setEnabled(compare_ready)
             # Summarize: idle only, a model picked, and something older
             # to fold. While this side is summarizing the button says
@@ -1689,6 +1782,47 @@ def build_window(client=None):
         if paths:
             add_attachments(paths)
 
+    # --- transcript save ---------------------------------------------------
+    def save_text_to_file(text, default_name):
+        """Offer a save dialog and write ``text`` to the picked file.
+
+        Cancelling writes nothing and shows no error. A failed write
+        gets a plain note naming the problem -- never a crash, never
+        silent. Returns True when the file was written.
+        """
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            window, "Save transcript", default_name,
+            "Text files (*.txt)")
+        if not path:
+            return False
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(text)
+        except OSError as exc:
+            reason = exc.strerror or str(exc)
+            statusbar.showMessage(
+                "Couldn't save to %s: %s" % (path, reason), 5000)
+            return False
+        statusbar.showMessage("Saved to %s" % path, 5000)
+        return True
+
+    def do_save(side):
+        """Save one side's transcript to a text file."""
+        if state["busy"] or state.get("relay") is not None:
+            return
+        side_obj = convo.sides[side]
+        save_text_to_file(
+            format_side_transcript(side_obj),
+            default_side_filename(side, side_obj.model))
+
+    def do_save_both():
+        """Save both transcripts to one combined text file."""
+        if state["busy"] or state.get("relay") is not None:
+            return
+        save_text_to_file(
+            format_both_transcript(convo),
+            default_both_filename())
+
     attach_btn.clicked.connect(on_attach_clicked)
 
     # --- sends ------------------------------------------------------------
@@ -1733,6 +1867,7 @@ def build_window(client=None):
     send_a.clicked.connect(lambda: do_send("A"))
     send_b.clicked.connect(lambda: do_send("B"))
     send_both.clicked.connect(lambda: do_send("Both"))
+    save_both.clicked.connect(do_save_both)
 
     # --- summarize --------------------------------------------------------
     def do_summarize(side):
@@ -2109,10 +2244,16 @@ def build_window(client=None):
             refresh_buttons()
         return clear
 
+    def make_save(side):
+        def save():
+            do_save(side)
+        return save
+
     for side in ("A", "B"):
         widgets[side]["stop"].clicked.connect(make_stop(side))
         widgets[side]["summarize"].clicked.connect(make_summarize(side))
         widgets[side]["clear"].clicked.connect(make_clear(side))
+        widgets[side]["save"].clicked.connect(make_save(side))
 
     # --- model pickers -----------------------------------------------------
     def on_picker_changed(side):
@@ -2204,6 +2345,9 @@ def build_window(client=None):
         "task_edit": task_edit, "task_worker": task_worker,
         "task_follow_up": task_follow_up, "task_run": task_run,
         "do_run_task": do_run_task,
+        "save_both": save_both, "do_save": do_save,
+        "do_save_both": do_save_both,
+        "save_text_to_file": save_text_to_file,
     }
 
     refresh_pair_combo()
