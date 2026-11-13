@@ -1,7 +1,24 @@
 # DUO changelog
 
 Every version, newest first. v0.1–v0.17 were built on 2026-11-12;
-v0.18–v0.30 on 2026-11-13.
+v0.18–v0.31 on 2026-11-13.
+
+## v0.31 — 2026-11-13
+
+The director bar collapses now. A "Director" toggle sits on the
+boundary between the panes and the director rows: click it and the
+controls hide so the panes take the whole window; click it again
+and everything comes back exactly as it was. The toggle stays
+visible either way, so the controls are always one click away, and
+your choice is remembered between runs. Collapsing never touches
+running work: a relay or task in flight keeps running while the
+rows are hidden, and the activity lights and the CPU/RAM meter
+stay visible. Behind the scenes, the phone deck moved into its own
+file (duo_deck.py) to make room: the window file was 16 lines under
+its 4,000-line bound. Nothing about the deck changed. Also fixed:
+closing the window while a background check was still running
+could crash the app on the way out; closing now waits for those
+threads to finish first.
 
 ## v0.30 — 2026-11-13
 

@@ -34,7 +34,8 @@ from dual_chat import (  # noqa: E402
     MSG_OLLAMA_NOT_INSTALLED, MSG_OLLAMA_SLOW, MSG_OLLAMA_START_FAILED,
     MSG_PHONE_BUSY, MSG_PHONE_RELAY, MSG_PHONE_TARGET,
     MSG_UPDATE_AVAILABLE, MSG_UPDATE_FAILED, MSG_UPDATE_LATEST,
-    SETTINGS_APP, SETTINGS_ORG, SETTING_ENTER_TO_SEND,
+    SETTINGS_APP, SETTINGS_ORG, SETTING_DIRECTOR_COLLAPSED,
+    SETTING_ENTER_TO_SEND,
     SETTING_SPLITTER_STATE, SETTING_TEMPERATURE,
     SETTING_WINDOW_GEOMETRY,
     SIDE_STATES,
@@ -6388,7 +6389,7 @@ class FrontDoorTests(unittest.TestCase):
 
     def test_changelog_covers_every_version(self):
         log = self._read("CHANGELOG.md")
-        for version in ["0.%d" % n for n in range(1, 31)]:
+        for version in ["0.%d" % n for n in range(1, 32)]:
             self.assertIn(version, log)
 
     def test_gitignore_covers_runtime_files(self):
@@ -8391,7 +8392,8 @@ class ModuleSplitTests(unittest.TestCase):
 
     MODULES = ("duo_ollama", "duo_stats", "duo_text", "duo_tasks",
                "duo_markdown", "duo_model", "duo_transcript",
-               "duo_storage", "duo_runner", "duo_icon", "duo_menu")
+               "duo_storage", "duo_runner", "duo_icon", "duo_menu",
+               "duo_deck")
 
     def _tree(self):
         return os.path.dirname(
@@ -8419,6 +8421,7 @@ class ModuleSplitTests(unittest.TestCase):
 
     def test_reexports_are_the_same_objects(self):
         import dual_chat
+        import duo_deck
         import duo_icon
         import duo_markdown
         import duo_menu
@@ -8433,6 +8436,10 @@ class ModuleSplitTests(unittest.TestCase):
         pairs = [
             (dual_chat.make_app_icon, duo_icon.make_app_icon),
             (dual_chat.build_menu_bar, duo_menu.build_menu_bar),
+            (dual_chat.DeckServer, duo_deck.DeckServer),
+            (dual_chat.build_deck_state, duo_deck.build_deck_state),
+            (dual_chat.get_lan_ip, duo_deck.get_lan_ip),
+            (dual_chat.render_qr_pixmap, duo_deck.render_qr_pixmap),
             (dual_chat.markdown_to_html, duo_markdown.markdown_to_html),
             (dual_chat.ChatSide, duo_model.ChatSide),
             (dual_chat.ChatMessage, duo_model.ChatMessage),
@@ -8742,6 +8749,12 @@ class MessageStructureTests(unittest.TestCase):
             script = fh.read()
         self.assertIn('"duo_menu.py": 0o100644', script)
 
+    def test_zip_includes_the_deck_module(self):
+        with open(os.path.join(self._tree(), "build_zip.py"),
+                  encoding="utf-8") as fh:
+            script = fh.read()
+        self.assertIn('"duo_deck.py": 0o100644', script)
+
 class UpdateCheckTests(unittest.TestCase):
     """v0.28 (audit T17): the update check's pure core -- version
     parsing and comparison, and the GitHub latest-release lookup
@@ -8956,6 +8969,35 @@ class UpdateCheckGuiTests(unittest.TestCase):
 
     def _message(self):
         return self.window.statusBar().currentMessage()
+
+    def test_closing_while_a_check_runs_waits_for_it(self):
+        # v0.31: destroying a running QThread aborts the whole
+        # process ("QThread: Destroyed while thread '' is still
+        # running", exit 134 in the full suite). Closing the
+        # window while the startup check is still in flight must
+        # wait for it to finish instead.
+        import threading
+        self.check_gate = threading.Event()
+        self._build_window()
+        checkers = self.state["update_checkers"]
+        self.assertTrue(self._wait_for(
+            lambda: len(checkers) == 1
+            and checkers[0].thread.isRunning(),
+            timeout=10),
+            "the startup check should be running, held on the gate")
+        # Release the gate from another thread: the GUI thread is
+        # about to block inside close() while it waits for the
+        # checker, so nothing on the GUI thread could release it.
+        # Hold the checker itself: close() cleans it out of the
+        # list once its thread finishes.
+        checker = checkers[0]
+        threading.Timer(0.5, self.check_gate.set).start()
+        self.window.close()
+        self.app.processEvents()
+        self.assertFalse(self.window.isVisible())
+        self.assertTrue(checker.thread.isFinished())
+        self.assertTrue(self._wait_for(lambda: checkers == []),
+                        "the finished checker should be cleaned up")
 
     def test_button_present_and_enabled_at_idle(self):
         self._build_window()
@@ -9867,6 +9909,180 @@ class MenuBarGuiTests(unittest.TestCase):
         self.assertNotIn("\u2014", tip)
         nudge = self.state["widgets"]["A"]["nudge"].text()
         self.assertEqual(nudge, "History is long. Summarize?")
+@unittest.skipUnless(os.environ.get("DUAL_CHAT_GUI_TESTS") == "1",
+                     "GUI tests run with DUAL_CHAT_GUI_TESTS=1")
+class DirectorCollapseGuiTests(unittest.TestCase):
+    """v0.31 (audit T19): one Director toggle collapses the whole
+    director area below the panes so the panes take the full
+    window. The toggle stays visible either way, the choice is
+    remembered between runs, and collapsing never touches running
+    work. The update check is stubbed, as in MenuBarGuiTests, so
+    no test touches the network."""
+
+    @classmethod
+    def setUpClass(cls):
+        from PySide6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+        cls.client = FakeGuiClient()
+
+    def setUp(self):
+        # The collapsed choice is persisted, so clear it before
+        # every window: each test starts from the default
+        # (expanded).
+        self._clear_director_collapsed()
+        from dual_chat import build_window
+        self._patcher = mock.patch(
+            "dual_chat.check_for_update",
+            return_value=("latest", None))
+        self._patcher.start()
+        self.client.reset()
+        self.window = build_window(self.client, logger=TEST_LOGGER)
+        self.window.show()
+        self.state = self.window._dual_chat
+        self._wait_for(lambda: self.state["widgets"]["A"]["picker"].count() == 2)
+        self._pick_models()
+
+    def tearDown(self):
+        self.window.close()
+        self.app.processEvents()
+        self._patcher.stop()
+        self._clear_director_collapsed()
+
+    def _clear_director_collapsed(self):
+        from PySide6.QtCore import QSettings
+        settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
+        settings.remove(SETTING_DIRECTOR_COLLAPSED)
+        settings.sync()
+
+    def _wait_for(self, cond, timeout=10.0):
+        from PySide6.QtTest import QTest
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            QTest.qWait(50)
+            if cond():
+                return True
+        return cond()
+
+    def _pick_models(self):
+        self.state["widgets"]["A"]["picker"].setCurrentIndex(0)
+        self.state["widgets"]["B"]["picker"].setCurrentIndex(1)
+        self.app.processEvents()
+
+    def _start_relay(self, seed, cap=10):
+        self.state["start_picker"].setCurrentIndex(0)
+        self.state["cap_spin"].setValue(cap)
+        self.state["mode_picker"].setCurrentIndex(0)
+        self.state["stop_edit"].setText("")
+        self.state["agree_check"].setChecked(False)
+        self.state["composer"].setPlainText(seed)
+        self.app.processEvents()
+        self.state["relay_btn"].click()
+
+    def _wait_for_relay_stopped(self, timeout=15.0):
+        return self._wait_for(lambda: self.state["relay_status"].text()
+                              .startswith("Relay stopped"), timeout=timeout)
+
+    def test_director_starts_expanded(self):
+        toggle = self.state["director_toggle"]
+        self.assertEqual(toggle.text(), "Director \u25be")
+        self.assertTrue(self.state["director"].isVisible())
+        self.assertTrue(toggle.isVisible())
+        self.assertTrue(self.state["composer"].isVisible())
+
+    def test_collapse_hides_director_and_panes_grow(self):
+        pane = self.state["widgets"]["A"]["transcript"]
+        before = pane.height()
+        self.state["director_toggle"].click()
+        self.app.processEvents()
+        self.assertTrue(self.state["director"].isHidden())
+        self.assertEqual(self.state["director_toggle"].text(),
+                         "Director \u25b8")
+        self.assertTrue(self.state["director_toggle"].isVisible())
+        self.assertTrue(self._wait_for(
+            lambda: pane.height() > before, timeout=5),
+            "the panes should grow into the freed space")
+
+    def test_expand_restores_director(self):
+        toggle = self.state["director_toggle"]
+        toggle.click()
+        self.app.processEvents()
+        self.assertTrue(self.state["director"].isHidden())
+        toggle.click()
+        self.app.processEvents()
+        self.assertTrue(self.state["director"].isVisible())
+        self.assertEqual(toggle.text(), "Director \u25be")
+        self.assertTrue(self.state["composer"].isVisible())
+        self.assertTrue(self.state["relay_btn"].isVisible())
+
+    def test_collapsed_state_persists_across_restart(self):
+        from dual_chat import build_window
+        self.state["director_toggle"].click()
+        self.app.processEvents()
+        self.assertTrue(self.state["director"].isHidden())
+        self.window.close()
+        self.app.processEvents()
+        window2 = build_window(self.client, logger=TEST_LOGGER)
+        try:
+            window2.show()
+            state2 = window2._dual_chat
+            self.assertTrue(self._wait_for(
+                lambda: state2["widgets"]["A"]["picker"].count() == 2))
+            self.assertTrue(state2["director"].isHidden())
+            self.assertEqual(state2["director_toggle"].text(),
+                             "Director \u25b8")
+            self.assertTrue(state2["director_toggle"].isVisible())
+            # And expanding persists the other way.
+            state2["director_toggle"].click()
+            self.app.processEvents()
+            self.assertTrue(state2["director"].isVisible())
+        finally:
+            window2.close()
+        self.app.processEvents()
+        window3 = build_window(self.client, logger=TEST_LOGGER)
+        try:
+            window3.show()
+            state3 = window3._dual_chat
+            self.assertTrue(self._wait_for(
+                lambda: state3["widgets"]["A"]["picker"].count() == 2))
+            self.assertTrue(state3["director"].isVisible())
+        finally:
+            window3.close()
+
+    def test_send_works_after_collapse_expand_cycle(self):
+        self.state["director_toggle"].click()
+        self.app.processEvents()
+        self.state["director_toggle"].click()
+        self.app.processEvents()
+        self.state["composer"].setPlainText("Hello, both of you.")
+        self.state["send_both"].click()
+        ok = self._wait_for(lambda: (
+            len(self.state["convo"].sides["A"].messages) >= 2
+            and len(self.state["convo"].sides["B"].messages) >= 2
+            and not self.state["state"]["busy"]), timeout=15)
+        self.assertTrue(ok, "both panes should show their replies")
+
+    def test_relay_keeps_running_while_collapsed(self):
+        self._start_relay("Talk about rain.", cap=4)
+        self.state["director_toggle"].click()
+        self.app.processEvents()
+        self.assertTrue(self.state["director"].isHidden())
+        self.assertTrue(self._wait_for_relay_stopped(),
+                        "the relay should run to its stop, collapsed "
+                        "or not")
+        self.assertGreaterEqual(
+            len(self.state["convo"].sides["A"].messages), 2)
+        self.assertGreaterEqual(
+            len(self.state["convo"].sides["B"].messages), 2)
+
+    def test_toggle_always_visible(self):
+        toggle = self.state["director_toggle"]
+        self.assertTrue(toggle.isVisible())
+        toggle.click()
+        self.app.processEvents()
+        self.assertTrue(toggle.isVisible())
+        toggle.click()
+        self.app.processEvents()
+        self.assertTrue(toggle.isVisible())
 
 
 if __name__ == "__main__":

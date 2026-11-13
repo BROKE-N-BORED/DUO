@@ -143,6 +143,11 @@ bash run.sh
   buttons keep a transcript as a text file.
 - The window remembers its size, position, and the split between
   the panes, so it opens where you left it.
+- The "Director" toggle between the panes and the controls below
+  hides the whole director area so the panes take the whole window;
+  click it again to bring everything back. The toggle stays visible
+  either way, your choice is remembered between runs, and a relay
+  or task keeps running while the controls are hidden.
 - DUO checks for a newer Release once at startup and says so in
   the status bar when one is out; the "Check for updates" button
   next to Phone deck runs the same check on demand. It never
