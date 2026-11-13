@@ -123,6 +123,7 @@ v0.22: multi-round tasks. A task runs for as many rounds as the
 """
 
 import datetime
+import html
 import json
 import os
 import queue
@@ -219,7 +220,7 @@ def make_debug_logger(log_dir=None):
         return _NullLogger()
 
 APP_NAME = "DUO"
-APP_VERSION = "0.23"
+APP_VERSION = "0.24"
 DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434"
 OLLAMA_URL_ENV = "DUAL_CHAT_OLLAMA_URL"
 
@@ -1380,6 +1381,175 @@ def load_side_transcript_file(path):
     return parse_side_transcript(text)
 
 
+# Markdown rendering (v0.24, audit T13): model replies are shown
+# formatted in the panes -- bold, italic, code, headers, lists,
+# quotes, links -- through the panes' QTextEdit rich-text support.
+# This is a DISPLAY layer only: history, exports, conversation
+# files, and the phone deck all keep the raw text, and user
+# messages are never reformatted (only assistant messages, plus
+# the summary entry, which is model output stored as a user entry).
+#
+# The converter is deliberately bounded: the subset below, nothing
+# more. It HTML-escapes everything FIRST and only then applies the
+# Markdown transforms, so a reply containing raw HTML (a "<b>" tag,
+# a "<script>") shows as text and can never inject markup. Links
+# are http/https only -- anything else renders as literal text.
+# Inline spans never cross a line break, and an unclosed delimiter
+# stays literal text rather than swallowing the rest of the message.
+# A code block's fence runs to the end of the message when the
+# closing fence is missing (standard Markdown behaviour).
+
+_MD_CODE_BG = "#f0f0f0"  # code-block background on the light panes
+_MD_INLINE_RE = re.compile(
+    r"`([^`\n]+)`"  # code span (first: nothing inside is formatted)
+    r"|\[([^\]\n]+)\]\(([^)\n]+)\)"  # link [text](url)
+    r"|\*\*(\S(?:.*?\S)?)\*\*"  # bold **text**
+    r"|\*(\S(?:.*?\S)?)\*"  # italic *text*
+    r"|(?<!\w)_(\S(?:.*?\S)?)_(?!\w)")  # italic _text_ (not snake_case)
+
+
+def _markdown_inline(line):
+    """Render the inline Markdown of one (already escaped) line:
+    code spans, links, bold, italic. The alternation order is the
+    precedence: code wins over everything inside it, bold wins over
+    italic for a "**" pair. Content must start and end with a
+    non-space character, so "2 * 3 * 4" is never italicised."""
+    def _replace(match):
+        code, link_text, link_url, bold, ital_star, ital_under = (
+            match.groups())
+        if code is not None:
+            return "<code>%s</code>" % code
+        if link_text is not None:
+            if (link_url.startswith("http://")
+                    or link_url.startswith("https://")):
+                return ('<a href="%s">%s</a>' % (link_url, link_text))
+            return match.group(0)
+        if bold is not None:
+            return "<b>%s</b>" % bold
+        if ital_star is not None:
+            return "<i>%s</i>" % ital_star
+        return "<i>%s</i>" % ital_under
+
+    return _MD_INLINE_RE.sub(_replace, line)
+
+
+def markdown_to_html(text):
+    """Convert the bounded Markdown subset to HTML for a pane.
+
+    Blocks, split on blank lines: fenced code blocks (```), headers
+    (# / ## / ###), unordered lists (- / *), ordered lists (1. ),
+    blockquotes (>), and paragraphs. A paragraph's lines are joined
+    with <br>, so line breaks show exactly as typed (a raw newline
+    inside a <p> would collapse to a space). Paragraph gaps render
+    as one newline in the pane's plain text -- the <p> margins give
+    the visual separation. Returns "" for empty or blank input."""
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    if not text.strip():
+        return ""
+    lines = text.split("\n")
+    blocks = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+        if not stripped:
+            i += 1
+            continue
+        if stripped.startswith("```"):
+            # Fenced code block: raw lines, escaped, no inline
+            # formatting inside. An unclosed fence runs to the end.
+            code_lines = []
+            i += 1
+            while i < len(lines) and not lines[i].strip().startswith("```"):
+                code_lines.append(lines[i])
+                i += 1
+            if i < len(lines):
+                i += 1  # skip the closing fence
+            blocks.append(("code", "\n".join(code_lines)))
+            continue
+        header = re.match(r"^(#{1,3}) ", stripped)
+        if header:
+            level = len(header.group(1))
+            blocks.append(("header", level, _markdown_inline(
+                html.escape(stripped[level + 1:]))))
+            i += 1
+            continue
+        if re.match(r"^[-*] ", stripped):
+            items = []
+            while i < len(lines):
+                item = lines[i].strip()
+                if not re.match(r"^[-*] ", item):
+                    break
+                items.append(_markdown_inline(html.escape(item[2:])))
+                i += 1
+            blocks.append(("ul", items))
+            continue
+        if re.match(r"^\d+[.)] ", stripped):
+            items = []
+            while i < len(lines):
+                item = lines[i].strip()
+                if not re.match(r"^\d+[.)] ", item):
+                    break
+                items.append(_markdown_inline(
+                    html.escape(re.sub(r"^\d+[.)] ", "", item))))
+                i += 1
+            blocks.append(("ol", items))
+            continue
+        if stripped.startswith(">"):
+            quote_lines = []
+            while i < len(lines):
+                quote = lines[i].strip()
+                if not quote.startswith(">"):
+                    break
+                quote_lines.append(quote[1:].strip())
+                i += 1
+            blocks.append(("quote", _markdown_inline(
+                html.escape(" ".join(quote_lines)))))
+            continue
+        para_lines = []
+        while i < len(lines):
+            para = lines[i]
+            if not para.strip():
+                break
+            if (para.strip().startswith("```")
+                    or re.match(r"^#{1,3} ", para.strip())
+                    or re.match(r"^[-*] ", para.strip())
+                    or re.match(r"^\d+[.)] ", para.strip())
+                    or para.strip().startswith(">")):
+                break
+            para_lines.append(_markdown_inline(html.escape(para)))
+            i += 1
+        blocks.append(("para", "<br>".join(para_lines)))
+
+    out = []
+    for block in blocks:
+        kind = block[0]
+        if kind == "code":
+            out.append('<pre style="background-color:%s;">%s</pre>'
+                       % (_MD_CODE_BG, html.escape(block[1])))
+        elif kind == "header":
+            out.append("<h%d>%s</h%d>" % (block[1], block[2], block[1]))
+        elif kind == "ul":
+            out.append("<ul>%s</ul>" % "".join(
+                "<li>%s</li>" % item for item in block[1]))
+        elif kind == "ol":
+            out.append("<ol>%s</ol>" % "".join(
+                "<li>%s</li>" % item for item in block[1]))
+        elif kind == "quote":
+            out.append("<blockquote>%s</blockquote>" % block[1])
+        else:
+            out.append("<p>%s</p>" % block[1])
+    return "".join(out)
+
+
+def _open_link_in_browser(url):
+    """Open a link clicked in a transcript pane in the default
+    browser. The import is lazy: Qt lives in build_window, not at
+    module level."""
+    from PySide6 import QtGui
+    QtGui.QDesktopServices.openUrl(url)
+
+
 # Conversation persistence (v0.17, audit T6): save the whole
 # conversation to a JSON file and load it back. The file carries both
 # sides' full histories -- every entry's role, content, label, and
@@ -2352,6 +2522,32 @@ def build_window(client=None, logger=None, deck_port=None):
     # --- one pane per side -----------------------------------------------
     widgets = {}  # side -> dict of widgets
 
+    class _LinkClickFilter(QtCore.QObject):
+        """Makes links in a read-only transcript clickable. QTextEdit
+        has no anchorClicked signal in this Qt build (that is
+        QTextBrowser-only), so clicks on the viewport are caught
+        here: a left-click on a link opens it in the default
+        browser, and hovering a link shows the pointing hand."""
+        def __init__(self, transcript):
+            super().__init__(transcript)
+            self._transcript = transcript
+
+        def eventFilter(self, obj, event):
+            if event.type() == QtCore.QEvent.MouseButtonPress:
+                if event.button() == QtCore.Qt.LeftButton:
+                    href = self._transcript.anchorAt(
+                        event.position().toPoint())
+                    if href:
+                        _open_link_in_browser(QtCore.QUrl(href))
+                        return True
+            elif event.type() == QtCore.QEvent.MouseMove:
+                href = self._transcript.anchorAt(
+                    event.position().toPoint())
+                self._transcript.viewport().setCursor(
+                    QtCore.Qt.PointingHandCursor if href
+                    else QtCore.Qt.ArrowCursor)
+            return super().eventFilter(obj, event)
+
     def make_pane(side):
         frame = QtWidgets.QFrame()
         frame.setFrameShape(QtWidgets.QFrame.StyledPanel)
@@ -2417,6 +2613,11 @@ def build_window(client=None, logger=None, deck_port=None):
 
         transcript = QtWidgets.QTextEdit()
         transcript.setReadOnly(True)
+        # Links in a rendered reply open in the default browser
+        # (via the viewport filter: QTextEdit has no anchorClicked
+        # signal in this Qt build).
+        transcript.viewport().installEventFilter(
+            _LinkClickFilter(transcript))
         transcript.setPlaceholderText("No messages yet.")
         # Wrap at the widget's width, set explicitly -- long model
         # replies must wrap in the pane, never run off the edge.
@@ -2524,6 +2725,11 @@ def build_window(client=None, logger=None, deck_port=None):
             "stats": stats, "session_tokens": session_tokens,
             "nudge": nudge, "summarize": summarize_btn,
             "reply_open": False,
+            # Document position where the streaming reply's body
+            # starts (just after its label). on_done uses it to
+            # replace the streamed plain text with the Markdown
+            # rendering; None when no reply is open.
+            "reply_body_pos": None,
         }
         return frame
 
@@ -2796,32 +3002,82 @@ def build_window(client=None, logger=None, deck_port=None):
         if not cursor.document().isEmpty():
             cursor.insertText("\n", _PLAIN_FMT)
 
-    def append_message(side, label, text):
+    def append_message(side, label, text, markdown=False):
         """Append one message block: a blank line separating it from
         the previous block, a bold "label: ", then the text. The live
         path and the re-render path both use this, so the window
-        always shows the same format."""
+        always shows the same format.
+
+        ``markdown`` renders the body through markdown_to_html
+        (assistant messages only -- user messages stay plain text
+        exactly as typed). The block is closed with insertBlock
+        rather than a "\n" insert: after a list or code block the
+        cursor is still inside that structure, and a plain "\n"
+        would land in it as a stray empty item (and swallow the
+        NEXT message into the list). insertBlock with a default
+        format steps out cleanly; the plain text comes out the
+        same either way."""
         t = widgets[side]["transcript"]
         cursor = t.textCursor()
         cursor.movePosition(cursor.MoveOperation.End)
         _block_gap(cursor)
         cursor.insertText(label + ": ", _BOLD_FMT)
-        cursor.insertText(text, _PLAIN_FMT)
-        cursor.insertText("\n", _PLAIN_FMT)
+        if markdown:
+            cursor.insertHtml(markdown_to_html(text))
+            cursor.movePosition(cursor.MoveOperation.End)
+            cursor.insertBlock(QtGui.QTextBlockFormat())
+        else:
+            cursor.insertText(text, _PLAIN_FMT)
+            cursor.insertText("\n", _PLAIN_FMT)
         t.setTextCursor(cursor)
         scroll_to_end(t)
         clear_search(side)
 
     def begin_reply(side, label):
         """Open a streaming reply: the blank-line gap plus the bold
-        label, with the body to follow as chunks arrive."""
+        label, with the body to follow as chunks arrive. Records
+        where the body starts, so on_done can replace the streamed
+        plain text with the Markdown rendering."""
         t = widgets[side]["transcript"]
         cursor = t.textCursor()
         cursor.movePosition(cursor.MoveOperation.End)
         _block_gap(cursor)
         cursor.insertText(label + ": ", _BOLD_FMT)
+        widgets[side]["reply_body_pos"] = cursor.position()
         t.setTextCursor(cursor)
         scroll_to_end(t)
+
+    def render_finished_reply(side, text):
+        """Re-render the reply that just finished streaming as
+        Markdown. The body streamed as plain text (partial Markdown
+        mid-stream would flicker and mangle); now that the turn is
+        done, the whole body -- plus the trailing newline
+        finish_reply added -- is replaced with the rendered version,
+        closed the same way append_message closes a Markdown block.
+        The replacement uses the finished ``text`` (the history's
+        copy), not the streamed characters, so the pane ends up
+        holding exactly what the history holds. A failed or stopped
+        turn never reaches this: partial text stays plain. The
+        search is cleared, as for any transcript change."""
+        body_pos = widgets[side].get("reply_body_pos")
+        widgets[side]["reply_body_pos"] = None
+        if body_pos is None:
+            return
+        t = widgets[side]["transcript"]
+        doc = t.document()
+        end = doc.characterCount() - 1
+        if body_pos > end:
+            return
+        cursor = QtGui.QTextCursor(doc)
+        cursor.setPosition(body_pos)
+        cursor.setPosition(end, QtGui.QTextCursor.KeepAnchor)
+        cursor.removeSelectedText()
+        cursor.insertHtml(markdown_to_html(text))
+        cursor.movePosition(QtGui.QTextCursor.MoveOperation.End)
+        cursor.insertBlock(QtGui.QTextBlockFormat())
+        t.setTextCursor(cursor)
+        scroll_to_end(t)
+        clear_search(side)
 
     def append_note(side, text):
         """Append a transient note ("(Relay stopped: ...)",
@@ -2851,12 +3107,18 @@ def build_window(client=None, logger=None, deck_port=None):
         so the format matches the live transcript exactly -- blank
         line between messages, bold sender labels. Transient notes
         like "(Stopped.)" are not in the history, so a re-render
-        drops them.
+        drops them. Assistant messages render as Markdown; user
+        messages stay plain. The summary entry renders too -- it is
+        model output, even though it is stored as a user entry.
         """
         side_obj = convo.sides[side]
         widgets[side]["transcript"].clear()
+        widgets[side]["reply_body_pos"] = None
         for i, label in enumerate(side_obj.labels):
-            append_message(side, label, side_obj.display_text(i))
+            markdown = (side_obj.history[i]["role"] == "assistant"
+                        or label == SUMMARY_LABEL)
+            append_message(side, label, side_obj.display_text(i),
+                           markdown=markdown)
         scroll_to_end(widgets[side]["transcript"])
         # A rebuild drops the highlights with the old document, so
         # the search state goes too (empty histories never reach
@@ -3406,6 +3668,9 @@ def build_window(client=None, logger=None, deck_port=None):
             return
         finish_reply(side)
         label = convo.sides[side].add_assistant(text)
+        # The turn finished: the streamed plain text becomes the
+        # Markdown rendering (before any relay/task note lands).
+        render_finished_reply(side, text)
         log_event(side, label, text)
         refresh_history_list(side)
         state["active"].discard(side)
@@ -3463,6 +3728,7 @@ def build_window(client=None, logger=None, deck_port=None):
             refresh_buttons()
             return
         finish_reply(side)
+        widgets[side]["reply_body_pos"] = None
         append_note(side, "(%s)" % message)
         state["active"].discard(side)
         set_status(side, "Idle")
@@ -3500,6 +3766,7 @@ def build_window(client=None, logger=None, deck_port=None):
             refresh_buttons()
             return
         finish_reply(side)
+        widgets[side]["reply_body_pos"] = None
         append_note(side, "(%s)" % MSG_STOPPED)
         state["active"].discard(side)
         state["queued"].discard(side)
@@ -4480,6 +4747,7 @@ def build_window(client=None, logger=None, deck_port=None):
         def clear():
             convo.sides[side].clear()
             widgets[side]["transcript"].clear()
+            widgets[side]["reply_body_pos"] = None
             clear_search(side)
             # A cleared conversation restarts: that side's entries
             # leave the full transcript too.

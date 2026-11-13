@@ -56,6 +56,7 @@ from dual_chat import (  # noqa: E402
     load_conversation_file, load_pairs, load_presets,
     load_side_transcript_file,
     make_debug_logger,
+    markdown_to_html,
     pairs_path, parse_ollama_list_output, parse_ps_payload,
     parse_side_transcript, parse_stop_phrases, parse_tags_payload,
     phrase_matches,
@@ -3748,6 +3749,164 @@ class TranscriptImportTests(unittest.TestCase):
                              "duo-no-such-transcript.txt"))
 
 
+class MarkdownTests(unittest.TestCase):
+    """Markdown rendering (v0.24, audit T13): the bounded converter.
+
+    Escape-first, then the subset: bold, italic, inline code,
+    fenced code blocks, headers 1-3, lists, blockquotes, http/https
+    links. Incomplete constructs stay literal; anything outside the
+    subset stays literal too."""
+
+    def test_bold(self):
+        self.assertEqual(
+            markdown_to_html("Hello **bold** end."),
+            "<p>Hello <b>bold</b> end.</p>")
+
+    def test_italic_star(self):
+        self.assertEqual(
+            markdown_to_html("Hello *ital* end."),
+            "<p>Hello <i>ital</i> end.</p>")
+
+    def test_italic_underscore(self):
+        self.assertEqual(
+            markdown_to_html("Hello _ital_ end."),
+            "<p>Hello <i>ital</i> end.</p>")
+
+    def test_inline_code(self):
+        self.assertEqual(
+            markdown_to_html("Run `print(x)` now."),
+            "<p>Run <code>print(x)</code> now.</p>")
+
+    def test_code_span_protects_markdown(self):
+        # Nothing inside a code span is formatted.
+        self.assertEqual(
+            markdown_to_html("Literal `**not bold**` here."),
+            "<p>Literal <code>**not bold**</code> here.</p>")
+
+    def test_fenced_block(self):
+        self.assertEqual(
+            markdown_to_html("```\nx = 1\ny = 2\n```"),
+            '<pre style="background-color:#f0f0f0;">x = 1\ny = 2</pre>')
+
+    def test_fenced_block_escapes_and_ignores_markdown(self):
+        self.assertEqual(
+            markdown_to_html("```\n<b>tag</b> and **stars**\n```"),
+            '<pre style="background-color:#f0f0f0;">'
+            "&lt;b&gt;tag&lt;/b&gt; and **stars**</pre>")
+
+    def test_unclosed_fence_runs_to_end(self):
+        self.assertEqual(
+            markdown_to_html("intro\n```\ncode to eof"),
+            "<p>intro</p>"
+            '<pre style="background-color:#f0f0f0;">code to eof</pre>')
+
+    def test_headers(self):
+        self.assertEqual(markdown_to_html("# Title"),
+                         "<h1>Title</h1>")
+        self.assertEqual(markdown_to_html("## Sub"),
+                         "<h2>Sub</h2>")
+        self.assertEqual(markdown_to_html("### Small"),
+                         "<h3>Small</h3>")
+
+    def test_header_level_four_stays_literal(self):
+        self.assertEqual(markdown_to_html("#### Not a header"),
+                         "<p>#### Not a header</p>")
+
+    def test_header_with_inline_markdown(self):
+        self.assertEqual(markdown_to_html("## A **bold** head"),
+                         "<h2>A <b>bold</b> head</h2>")
+
+    def test_unordered_list(self):
+        self.assertEqual(
+            markdown_to_html("- one\n- two\n* three"),
+            "<ul><li>one</li><li>two</li><li>three</li></ul>")
+
+    def test_ordered_list(self):
+        self.assertEqual(
+            markdown_to_html("1. first\n2. second"),
+            "<ol><li>first</li><li>second</li></ol>")
+
+    def test_list_items_take_inline_markdown(self):
+        self.assertEqual(
+            markdown_to_html("- **bold** item\n- `code` item"),
+            "<ul><li><b>bold</b> item</li>"
+            "<li><code>code</code> item</li></ul>")
+
+    def test_blockquote(self):
+        self.assertEqual(
+            markdown_to_html("> quoted words\n> more quote"),
+            "<blockquote>quoted words more quote</blockquote>")
+
+    def test_link(self):
+        self.assertEqual(
+            markdown_to_html("see [example](https://example.com) here."),
+            '<p>see <a href="https://example.com">example</a> here.</p>')
+
+    def test_link_http_allowed(self):
+        self.assertIn(
+            '<a href="http://example.com">',
+            markdown_to_html("[x](http://example.com)"))
+
+    def test_link_non_http_stays_literal(self):
+        # No javascript: (or any other scheme) ever becomes a link.
+        self.assertEqual(
+            markdown_to_html("see [x](javascript:alert(1)) here."),
+            "<p>see [x](javascript:alert(1)) here.</p>")
+
+    def test_escaping_raw_html_shown_as_text(self):
+        self.assertEqual(
+            markdown_to_html("raw <b>not bold</b> text"),
+            "<p>raw &lt;b&gt;not bold&lt;/b&gt; text</p>")
+
+    def test_escaping_script_tag(self):
+        self.assertNotIn("<script>",
+                         markdown_to_html("<script>alert(1)</script>"))
+        self.assertIn("&lt;script&gt;",
+                      markdown_to_html("<script>alert(1)</script>"))
+
+    def test_unclosed_bold_stays_literal(self):
+        self.assertEqual(
+            markdown_to_html("unclosed **bold stays literal"),
+            "<p>unclosed **bold stays literal</p>")
+
+    def test_unclosed_italic_stays_literal(self):
+        self.assertEqual(
+            markdown_to_html("unclosed *ital stays literal"),
+            "<p>unclosed *ital stays literal</p>")
+
+    def test_snake_case_not_italic(self):
+        self.assertEqual(
+            markdown_to_html("snake_case stays plain"),
+            "<p>snake_case stays plain</p>")
+
+    def test_asterisk_math_not_italic(self):
+        self.assertEqual(
+            markdown_to_html("2 * 3 * 4 stays plain"),
+            "<p>2 * 3 * 4 stays plain</p>")
+
+    def test_mixed_content(self):
+        self.assertEqual(
+            markdown_to_html(
+                "# Title\n\nHello **bold** and `code`.\n\n- one\n- two"),
+            "<h1>Title</h1>"
+            "<p>Hello <b>bold</b> and <code>code</code>.</p>"
+            "<ul><li>one</li><li>two</li></ul>")
+
+    def test_empty_string(self):
+        self.assertEqual(markdown_to_html(""), "")
+        self.assertEqual(markdown_to_html("   \n  "), "")
+
+    def test_multiline_paragraph_keeps_line_breaks(self):
+        self.assertEqual(
+            markdown_to_html("line one\nline two"),
+            "<p>line one<br>line two</p>")
+
+    def test_crlf_normalized(self):
+        self.assertEqual(
+            markdown_to_html("one\r\ntwo"),
+            "<p>one<br>two</p>")
+
+
 # ---------------------------------------------------------------------------
 # Transcripts (Item 7): GUI
 # ---------------------------------------------------------------------------
@@ -4104,11 +4263,17 @@ class Item9GuiTests(unittest.TestCase):
             text)
         # Asserted on the rendered document, not just the string:
         # sender labels bold, bodies plain.
+        # (No trailing space on the reply: since v0.24 the finished
+        # reply is re-rendered from the history text, and the fake
+        # client streams "word " chunks -- the live document used to
+        # carry a trailing space the history never had. The
+        # re-render path never had it either, so the two paths now
+        # agree.)
         self.assertEqual(self._fragments("A"), [
             ("You: ", True),
             ("hello", False),
             ("fake-a:latest: ", True),
-            ("Reply from fake-a:latest. ", False),
+            ("Reply from fake-a:latest.", False),
         ])
 
     def test_streaming_still_appends_tokens_mid_turn(self):
@@ -5942,7 +6107,7 @@ class FrontDoorTests(unittest.TestCase):
 
     def test_changelog_covers_every_version(self):
         log = self._read("CHANGELOG.md")
-        for version in ["0.%d" % n for n in range(1, 24)]:
+        for version in ["0.%d" % n for n in range(1, 25)]:
             self.assertIn(version, log)
 
     def test_gitignore_covers_runtime_files(self):
@@ -7608,6 +7773,326 @@ class TranscriptImportGuiTests(unittest.TestCase):
              ("user", "and of Spain?\nasking for a friend"),
              ("assistant", "Madrid."),
              ("user", "what about Italy?")])
+
+
+@unittest.skipUnless(os.environ.get("DUAL_CHAT_GUI_TESTS") == "1",
+                     "GUI tests run with DUAL_CHAT_GUI_TESTS=1")
+class MarkdownGuiTests(unittest.TestCase):
+    """Markdown rendering (v0.24, audit T13): assistant replies render
+    as formatted text in the panes -- live streaming stays plain
+    until the turn finishes, user messages stay literal, and nothing
+    stored (history, exports) changes."""
+
+    @classmethod
+    def setUpClass(cls):
+        from PySide6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+        cls.client = FakeGuiClient()
+
+    def setUp(self):
+        from dual_chat import build_window
+        self.client.reset()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.pairs_file = os.path.join(self.tmp.name, "duo-pairs.json")
+        self._env = mock.patch.dict(
+            os.environ, {"DUAL_CHAT_PAIRS_FILE": self.pairs_file})
+        self._env.start()
+        self.window = build_window(self.client, logger=TEST_LOGGER)
+        self.window.show()
+        self.state = self.window._dual_chat
+        self._wait_for(lambda: self.state["widgets"]["A"]["picker"].count() == 2)
+        self._pick_models()
+
+    def tearDown(self):
+        self.window.close()
+        self._env.stop()
+        self.tmp.cleanup()
+
+    def _wait_for(self, cond, timeout=10.0):
+        from PySide6.QtTest import QTest
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            QTest.qWait(50)
+            if cond():
+                return True
+        return cond()
+
+    def _pick_models(self):
+        self.state["widgets"]["A"]["picker"].setCurrentIndex(0)
+        self.state["widgets"]["B"]["picker"].setCurrentIndex(1)
+        self.app.processEvents()
+
+    def _send_to_a_and_wait(self, text):
+        self.state["composer"].setPlainText(text)
+        self.state["send_a"].click()
+        return self._wait_for(lambda: (
+            len(self.state["convo"].sides["A"].history) >= 2
+            and not self.state["state"]["busy"]), timeout=15)
+
+    def _transcript(self, side):
+        return self.state["widgets"][side]["transcript"].toPlainText()
+
+    def _fragments(self, side):
+        """[(text, bold, italic, mono, href)] for every fragment in a
+        pane's document, in order -- the rendered format, not just
+        the plain string."""
+        from PySide6 import QtGui
+        doc = self.state["widgets"][side]["transcript"].document()
+        out = []
+        block = doc.firstBlock()
+        while block.isValid():
+            it = block.begin()
+            while not it.atEnd():
+                frag = it.fragment()
+                if frag.isValid():
+                    fmt = frag.charFormat()
+                    # font().family(), not the deprecated
+                    # fontFamily(): the deprecated call segfaults
+                    # this PySide6 build (proven by faulthandler).
+                    out.append((frag.text(),
+                                fmt.fontWeight()
+                                >= QtGui.QFont.Weight.Bold,
+                                fmt.fontItalic(),
+                                fmt.font().family() == "monospace",
+                                fmt.anchorHref()))
+                it += 1
+            block = block.next()
+        return out
+
+    def _save_dialog(self, path):
+        """Patch the save dialog to return ``path`` ("" cancels)."""
+        from PySide6 import QtWidgets
+        return mock.patch.object(
+            QtWidgets.QFileDialog, "getSaveFileName",
+            return_value=(path, "Text files (*.txt)"))
+
+    def _open_dialog(self, path):
+        """Patch the open dialog to return ``path`` ("" cancels)."""
+        from PySide6 import QtWidgets
+        return mock.patch.object(
+            QtWidgets.QFileDialog, "getOpenFileName",
+            return_value=(path, "Text files (*.txt)"))
+
+    def _read(self, path):
+        with open(path, encoding="utf-8") as fh:
+            return fh.read()
+
+    def test_completed_reply_renders_markdown(self):
+        reply = ("## Findings\n\nThe **bold** word and `code()` here."
+                 "\n\n- one\n- two\n\n"
+                 "See [example](https://example.com).")
+        self.client.replies = {"fake-a:latest": [reply]}
+        self.assertTrue(self._send_to_a_and_wait("tell me"))
+        plain = self._transcript("A")
+        # The markers are gone from what the window shows...
+        self.assertNotIn("**", plain)
+        self.assertNotIn("`", plain)
+        self.assertNotIn("##", plain)
+        self.assertNotIn("[example]", plain)
+        # ...but the words are all there, in order.
+        self.assertIn("fake-a:latest: Findings", plain)
+        self.assertIn("The bold word and code() here.", plain)
+        self.assertIn("one\ntwo", plain)
+        self.assertIn("See example.", plain)
+        # ...and the formatting is real, not just stripped markers.
+        frags = self._fragments("A")
+        self.assertTrue(any(text == "bold" and bold
+                            for text, bold, _i, _m, _h in frags),
+                        frags)
+        self.assertTrue(any(text == "code()" and mono
+                            for text, _b, _i, mono, _h in frags),
+                        frags)
+        self.assertTrue(any(text == "example"
+                            and href == "https://example.com"
+                            for text, _b, _i, _m, href in frags),
+                        frags)
+        html = self.state["widgets"]["A"]["transcript"].toHtml()
+        self.assertIn("font-size:x-large", html)  # the h2 header
+        self.assertIn("<ul", html)
+        self.assertIn("<li", html)
+        # The history still holds the raw Markdown, untouched.
+        self.assertEqual(
+            self.state["convo"].sides["A"].history[1]["content"], reply)
+
+    def test_link_click_opens_browser(self):
+        # Clicking a link in a pane opens it in the default browser:
+        # render a reply with a link, click the link text in the
+        # viewport with the opener mocked, and check the URL
+        # reaches it.
+        from PySide6 import QtCore, QtGui, QtTest
+        reply = "See [example](https://example.com) here."
+        self.client.replies = {"fake-a:latest": [reply]}
+        self.assertTrue(self._send_to_a_and_wait("tell me"))
+        transcript = self.state["widgets"]["A"]["transcript"]
+        found = transcript.document().find("example")
+        self.assertFalse(found.isNull())
+        rect = transcript.cursorRect(found)
+        with mock.patch.object(
+                QtGui.QDesktopServices, "openUrl") as opener:
+            QtTest.QTest.mouseClick(
+                transcript.viewport(), QtCore.Qt.LeftButton,
+                pos=rect.center())
+            opener.assert_called_once()
+            self.assertEqual(opener.call_args[0][0].toString(),
+                             "https://example.com")
+
+    def test_streaming_shows_plain_then_formats(self):
+        # A long, slow reply: plenty of time to catch it mid-stream.
+        reply = ("Here is **bold** text and `code` and more words "
+                 "to keep it streaming for a while now.")
+        self.client.replies = {"fake-a:latest": [reply]}
+        self.client.delay = 0.3
+        self.state["composer"].setPlainText("tell me")
+        self.state["send_a"].click()
+        # Mid-stream the raw markers are visible and unformatted.
+        self.assertTrue(self._wait_for(
+            lambda: "**bold**" in self._transcript("A"), timeout=10),
+            "the raw markers should stream into the pane")
+        mid = self._fragments("A")
+        self.assertFalse(any("bold" in text and bold
+                             for text, bold, _i, _m, _h in mid),
+                         mid)
+        # Once the turn finishes, the same text is formatted.
+        self.assertTrue(self._wait_for(
+            lambda: not self.state["state"]["busy"], timeout=15))
+        self.assertNotIn("**", self._transcript("A"))
+        done = self._fragments("A")
+        self.assertTrue(any(text == "bold" and bold
+                            for text, bold, _i, _m, _h in done),
+                        done)
+
+    def test_user_message_stays_literal(self):
+        self.assertTrue(self._send_to_a_and_wait("say **not bold**"))
+        plain = self._transcript("A")
+        self.assertIn("You: say **not bold**", plain)
+        frags = self._fragments("A")
+        self.assertFalse(any("not bold" in text and bold
+                             for text, bold, _i, _m, _h in frags),
+                         frags)
+
+    def test_export_keeps_raw_markdown(self):
+        reply = "## Findings\n\nThe **bold** word."
+        self.client.replies = {"fake-a:latest": [reply]}
+        self.assertTrue(self._send_to_a_and_wait("tell me"))
+        path = os.path.join(self.tmp.name, "out.txt")
+        with self._save_dialog(path):
+            self.state["widgets"]["A"]["save"].click()
+        text = self._read(path)
+        self.assertIn("fake-a:latest: ## Findings", text)
+        self.assertIn("The **bold** word.", text)
+
+    def test_search_finds_text_in_markdown_reply(self):
+        reply = "The **bold** word and `code()` here."
+        self.client.replies = {"fake-a:latest": [reply]}
+        self.assertTrue(self._send_to_a_and_wait("tell me"))
+        w = self.state["widgets"]["A"]
+        w["search_edit"].setText("bold")
+        self.app.processEvents()
+        self.assertEqual(w["search_count"].text(), "1 matches")
+        self.assertTrue(
+            self.state["widgets"]["A"]["transcript"].extraSelections())
+
+    def test_raw_html_shown_as_text(self):
+        reply = "raw <b>not bold</b> and <script>alert(1)</script>"
+        self.client.replies = {"fake-a:latest": [reply]}
+        self.assertTrue(self._send_to_a_and_wait("tell me"))
+        plain = self._transcript("A")
+        self.assertIn("raw <b>not bold</b>", plain)
+        self.assertIn("<script>alert(1)</script>", plain)
+        frags = self._fragments("A")
+        self.assertFalse(any("not bold" in text and bold
+                             for text, bold, _i, _m, _h in frags),
+                         frags)
+
+    def test_summary_entry_renders_markdown(self):
+        self.client.replies = {"fake-a:latest": [
+            "alpha one", "alpha two", "alpha three",
+            "They picked **apple pie** over cake."]}
+        self.assertTrue(self._send_to_a_and_wait("first message"))
+        self.assertTrue(self._send_to_a_and_wait("second message"))
+        self.assertTrue(self._send_to_a_and_wait("third message"))
+        convo = self.state["convo"]
+        self.assertEqual(len(convo.sides["A"].history), 6)
+        self.state["widgets"]["A"]["summarize"].click()
+        ok = self._wait_for(lambda: (
+            len(convo.sides["A"].history) == 5
+            and convo.sides["A"].labels[0] == SUMMARY_LABEL
+            and not self.state["state"]["busy"]), timeout=15)
+        self.assertTrue(ok, "history should fold into summary + last 4")
+        # The summary entry is model output: it renders.
+        self.assertNotIn("**", self._transcript("A"))
+        frags = self._fragments("A")
+        self.assertTrue(any(text == "apple pie" and bold
+                            for text, bold, _i, _m, _h in frags),
+                        frags)
+
+    def test_failed_turn_stays_plain(self):
+        from dual_chat import OllamaError
+
+        class FailingClient(FakeGuiClient):
+            def chat_stream(self, model, messages, on_chunk,
+                            cancel_event, timeout=1800, on_metrics=None,
+                            on_retry=None, options=None):
+                on_chunk("**partial** ")
+                raise OllamaError("boom")
+
+        self.window.close()
+        from dual_chat import build_window
+        failing = FailingClient()
+        self.window = build_window(failing, logger=TEST_LOGGER)
+        self.window.show()
+        self.state = self.window._dual_chat
+        self._wait_for(lambda: self.state["widgets"]["A"]["picker"].count() == 2)
+        self._pick_models()
+        self.state["composer"].setPlainText("tell me")
+        self.state["send_a"].click()
+        self.assertTrue(self._wait_for(
+            lambda: not self.state["state"]["busy"], timeout=15))
+        # The partial text stayed plain: a failed turn never finished.
+        self.assertIn("**partial**", self._transcript("A"))
+        frags = self._fragments("A")
+        self.assertFalse(any("partial" in text and bold
+                             for text, bold, _i, _m, _h in frags),
+                         frags)
+
+    def test_imported_markdown_renders(self):
+        side = ChatSide("A")
+        side.model = "other-model:9b"
+        side.add_user("what did you find?")
+        side.add_assistant("The **bold** word.")
+        path = os.path.join(self.tmp.name, "saved.txt")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(format_side_transcript(side))
+        with self._open_dialog(path):
+            self.state["widgets"]["A"]["import"].click()
+        self.app.processEvents()
+        # The re-render path formats the imported assistant message.
+        self.assertNotIn("**", self._transcript("A"))
+        self.assertIn("The bold word.", self._transcript("A"))
+        frags = self._fragments("A")
+        self.assertTrue(any(text == "bold" and bold
+                            for text, bold, _i, _m, _h in frags),
+                        frags)
+
+    def test_message_after_list_is_not_a_list_item(self):
+        # A list reply must not swallow the next message into the
+        # list (the close after insertHtml steps out cleanly).
+        self.client.replies = {"fake-a:latest": ["- one\n- two"]}
+        self.assertTrue(self._send_to_a_and_wait("list them"))
+        self.assertTrue(self._send_to_a_and_wait("second message"))
+        plain = self._transcript("A")
+        self.assertIn("one\ntwo\n\nYou: second message", plain)
+        doc = self.state["widgets"]["A"]["transcript"].document()
+        block = doc.firstBlock()
+        found = False
+        while block.isValid():
+            if "second message" in block.text():
+                found = True
+                self.assertIsNone(block.textList(),
+                                  "the second message must not be "
+                                  "inside the list")
+            block = block.next()
+        self.assertTrue(found, "second message block not found")
 
 
 if __name__ == "__main__":

@@ -1,7 +1,22 @@
 # DUO changelog
 
 Every version, newest first. v0.1–v0.17 were built on 2026-11-12;
-v0.18–v0.23 on 2026-11-13.
+v0.18–v0.24 on 2026-11-13.
+
+## v0.24 — 2026-11-13
+
+Streaming Markdown rendering. Model replies now show formatted in
+the panes instead of raw markup: bold, italic, inline code, fenced
+code blocks, headers, lists, blockquotes, and links (clicking one
+opens it in the browser). While a reply streams it stays plain text,
+and the moment the turn finishes it formats in place; a failed or
+stopped turn stays plain. Only model replies render — your own
+messages stay exactly as typed, and so do the relay and task notes.
+Nothing stored changes: history, saved transcripts, conversation
+files, and the phone deck all keep the raw text, and search still
+finds words inside a formatted reply. A reply containing raw HTML
+shows it as text, never as markup, and only http/https links
+become clickable.
 
 ## v0.23 — 2026-11-13
 

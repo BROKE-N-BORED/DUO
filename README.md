@@ -46,7 +46,9 @@ Everything in one app:
   conversation loads it back exactly as it was.
 - **Readable chat** — messages in the window are separated by a blank
   line, with the sender's name in bold, so a long reply never runs
-  into the next message.
+  into the next message. Model replies render their Markdown —
+  bold, code, headers, lists, links — while your own messages stay
+  exactly as typed.
 - **Stays connected** — if Ollama stalls briefly while the computer
   is busy, a turn retries a few times instead of giving up, and a
   slow Ollama is never reported as "not running". If Ollama really
@@ -277,6 +279,13 @@ bash run.sh
   wrapping at the ends. Searching is display-only: it never changes
   the conversation, and any new message, re-render, or clear drops
   the search.
+- Markdown: model replies show formatted in the panes — bold, italic,
+  code, code blocks, headers, lists, quotes, and links (clicking a
+  link opens it in the browser). While a reply streams it stays plain
+  text, and the moment the turn finishes it formats in place. Your
+  own messages stay exactly as typed — only model replies render.
+  Saved transcripts still carry the raw text, exactly as the model
+  sent it.
 - Import: each pane has an Import button next to Save that loads a
   saved single-pane transcript back into the pane. Importing replaces
   the pane's conversation, so it asks first when the pane already has
