@@ -1,7 +1,27 @@
 # DUO changelog
 
 Every version, newest first. v0.1–v0.17 were built on 2026-11-12;
-v0.18–v0.22 on 2026-11-13.
+v0.18–v0.23 on 2026-11-13.
+
+## v0.23 — 2026-11-13
+
+Transcript search and import. Each pane has a search row under its
+transcript: type to find text in that conversation (case-insensitive,
+plain substring, no regex), with every match highlighted and Previous
+/ Next stepping between them, wrapping at the ends. Searching never
+changes the conversation — any new message, re-render, or clear drops
+the search. Each pane also has an Import button that loads a saved
+single-pane transcript back into the pane, replacing its conversation
+(it asks first when the pane already has messages). The imported
+messages join the pane's history, so the next send includes them.
+The picked model is untouched — the file's model names are display
+labels only — and the imported entries go at the end of the full
+transcript, since the file has no timestamps to interleave by.
+"Save both" and full-transcript files are refused plainly: import
+takes a single-side transcript only. Also in this version, the
+.gitignore now covers secret files (.env, providers.json, key
+files, local config) so a key or token can never be committed by
+accident — the tree and repo history were audited clean first.
 
 ## v0.22 — 2026-11-13
 

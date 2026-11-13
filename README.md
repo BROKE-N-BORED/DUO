@@ -37,7 +37,9 @@ Everything in one app:
   continue it, for as many rounds as you pick.
 - **Transcripts** — save either side, or both, to a plain text file,
   or save the full transcript: the whole conversation as it happened,
-  both sides interleaved in time order.
+  both sides interleaved in time order. Each pane also has a search
+  row for finding text in its conversation, and an Import button
+  that loads a saved single-side transcript back into the pane.
 - **Conversation save** — Save conversation keeps the whole
   conversation in a file you can open again later: both sides'
   histories, both models, and both instruction fields. Open
@@ -268,6 +270,27 @@ bash run.sh
   Saving is only available while nothing is generating — the
   transcript is moving mid-turn, so a save then would catch it
   half-written.
+- Search: under each pane's transcript is a search box. Type to find
+  text in that pane's conversation — case-insensitive plain substring
+  matching, no regex. Every match is highlighted, the current one in
+  a different colour, and Previous / Next step between matches,
+  wrapping at the ends. Searching is display-only: it never changes
+  the conversation, and any new message, re-render, or clear drops
+  the search.
+- Import: each pane has an Import button next to Save that loads a
+  saved single-pane transcript back into the pane. Importing replaces
+  the pane's conversation, so it asks first when the pane already has
+  messages. The imported messages join the pane's history, so the
+  next send includes them in the model's context. The picked model
+  is untouched — the file's model names are display labels only. The
+  imported entries go at the end of the full transcript, since the
+  file has no timestamps to interleave them by; the other side's
+  entries are untouched. "Save both" files and full transcripts are
+  refused plainly — import takes a single-side transcript only. Note
+  that a transcript file carries what the window showed, so an
+  imported message is the window's short text (the "(Attached: ...)"
+  tag, not the file contents; the handoff note, not the full framed
+  text).
 - Save conversation, next to Save both, saves the whole conversation
   to a file you can open again later: both sides' histories with
   their labels, both models, both instruction fields, and the

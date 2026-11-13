@@ -43,7 +43,7 @@ from dual_chat import (  # noqa: E402
     NoModelSelected,
     OllamaClient, OllamaError, OllamaServerManager, RelaySession,
     SUMMARY_KEEP_LAST, SUMMARY_LABEL, SUMMARIZE_PROMPT, SerialRunner,
-    TaskSession, attachment_tag, build_attached_message,
+    TaskSession, TranscriptError, attachment_tag, build_attached_message,
     build_deck_state, compute_turn_stats, conversation_to_data,
     data_to_conversation, default_both_filename,
     default_conversation_filename, default_debug_filename,
@@ -54,9 +54,11 @@ from dual_chat import (  # noqa: E402
     format_side_transcript,
     format_stats_line, get_lan_ip, is_valid_preset, load_attachment,
     load_conversation_file, load_pairs, load_presets,
+    load_side_transcript_file,
     make_debug_logger,
     pairs_path, parse_ollama_list_output, parse_ps_payload,
-    parse_stop_phrases, parse_tags_payload, phrase_matches,
+    parse_side_transcript, parse_stop_phrases, parse_tags_payload,
+    phrase_matches,
     presets_file_corrupt, presets_path,
     render_qr_pixmap,
     sanitize_filename_part,
@@ -3605,6 +3607,147 @@ class FullTranscriptFormatTests(unittest.TestCase):
                          "duo-full-2026-11-12.txt")
 
 
+class TranscriptImportTests(unittest.TestCase):
+    """Transcript import (v0.23, audit T12): parsing a saved
+    single-pane transcript back into history entries."""
+
+    def _side_with(self, model="fake-a:latest"):
+        side = ChatSide("A")
+        side.model = model
+        return side
+
+    def test_round_trip_restores_history_labels_display(self):
+        side = self._side_with()
+        side.add_user("hello there")
+        side.add_assistant("hi back")
+        side.add_user("line one\nline two")
+        entries = parse_side_transcript(format_side_transcript(side))
+        self.assertEqual(
+            [(entry["role"], entry["content"], entry["label"])
+             for entry in entries],
+            [("user", "hello there", "You"),
+             ("assistant", "hi back", "fake-a:latest"),
+             ("user", "line one\nline two", "You")])
+
+    def test_header_and_empty_marker_skipped(self):
+        # An empty export is a header plus "No messages yet." -- both
+        # are skipped, and the file parses to zero messages.
+        side = self._side_with()
+        text = format_side_transcript(side)
+        self.assertIn("No messages yet.", text)
+        with self.assertRaisesRegex(TranscriptError,
+                                    "no messages in it"):
+            parse_side_transcript(text)
+
+    def test_multiline_bodies_preserved(self):
+        side = self._side_with()
+        side.add_user("para one\n\npara two")
+        side.add_assistant("first line\nsecond line")
+        entries = parse_side_transcript(format_side_transcript(side))
+        self.assertEqual(entries[0]["content"], "para one\n\npara two")
+        self.assertEqual(entries[1]["content"],
+                         "first line\nsecond line")
+
+    def test_trailing_space_in_body_preserved(self):
+        # Streamed replies end with a trailing space per word, so a
+        # round-trip must keep a trailing space, not strip it.
+        side = self._side_with()
+        side.add_assistant("Rainy day. ")
+        entries = parse_side_transcript(format_side_transcript(side))
+        self.assertEqual(entries[0]["content"], "Rainy day. ")
+
+    def test_relay_and_task_labels_preserved(self):
+        side = self._side_with()
+        side.add_user("hop text", label="You [relay from Model B]")
+        side.add_user("task text", label="You [task]")
+        side.add_user("framed handoff", label="You [task handoff]",
+                      display="Task result from Model B, for review.")
+        entries = parse_side_transcript(format_side_transcript(side))
+        self.assertEqual(
+            [(entry["role"], entry["label"]) for entry in entries],
+            [("user", "You [relay from Model B]"),
+             ("user", "You [task]"),
+             ("user", "You [task handoff]")])
+        # The export carries the display text, not the full framed
+        # handoff -- so the import restores what the window showed.
+        self.assertEqual(
+            entries[2]["content"],
+            "Task result from Model B, for review.")
+
+    def test_summary_entry_parses_as_user(self):
+        side = self._side_with()
+        side.add_user("one")
+        side.add_assistant("two")
+        side.add_user("three")
+        side.add_assistant("four")
+        side.add_user("five")
+        self.assertTrue(side.summarize("short version"))
+        entries = parse_side_transcript(format_side_transcript(side))
+        self.assertEqual(entries[0]["label"], SUMMARY_LABEL)
+        self.assertEqual(entries[0]["role"], "user")
+        self.assertIn("short version", entries[0]["content"])
+
+    def test_garbage_file_rejected(self):
+        with self.assertRaisesRegex(
+                TranscriptError, "doesn't look like a DUO transcript"):
+            parse_side_transcript("hello world\n")
+
+    def test_zero_message_file_rejected(self):
+        with self.assertRaisesRegex(TranscriptError,
+                                    "no messages in it"):
+            parse_side_transcript(
+                "DUO transcript -- Model A (a) -- saved 2026-11-13 "
+                "00:00\n\nNo messages yet.\n")
+
+    def test_blocks_without_labels_rejected(self):
+        with self.assertRaisesRegex(
+                TranscriptError, "no messages DUO can read"):
+            parse_side_transcript(
+                "DUO transcript -- Model A (a) -- saved 2026-11-13 "
+                "00:00\n\nno label here\n")
+
+    def test_save_both_file_rejected(self):
+        convo = Conversation()
+        convo.sides["A"].model = "fake-a:latest"
+        convo.sides["B"].model = "fake-b:latest"
+        convo.sides["A"].add_user("hi")
+        convo.sides["B"].add_user("hey")
+        with self.assertRaisesRegex(
+                TranscriptError,
+                "holds both sides.*single-side transcript"):
+            parse_side_transcript(format_both_transcript(convo))
+
+    def test_full_transcript_file_rejected(self):
+        log = [("A", "You", "hi"), ("B", "fake-b:latest", "yo")]
+        with self.assertRaisesRegex(
+                TranscriptError,
+                "is a full transcript.*single-side transcript"):
+            parse_side_transcript(format_full_transcript(log))
+
+    def test_load_side_transcript_file(self):
+        side = self._side_with()
+        side.add_user("hello")
+        side.add_assistant("hi back")
+        with tempfile.NamedTemporaryFile(
+                "w", suffix=".txt", delete=False,
+                encoding="utf-8") as fh:
+            fh.write(format_side_transcript(side))
+            path = fh.name
+        try:
+            entries = load_side_transcript_file(path)
+        finally:
+            os.unlink(path)
+        self.assertEqual(
+            [(entry["role"], entry["content"]) for entry in entries],
+            [("user", "hello"), ("assistant", "hi back")])
+
+    def test_load_missing_file_raises_oserror(self):
+        with self.assertRaises(OSError):
+            load_side_transcript_file(
+                os.path.join(tempfile.gettempdir(),
+                             "duo-no-such-transcript.txt"))
+
+
 # ---------------------------------------------------------------------------
 # Transcripts (Item 7): GUI
 # ---------------------------------------------------------------------------
@@ -5799,7 +5942,7 @@ class FrontDoorTests(unittest.TestCase):
 
     def test_changelog_covers_every_version(self):
         log = self._read("CHANGELOG.md")
-        for version in ["0.%d" % n for n in range(1, 23)]:
+        for version in ["0.%d" % n for n in range(1, 24)]:
             self.assertIn(version, log)
 
     def test_gitignore_covers_runtime_files(self):
@@ -5807,6 +5950,17 @@ class FrontDoorTests(unittest.TestCase):
         for entry in ("__pycache__/", "*.pyc", ".venv/", "duo-debug.log",
                       "duo-pairs.json", "duo-relay-presets.json",
                       "duo.png", "*.zip"):
+            self.assertIn(entry, ignored)
+
+    def test_gitignore_covers_secret_files(self):
+        # Secrets are never in code: they live in files the repo
+        # ignores, so a key or token can never be committed by
+        # accident. Every category the rule names must be covered.
+        ignored = self._read(".gitignore")
+        for entry in (".env", ".env.*", "*.env", "providers.json",
+                      "*.pem", "*.key", "*.p12", "*.pfx", "id_rsa*",
+                      "credentials*.json", "*secret*.json",
+                      "local-config.json", "config.local.*", ".netrc"):
             self.assertIn(entry, ignored)
 
     def test_ci_workflow_runs_the_suite_offscreen(self):
@@ -7043,6 +7197,417 @@ class RelayPresetGuiTests(unittest.TestCase):
         self.assertEqual(set(load_presets(self.presets_file)), {"one"})
         self.assertIn("Couldn't save relay preset 'two': disk full",
                       self._status())
+
+
+@unittest.skipUnless(os.environ.get("DUAL_CHAT_GUI_TESTS") == "1",
+                     "GUI tests run with DUAL_CHAT_GUI_TESTS=1")
+class TranscriptSearchGuiTests(unittest.TestCase):
+    """Transcript search (v0.23, audit T12): the per-pane search row
+    -- match counting, highlighting, prev/next cycling, and the
+    search clearing whenever the transcript changes."""
+
+    @classmethod
+    def setUpClass(cls):
+        from PySide6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+        cls.client = FakeGuiClient()
+
+    def setUp(self):
+        from dual_chat import build_window
+        self.client.reset()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.pairs_file = os.path.join(self.tmp.name, "duo-pairs.json")
+        self._env = mock.patch.dict(
+            os.environ, {"DUAL_CHAT_PAIRS_FILE": self.pairs_file})
+        self._env.start()
+        self.window = build_window(self.client, logger=TEST_LOGGER)
+        self.window.show()
+        self.state = self.window._dual_chat
+        self._wait_for(lambda: self.state["widgets"]["A"]["picker"].count() == 2)
+        self._pick_models()
+
+    def tearDown(self):
+        self.window.close()
+        self._env.stop()
+        self.tmp.cleanup()
+
+    def _wait_for(self, cond, timeout=10.0):
+        from PySide6.QtTest import QTest
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            QTest.qWait(50)
+            if cond():
+                return True
+        return cond()
+
+    def _pick_models(self):
+        self.state["widgets"]["A"]["picker"].setCurrentIndex(0)
+        self.state["widgets"]["B"]["picker"].setCurrentIndex(1)
+        self.app.processEvents()
+
+    def _seed_a(self):
+        side = self.state["convo"].sides["A"]
+        side.add_user("the rain in Spain")
+        side.add_assistant("rain, rain, go away")
+        side.add_user("no weather here")
+        self.state["render_transcript"]("A")
+        self.app.processEvents()
+
+    def _widgets_a(self):
+        return self.state["widgets"]["A"]
+
+    def test_search_row_present(self):
+        w = self._widgets_a()
+        self.assertEqual(w["search_edit"].placeholderText(),
+                         "Search this conversation…")
+        self.assertEqual(w["search_prev"].text(), "Previous")
+        self.assertEqual(w["search_next"].text(), "Next")
+        self.assertEqual(w["search_count"].text(), "")
+
+    def test_match_count_and_case_insensitive(self):
+        self._seed_a()
+        w = self._widgets_a()
+        w["search_edit"].setText("RAIN")
+        self.app.processEvents()
+        # "rain" appears once in the first message, twice in the
+        # second -- and the uppercase query still finds them all.
+        self.assertEqual(w["search_count"].text(), "3 matches")
+        selections = w["transcript"].extraSelections()
+        self.assertEqual(len(selections), 3)
+        # The current match (the first) is orange, the rest yellow.
+        self.assertEqual(
+            selections[0].format.background().color().name(),
+            "#ffa500")
+        self.assertEqual(
+            selections[1].format.background().color().name(),
+            "#ffff00")
+        self.assertEqual(
+            selections[2].format.background().color().name(),
+            "#ffff00")
+
+    def test_prev_next_cycle_with_wrap(self):
+        self._seed_a()
+        w = self._widgets_a()
+        w["search_edit"].setText("rain")
+        self.app.processEvents()
+        self.assertEqual(w["search_count"].text(), "3 matches")
+        w["search_next"].click()
+        self.assertEqual(w["search_count"].text(), "2 of 3")
+        w["search_next"].click()
+        self.assertEqual(w["search_count"].text(), "3 of 3")
+        # Past the last match wraps back to the first.
+        w["search_next"].click()
+        self.assertEqual(w["search_count"].text(), "1 of 3")
+        w["search_prev"].click()
+        self.assertEqual(w["search_count"].text(), "3 of 3")
+
+    def test_empty_search_clears(self):
+        self._seed_a()
+        w = self._widgets_a()
+        w["search_edit"].setText("rain")
+        self.app.processEvents()
+        self.assertEqual(len(w["transcript"].extraSelections()), 3)
+        w["search_edit"].setText("")
+        self.app.processEvents()
+        self.assertEqual(w["search_count"].text(), "")
+        self.assertEqual(w["transcript"].extraSelections(), [])
+
+    def test_no_match_label(self):
+        self._seed_a()
+        w = self._widgets_a()
+        w["search_edit"].setText("zebra")
+        self.app.processEvents()
+        self.assertEqual(w["search_count"].text(), "No matches")
+        self.assertEqual(w["transcript"].extraSelections(), [])
+        # Stepping with no matches does nothing.
+        w["search_next"].click()
+        self.assertEqual(w["search_count"].text(), "No matches")
+
+    def test_search_cleared_on_pane_clear(self):
+        self._seed_a()
+        w = self._widgets_a()
+        w["search_edit"].setText("rain")
+        self.app.processEvents()
+        self.assertEqual(w["search_count"].text(), "3 matches")
+        w["clear"].click()
+        self.app.processEvents()
+        self.assertEqual(w["search_edit"].text(), "")
+        self.assertEqual(w["search_count"].text(), "")
+        self.assertEqual(w["transcript"].extraSelections(), [])
+
+    def test_search_cleared_on_rerender(self):
+        self._seed_a()
+        w = self._widgets_a()
+        w["search_edit"].setText("rain")
+        self.app.processEvents()
+        self.assertEqual(w["search_count"].text(), "3 matches")
+        self.state["render_transcript"]("A")
+        self.app.processEvents()
+        self.assertEqual(w["search_edit"].text(), "")
+        self.assertEqual(w["search_count"].text(), "")
+        self.assertEqual(w["transcript"].extraSelections(), [])
+
+    def test_search_cleared_on_new_message(self):
+        self._seed_a()
+        w = self._widgets_a()
+        w["search_edit"].setText("rain")
+        self.app.processEvents()
+        self.assertEqual(w["search_count"].text(), "3 matches")
+        self.state["composer"].setPlainText("more weather talk")
+        self.state["send_a"].click()
+        self.assertTrue(self._wait_for(
+            lambda: not self.state["state"]["busy"], timeout=15))
+        self.assertEqual(w["search_edit"].text(), "")
+        self.assertEqual(w["search_count"].text(), "")
+        self.assertEqual(w["transcript"].extraSelections(), [])
+
+    def test_search_is_display_only(self):
+        self._seed_a()
+        side = self.state["convo"].sides["A"]
+        history_before = copy.deepcopy(side.history)
+        labels_before = list(side.labels)
+        display_before = list(side.display)
+        export_before = format_side_transcript(side)
+        w = self._widgets_a()
+        w["search_edit"].setText("rain")
+        self.app.processEvents()
+        w["search_next"].click()
+        w["search_prev"].click()
+        w["search_edit"].setText("")
+        self.app.processEvents()
+        self.assertEqual(side.history, history_before)
+        self.assertEqual(side.labels, labels_before)
+        self.assertEqual(side.display, display_before)
+        self.assertEqual(format_side_transcript(side), export_before)
+
+
+@unittest.skipUnless(os.environ.get("DUAL_CHAT_GUI_TESTS") == "1",
+                     "GUI tests run with DUAL_CHAT_GUI_TESTS=1")
+class TranscriptImportGuiTests(unittest.TestCase):
+    """Transcript import (v0.23, audit T12): the per-pane Import
+    button -- replacing a pane from a saved single-pane transcript,
+    the confirmation, the rejections, and the full-log rule."""
+
+    @classmethod
+    def setUpClass(cls):
+        from PySide6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+        cls.client = FakeGuiClient()
+
+    def setUp(self):
+        from dual_chat import build_window
+        self.client.reset()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.pairs_file = os.path.join(self.tmp.name, "duo-pairs.json")
+        self._env = mock.patch.dict(
+            os.environ, {"DUAL_CHAT_PAIRS_FILE": self.pairs_file})
+        self._env.start()
+        self.window = build_window(self.client, logger=TEST_LOGGER)
+        self.window.show()
+        self.state = self.window._dual_chat
+        self._wait_for(lambda: self.state["widgets"]["A"]["picker"].count() == 2)
+        self._pick_models()
+
+    def tearDown(self):
+        self.window.close()
+        self._env.stop()
+        self.tmp.cleanup()
+
+    def _wait_for(self, cond, timeout=10.0):
+        from PySide6.QtTest import QTest
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            QTest.qWait(50)
+            if cond():
+                return True
+        return cond()
+
+    def _pick_models(self):
+        self.state["widgets"]["A"]["picker"].setCurrentIndex(0)
+        self.state["widgets"]["B"]["picker"].setCurrentIndex(1)
+        self.app.processEvents()
+
+    def _send_to_a_and_wait(self, text):
+        self.state["composer"].setPlainText(text)
+        self.state["send_a"].click()
+        return self._wait_for(lambda: (
+            len(self.state["convo"].sides["A"].history) >= 2
+            and not self.state["state"]["busy"]), timeout=15)
+
+    def _send_both_and_wait(self, text):
+        self.state["composer"].setPlainText(text)
+        self.state["send_both"].click()
+        return self._wait_for(lambda: (
+            len(self.state["convo"].sides["A"].history) >= 2
+            and len(self.state["convo"].sides["B"].history) >= 2
+            and not self.state["state"]["busy"]), timeout=15)
+
+    def _open_dialog(self, path):
+        """Patch the open dialog to return ``path`` ("" cancels)."""
+        from PySide6 import QtWidgets
+        return mock.patch.object(
+            QtWidgets.QFileDialog, "getOpenFileName",
+            return_value=(path, "Text files (*.txt)"))
+
+    def _answer(self, button):
+        from PySide6.QtWidgets import QMessageBox
+        return mock.patch.object(QMessageBox, "question",
+                                 return_value=button)
+
+    def _write_file(self, name, text):
+        path = os.path.join(self.tmp.name, name)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        return path
+
+    def _export_file(self, name="saved-a.txt"):
+        """A single-pane export of a made-up conversation, with a
+        model name the window never picked -- importing must not
+        touch the picker."""
+        side = ChatSide("A")
+        side.model = "other-model:9b"
+        side.add_user("what is the capital of France?")
+        side.add_assistant("Paris.")
+        side.add_user("and of Spain?\nasking for a friend")
+        side.add_assistant("Madrid.")
+        return self._write_file(name, format_side_transcript(side))
+
+    def _status(self):
+        return self.window.statusBar().currentMessage()
+
+    def test_import_button_present_and_enabled_when_idle(self):
+        w = self.state["widgets"]["A"]
+        self.assertEqual(w["import"].text(), "Import")
+        self.assertTrue(w["import"].isEnabled())
+
+    def test_import_into_empty_pane_needs_no_confirm(self):
+        from PySide6.QtWidgets import QMessageBox
+        path = self._export_file()
+        no_confirm = mock.patch.object(
+            QMessageBox, "question",
+            side_effect=AssertionError("confirm asked on empty pane"))
+        with self._open_dialog(path), no_confirm:
+            self.state["widgets"]["A"]["import"].click()
+        self.app.processEvents()
+        side = self.state["convo"].sides["A"]
+        self.assertEqual(
+            [(entry["role"], entry["content"]) for entry in side.history],
+            [("user", "what is the capital of France?"),
+             ("assistant", "Paris."),
+             ("user", "and of Spain?\nasking for a friend"),
+             ("assistant", "Madrid.")])
+        self.assertEqual(
+            side.labels,
+            ["You", "other-model:9b", "You", "other-model:9b"])
+        self.assertEqual(side.display, [None, None, None, None])
+        self.assertEqual(self._status(),
+                         "Transcript imported from %s" % path)
+
+    def test_import_over_live_pane_yes_replaces(self):
+        from PySide6.QtWidgets import QMessageBox
+        self.assertTrue(self._send_to_a_and_wait("live message"))
+        path = self._export_file()
+        with self._open_dialog(path), self._answer(
+                QMessageBox.StandardButton.Yes):
+            self.state["widgets"]["A"]["import"].click()
+        self.app.processEvents()
+        side = self.state["convo"].sides["A"]
+        self.assertEqual(len(side.history), 4)
+        self.assertEqual(side.history[0]["content"],
+                         "what is the capital of France?")
+
+    def test_import_over_live_pane_no_keeps(self):
+        from PySide6.QtWidgets import QMessageBox
+        self.assertTrue(self._send_to_a_and_wait("live message"))
+        before = copy.deepcopy(self.state["convo"].sides["A"].history)
+        path = self._export_file()
+        with self._open_dialog(path), self._answer(
+                QMessageBox.StandardButton.No):
+            self.state["widgets"]["A"]["import"].click()
+        self.app.processEvents()
+        self.assertEqual(self.state["convo"].sides["A"].history, before)
+
+    def test_import_dialog_cancel_changes_nothing(self):
+        self.assertTrue(self._send_to_a_and_wait("live message"))
+        before = copy.deepcopy(self.state["convo"].sides["A"].history)
+        with self._open_dialog(""):
+            self.state["widgets"]["A"]["import"].click()
+        self.app.processEvents()
+        self.assertEqual(self.state["convo"].sides["A"].history, before)
+
+    def test_rejected_file_changes_nothing(self):
+        self.assertTrue(self._send_to_a_and_wait("live message"))
+        before = copy.deepcopy(self.state["convo"].sides["A"].history)
+        convo = Conversation()
+        convo.sides["A"].model = "fake-a:latest"
+        convo.sides["B"].model = "fake-b:latest"
+        convo.sides["A"].add_user("hi")
+        convo.sides["B"].add_user("hey")
+        path = self._write_file("both.txt",
+                                format_both_transcript(convo))
+        with self._open_dialog(path):
+            self.state["widgets"]["A"]["import"].click()
+        self.app.processEvents()
+        self.assertEqual(self.state["convo"].sides["A"].history, before)
+        self.assertIn("holds both sides", self._status())
+        garbage = self._write_file("garbage.txt", "hello world\n")
+        with self._open_dialog(garbage):
+            self.state["widgets"]["A"]["import"].click()
+        self.app.processEvents()
+        self.assertEqual(self.state["convo"].sides["A"].history, before)
+        self.assertIn("doesn't look like a DUO transcript",
+                      self._status())
+
+    def test_full_log_updated_per_rule(self):
+        from PySide6.QtWidgets import QMessageBox
+        self.assertTrue(self._send_both_and_wait("hello both"))
+        log_before = list(self.state["state"]["full_log"])
+        b_before = [entry for entry in log_before if entry[0] == "B"]
+        self.assertTrue(b_before)
+        path = self._export_file()
+        with self._open_dialog(path), self._answer(
+                QMessageBox.StandardButton.Yes):
+            self.state["widgets"]["A"]["import"].click()
+        self.app.processEvents()
+        log = self.state["state"]["full_log"]
+        # The other side's entries are untouched, in their order.
+        self.assertEqual([entry for entry in log if entry[0] == "B"],
+                         b_before)
+        # The pane's old entries are gone; the imported ones sit at
+        # the end, in file order.
+        a_entries = [entry for entry in log if entry[0] == "A"]
+        self.assertEqual(
+            a_entries,
+            [("A", "You", "what is the capital of France?"),
+             ("A", "other-model:9b", "Paris."),
+             ("A", "You", "and of Spain?\nasking for a friend"),
+             ("A", "other-model:9b", "Madrid.")])
+        self.assertEqual(log[-len(a_entries):], a_entries)
+
+    def test_model_picker_untouched_after_import(self):
+        path = self._export_file()
+        with self._open_dialog(path):
+            self.state["widgets"]["A"]["import"].click()
+        self.app.processEvents()
+        picker = self.state["widgets"]["A"]["picker"]
+        self.assertEqual(picker.currentText(), "fake-a:latest")
+        self.assertEqual(self.state["convo"].sides["A"].model,
+                         "fake-a:latest")
+
+    def test_send_after_import_includes_imported_history(self):
+        path = self._export_file()
+        with self._open_dialog(path):
+            self.state["widgets"]["A"]["import"].click()
+        self.app.processEvents()
+        self.assertTrue(self._send_to_a_and_wait("what about Italy?"))
+        _model, sent = self.client.messages_seen[-1]
+        self.assertEqual(
+            [(message["role"], message["content"]) for message in sent],
+            [("user", "what is the capital of France?"),
+             ("assistant", "Paris."),
+             ("user", "and of Spain?\nasking for a friend"),
+             ("assistant", "Madrid."),
+             ("user", "what about Italy?")])
 
 
 if __name__ == "__main__":

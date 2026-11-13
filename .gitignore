@@ -7,3 +7,20 @@ duo-relay-presets.json
 duo.png
 *.zip
 .DS_Store
+
+# Secret files are never committed: keys, tokens, and local config
+# live here only, never in code or in the repo.
+.env
+.env.*
+*.env
+providers.json
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+credentials*.json
+*secret*.json
+local-config.json
+config.local.*
+.netrc

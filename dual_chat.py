@@ -219,7 +219,7 @@ def make_debug_logger(log_dir=None):
         return _NullLogger()
 
 APP_NAME = "DUO"
-APP_VERSION = "0.22"
+APP_VERSION = "0.23"
 DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434"
 OLLAMA_URL_ENV = "DUAL_CHAT_OLLAMA_URL"
 
@@ -1261,6 +1261,123 @@ def format_full_transcript(log, when=None):
     blocks = ["%s -- %s: %s" % (side, label, text)
               for side, label, text in log]
     return "\n\n".join([header] + blocks) + "\n"
+
+
+class TranscriptError(Exception):
+    """A transcript file can't be imported: the wrong format, or no
+    messages DUO can read. The message is plain text for the user."""
+
+
+# A "You" label: the user, optionally with a [relay from ...] /
+# [task] / [task handoff] tag. The tag is part of the label.
+_LABEL_YOU = re.compile(r"^You( \[[^\]]*\])?: (.*)$")
+# A model label: a single word, optionally with a :tag suffix.
+_LABEL_MODEL = re.compile(r"^([A-Za-z0-9._\-/]+(?::[A-Za-z0-9._\-]+)?): (.*)$")
+
+
+def _parse_transcript_block(block):
+    """Parse one message block into (role, content, label), or None
+    when the block doesn't start with a sender label. The body is the
+    rest of the block, multi-line bodies included."""
+    first, _, rest = block.partition("\n")
+    match = _LABEL_YOU.match(first)
+    if match:
+        label = "You" + (match.group(1) or "")
+        body = match.group(2)
+        role = "user"
+    elif first.startswith(SUMMARY_LABEL + ": "):
+        label = SUMMARY_LABEL
+        body = first[len(SUMMARY_LABEL) + 2:]
+        role = "user"
+    else:
+        match = _LABEL_MODEL.match(first)
+        if not match:
+            return None
+        label = match.group(1)
+        body = match.group(2)
+        role = "assistant"
+    if rest:
+        body += "\n" + rest
+    return (role, body, label)
+
+
+def parse_side_transcript(text):
+    """Parse a saved single-pane transcript (the v0.7 export format)
+    into a list of {role, content, label} entries, in file order.
+
+    The header line and the "No messages yet." line are skipped.
+    Messages are split on blank lines; a block with no sender label
+    is a continuation of the previous message (a blank line inside
+    its body). Labels starting with "You" are the user's, anything
+    else is the model's, and the label text is kept exactly.
+
+    A "Save both" file or a full-transcript file is rejected by
+    structure, not by filename: their headers name no single model,
+    and their blocks start with a "Model A (...)" section header or
+    an "A -- " / "B -- " side prefix. Raises TranscriptError for
+    any file that isn't a single-pane transcript with messages.
+
+    Note what an export carries: the text the window showed
+    (display_text), not the full message contents -- attached file
+    contents are never pasted in, and a handoff shows its short
+    note, not the framed text. So an imported message's content is
+    what the window showed, which is what the model will see if it
+    is sent again."""
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    if not lines or not lines[0].startswith("DUO transcript -- "):
+        raise TranscriptError(
+            "this doesn't look like a DUO transcript file")
+    header = lines[0]
+    single = re.match(
+        r"^DUO transcript -- Model [AB] \(.*\) -- saved ", header)
+    rest = "\n".join(lines[1:])
+    # Blocks are separated by blank lines; the blank line after the
+    # header leaves a leading newline on the first block. Strip
+    # newlines only -- a message body can end with a space (streamed
+    # replies do), and that space is content, not separator.
+    blocks = [block.strip("\n")
+              for block in rest.split("\n\n") if block.strip()]
+    if not single:
+        for block in blocks:
+            first = block.split("\n", 1)[0]
+            if re.match(r"^Model [AB] \(.*\)$", first):
+                raise TranscriptError(
+                    "this file holds both sides -- import a "
+                    "single-side transcript instead")
+            if first.startswith("A -- ") or first.startswith("B -- "):
+                raise TranscriptError(
+                    "this is a full transcript -- import a "
+                    "single-side transcript instead")
+        raise TranscriptError("this file has no messages in it")
+    entries = []
+    for block in blocks:
+        if block.strip() == "No messages yet.":
+            continue
+        parsed = _parse_transcript_block(block)
+        if parsed is None:
+            if entries:
+                role, content, label = entries[-1]
+                entries[-1] = (role, content + "\n\n" + block, label)
+            else:
+                raise TranscriptError(
+                    "this file has no messages DUO can read")
+        else:
+            entries.append(parsed)
+    if not entries:
+        raise TranscriptError("this file has no messages in it")
+    return [{"role": role, "content": content, "label": label}
+            for role, content, label in entries]
+
+
+def load_side_transcript_file(path):
+    """Read a saved single-pane transcript file and parse it. Raises
+    TranscriptError for a bad format, OSError for a file that can't
+    be read."""
+    with open(path, encoding="utf-8") as fh:
+        text = fh.read()
+    return parse_side_transcript(text)
 
 
 # Conversation persistence (v0.17, audit T6): save the whole
@@ -2307,6 +2424,22 @@ def build_window(client=None, logger=None, deck_port=None):
             QtWidgets.QTextEdit.LineWrapMode.WidgetWidth)
         layout.addWidget(transcript, stretch=1)
 
+        # Search row: find text in this pane's transcript. Display
+        # only -- it never changes history, labels, or the saved
+        # file. Any change to the transcript clears it (see
+        # clear_search).
+        search_row = QtWidgets.QHBoxLayout()
+        search_edit = QtWidgets.QLineEdit()
+        search_edit.setPlaceholderText("Search this conversation…")
+        search_row.addWidget(search_edit, stretch=1)
+        search_count = QtWidgets.QLabel("")
+        search_row.addWidget(search_count)
+        search_prev = QtWidgets.QPushButton("Previous")
+        search_row.addWidget(search_prev)
+        search_next = QtWidgets.QPushButton("Next")
+        search_row.addWidget(search_next)
+        layout.addLayout(search_row)
+
         # Stats line: the last completed turn's speed and RAM. Dashes
         # until a turn has run.
         stats = QtWidgets.QLabel(format_stats_line(None))
@@ -2367,6 +2500,8 @@ def build_window(client=None, logger=None, deck_port=None):
         bottom.addWidget(clear)
         save = QtWidgets.QPushButton("Save")
         bottom.addWidget(save)
+        import_btn = QtWidgets.QPushButton("Import")
+        bottom.addWidget(import_btn)
         hist_toggle = QtWidgets.QPushButton("History ▸")
         hist_toggle.setCheckable(True)
         hist_toggle.setFlat(True)
@@ -2377,7 +2512,10 @@ def build_window(client=None, logger=None, deck_port=None):
             "picker": picker, "refresh": refresh, "transcript": transcript,
             "temperature": temp_spin,
             "status": status, "stop": stop, "clear": clear,
-            "save": save,
+            "save": save, "import": import_btn,
+            "search_edit": search_edit, "search_count": search_count,
+            "search_prev": search_prev, "search_next": search_next,
+            "search_matches": [], "search_current": -1,
             "instr_toggle": instr_toggle, "instr_edit": instr_edit,
             "use_this": use_this, "hist_toggle": hist_toggle,
             "hist_frame": hist_frame, "hist_list": hist_list,
@@ -2672,6 +2810,7 @@ def build_window(client=None, logger=None, deck_port=None):
         cursor.insertText("\n", _PLAIN_FMT)
         t.setTextCursor(cursor)
         scroll_to_end(t)
+        clear_search(side)
 
     def begin_reply(side, label):
         """Open a streaming reply: the blank-line gap plus the bold
@@ -2697,6 +2836,7 @@ def build_window(client=None, logger=None, deck_port=None):
         cursor.insertText("\n", _PLAIN_FMT)
         t.setTextCursor(cursor)
         scroll_to_end(t)
+        clear_search(side)
 
     def log_event(side, label, text):
         """Record one message in the shared chronological log (the
@@ -2718,6 +2858,104 @@ def build_window(client=None, logger=None, deck_port=None):
         for i, label in enumerate(side_obj.labels):
             append_message(side, label, side_obj.display_text(i))
         scroll_to_end(widgets[side]["transcript"])
+        # A rebuild drops the highlights with the old document, so
+        # the search state goes too (empty histories never reach
+        # append_message, which clears it on its own).
+        clear_search(side)
+
+    # --- transcript search ---------------------------------------------------
+    # Search is display-only: it highlights matches in the pane's
+    # transcript and jumps between them, and never touches history,
+    # labels, or the saved file. Matching is a case-insensitive plain
+    # substring search over the displayed text -- no regex. Matches
+    # are found through the document itself (QTextDocument.find), so
+    # positions are always document positions, whatever characters
+    # the text holds.
+    _SEARCH_FMT = QtGui.QTextCharFormat()
+    _SEARCH_FMT.setBackground(QtGui.QColor("yellow"))
+    _SEARCH_CURRENT_FMT = QtGui.QTextCharFormat()
+    _SEARCH_CURRENT_FMT.setBackground(QtGui.QColor("orange"))
+
+    def _apply_search_selections(side):
+        w = widgets[side]
+        doc = w["transcript"].document()
+        selections = []
+        for i, (start, end) in enumerate(w["search_matches"]):
+            sel = QtWidgets.QTextEdit.ExtraSelection()
+            cursor = QtGui.QTextCursor(doc)
+            cursor.setPosition(start)
+            cursor.setPosition(end, QtGui.QTextCursor.KeepAnchor)
+            sel.cursor = cursor
+            sel.format = (_SEARCH_CURRENT_FMT if i == w["search_current"]
+                          else _SEARCH_FMT)
+            selections.append(sel)
+        w["transcript"].setExtraSelections(selections)
+
+    def clear_search(side):
+        """Drop a pane's search: query, highlights, count. Called
+        whenever the transcript changes -- a new message, a note, a
+        re-render, a clear -- because the matches would be stale."""
+        w = widgets[side]
+        w["search_matches"] = []
+        w["search_current"] = -1
+        w["transcript"].setExtraSelections([])
+        w["search_count"].setText("")
+        edit = w["search_edit"]
+        edit.blockSignals(True)
+        edit.setText("")
+        edit.blockSignals(False)
+
+    def _jump_to_search_match(side):
+        w = widgets[side]
+        if w["search_current"] < 0:
+            return
+        start, _end = w["search_matches"][w["search_current"]]
+        t = w["transcript"]
+        cursor = t.textCursor()
+        cursor.setPosition(start)
+        t.setTextCursor(cursor)
+        t.ensureCursorVisible()
+
+    def run_search(side):
+        """Run the pane's current query over its displayed text."""
+        w = widgets[side]
+        query = w["search_edit"].text()
+        if not query:
+            w["search_matches"] = []
+            w["search_current"] = -1
+            w["transcript"].setExtraSelections([])
+            w["search_count"].setText("")
+            return
+        doc = w["transcript"].document()
+        matches = []
+        cursor = doc.find(query, 0)
+        while not cursor.isNull():
+            matches.append((cursor.selectionStart(),
+                            cursor.selectionEnd()))
+            cursor = doc.find(query, cursor)
+        w["search_matches"] = matches
+        if not matches:
+            w["search_current"] = -1
+            w["transcript"].setExtraSelections([])
+            w["search_count"].setText("No matches")
+            return
+        w["search_current"] = 0
+        _apply_search_selections(side)
+        w["search_count"].setText("%d matches" % len(matches))
+        _jump_to_search_match(side)
+
+    def step_search(side, delta):
+        """Move to the next (+1) or previous (-1) match, wrapping at
+        the ends. Does nothing when there are no matches."""
+        w = widgets[side]
+        matches = w["search_matches"]
+        if not matches:
+            return
+        w["search_current"] = (w["search_current"] + delta) % len(matches)
+        _apply_search_selections(side)
+        w["search_count"].setText(
+            "%d of %d" % (w["search_current"] + 1, len(matches)))
+        _jump_to_search_match(side)
 
     def refresh_history_list(side):
         """Rebuild a pane's history-editor list from its history."""
@@ -2835,6 +3073,9 @@ def build_window(client=None, logger=None, deck_port=None):
                                   and side not in state["active"]
                                   and side not in state["queued"])
             w["save"].setEnabled(save_idle)
+            # Import replaces the pane's history, so it waits for
+            # idle for the same reason a save does.
+            w["import"].setEnabled(save_idle)
             w["use_this"].setEnabled(compare_ready)
             # Summarize: idle only, a model picked, and something older
             # to fold. While this side is summarizing the button says
@@ -3418,6 +3659,70 @@ def build_window(client=None, logger=None, deck_port=None):
             format_side_transcript(side_obj),
             default_side_filename(side, side_obj.model))
 
+    def do_import(side):
+        """Import a saved single-pane transcript into this pane,
+        replacing its conversation. The file is read and parsed
+        before anything changes, so a bad file leaves the pane
+        untouched.
+
+        The file's model names are display labels only: the pane's
+        picked model is NOT changed by an import. The imported
+        messages do join the pane's history, so the next send
+        includes them in the model's context -- that is the point
+        of importing.
+
+        The full-transcript log: the pane's existing entries are
+        removed and the imported entries are appended at the end
+        in file order. The file has no timestamps, so interleaving
+        them with the other side's entries by time is impossible;
+        the other side's entries are untouched."""
+        if state["busy"] or state.get("relay") is not None:
+            return
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            window, "Import transcript", "",
+            "Text files (*.txt)")
+        if not path:
+            return
+        try:
+            entries = load_side_transcript_file(path)
+        except (TranscriptError, OSError) as exc:
+            statusbar.showMessage(
+                "Couldn't import that file: %s" % exc, 5000)
+            return
+        side_obj = convo.sides[side]
+        if side_obj.history:
+            answer = QtWidgets.QMessageBox.question(
+                window, "Import transcript?",
+                "Importing replaces the conversation in this pane.",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                QtWidgets.QMessageBox.No)
+            if answer != QtWidgets.QMessageBox.Yes:
+                return
+        side_obj.history = [{"role": entry["role"],
+                             "content": entry["content"]}
+                            for entry in entries]
+        side_obj.labels = [entry["label"] for entry in entries]
+        side_obj.display = [None] * len(entries)
+        state["full_log"] = [entry for entry in state["full_log"]
+                             if entry[0] != side]
+        for entry in entries:
+            # Imported content IS the display text: exports carry
+            # what the window showed, so content and display agree.
+            state["full_log"].append(
+                (side, entry["label"], entry["content"]))
+        render_transcript(side)
+        refresh_history_list(side)
+        # A replaced conversation ends any compare offer and strands
+        # the last turn's stats, like a clear does.
+        state["compare"] = {}
+        state["compare_round"] = False
+        state["stats"][side] = None
+        refresh_stats_label(side)
+        set_status(side, "Idle")
+        refresh_buttons()
+        statusbar.showMessage(
+            "Transcript imported from %s" % path, 5000)
+
     def do_save_both():
         """Save both transcripts to one combined text file."""
         if state["busy"] or state.get("relay") is not None:
@@ -3946,6 +4251,12 @@ def build_window(client=None, logger=None, deck_port=None):
         w["instr_toggle"].toggled.connect(make_instr_toggle(side))
         w["hist_toggle"].toggled.connect(make_hist_toggle(side))
         w["instr_edit"].textChanged.connect(make_instr_changed(side))
+        w["search_edit"].textChanged.connect(
+            (lambda s: lambda *a: run_search(s))(side))
+        w["search_prev"].clicked.connect(
+            (lambda s: lambda: step_search(s, -1))(side))
+        w["search_next"].clicked.connect(
+            (lambda s: lambda: step_search(s, +1))(side))
 
     # --- saved pairs ---------------------------------------------------------
     def refresh_pair_combo(select=None):
@@ -4169,6 +4480,7 @@ def build_window(client=None, logger=None, deck_port=None):
         def clear():
             convo.sides[side].clear()
             widgets[side]["transcript"].clear()
+            clear_search(side)
             # A cleared conversation restarts: that side's entries
             # leave the full transcript too.
             state["full_log"] = [entry for entry in state["full_log"]
@@ -4189,11 +4501,17 @@ def build_window(client=None, logger=None, deck_port=None):
             do_save(side)
         return save
 
+    def make_import(side):
+        def do_import_side():
+            do_import(side)
+        return do_import_side
+
     for side in ("A", "B"):
         widgets[side]["stop"].clicked.connect(make_stop(side))
         widgets[side]["summarize"].clicked.connect(make_summarize(side))
         widgets[side]["clear"].clicked.connect(make_clear(side))
         widgets[side]["save"].clicked.connect(make_save(side))
+        widgets[side]["import"].clicked.connect(make_import(side))
 
     # --- model pickers -----------------------------------------------------
     def on_picker_changed(side):
@@ -4432,6 +4750,9 @@ def build_window(client=None, logger=None, deck_port=None):
         "do_run_task": do_run_task,
         "save_both": save_both, "do_save": do_save,
         "do_save_both": do_save_both,
+        "do_import": do_import,
+        "clear_search": clear_search, "run_search": run_search,
+        "step_search": step_search,
         "save_full": save_full, "do_save_full": do_save_full,
         "save_convo": save_convo, "open_convo": open_convo,
         "do_save_conversation": do_save_conversation,
