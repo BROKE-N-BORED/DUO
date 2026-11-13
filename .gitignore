@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.venv/
+duo-debug.log
+duo-pairs.json
+duo.png
+*.zip
+.DS_Store

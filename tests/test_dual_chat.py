@@ -1,4 +1,4 @@
-"""Tests for DUO Items 1-11. No real Ollama needed: a fake Ollama HTTP
+"""Tests for DUO. No real Ollama needed: a fake Ollama HTTP
 server (and a fake client for the GUI tests) stands in for the real one.
 
 Run from the project root:  python3 -m unittest discover -s tests -v
@@ -4885,7 +4885,7 @@ class WindowFinishGuiTests(unittest.TestCase):
         self.app.processEvents()
 
     def test_title_shows_version(self):
-        self.assertEqual(self.window.windowTitle(), "DUO 0.15")
+        self.assertEqual(self.window.windowTitle(), "DUO " + APP_VERSION)
 
     def test_window_has_icon(self):
         self.assertFalse(self.window.windowIcon().isNull())
@@ -5007,6 +5007,213 @@ class WindowFinishGuiTests(unittest.TestCase):
         self.assertEqual(set(load_pairs(self.pairs_file)),
                          {"one", "two"})
         self.assertEqual(self.state["pair_combo"].count(), 2)
+class FrontDoorTests(unittest.TestCase):
+    """v0.16 (audit T5): the front door -- CHANGELOG, .gitignore, the
+    CI workflow, the .desktop launcher, and the uninstaller."""
+
+    def _tree(self):
+        return os.path.dirname(
+            os.path.dirname(os.path.abspath(__file__)))
+
+    def _read(self, rel):
+        with open(os.path.join(self._tree(), rel),
+                  encoding="utf-8") as fh:
+            return fh.read()
+
+    def test_changelog_covers_every_version(self):
+        log = self._read("CHANGELOG.md")
+        for version in ["0.%d" % n for n in range(1, 17)]:
+            self.assertIn(version, log)
+
+    def test_gitignore_covers_runtime_files(self):
+        ignored = self._read(".gitignore")
+        for entry in ("__pycache__/", "*.pyc", ".venv/", "duo-debug.log",
+                      "duo-pairs.json", "duo.png", "*.zip"):
+            self.assertIn(entry, ignored)
+
+    def test_ci_workflow_runs_the_suite_offscreen(self):
+        # The workflow must run the suite the way the README says to:
+        # Python 3.12, pinned PySide6, unittest discover, offscreen.
+        # PyYAML is not in the test venv, so parse with it when it is
+        # available and fall back to strict text checks when it isn't.
+        text = self._read(".github/workflows/ci.yml")
+        try:
+            import yaml
+        except ImportError:
+            yaml = None
+        if yaml is not None:
+            parsed = yaml.safe_load(text)
+            steps = parsed["jobs"]["test"]["steps"]
+            commands = [s.get("run", "") for s in steps]
+            self.assertTrue(
+                any("unittest discover -s tests" in c for c in commands),
+                commands)
+            self.assertTrue(
+                any("PySide6-Essentials==6.12.0" in c for c in commands),
+                commands)
+            envs = [s.get("env", {}) for s in steps]
+            self.assertTrue(
+                any(e.get("QT_QPA_PLATFORM") == "offscreen" for e in envs),
+                envs)
+            self.assertEqual(parsed["jobs"]["test"]["runs-on"],
+                             "ubuntu-latest")
+        else:
+            self.assertNotIn("\t", text)
+            self.assertIn("python -m unittest discover -s tests", text)
+            self.assertIn("QT_QPA_PLATFORM: offscreen", text)
+            self.assertIn("PySide6-Essentials==6.12.0", text)
+            self.assertIn("ubuntu-latest", text)
+            self.assertIn('python-version: "3.12"', text)
+
+    def _parse_desktop(self, text):
+        entries = {}
+        section = None
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("[") and line.endswith("]"):
+                section = line[1:-1]
+                entries[section] = {}
+                continue
+            self.assertIn("=", line)
+            key, value = line.split("=", 1)
+            entries[section][key.strip()] = value.strip()
+        return entries
+
+    def test_desktop_file_parses_and_names_the_app(self):
+        # DUO.desktop is a template: install.sh substitutes @APP_DIR@
+        # with the real app folder. The template itself must still
+        # parse and carry every field the menu needs.
+        entries = self._parse_desktop(self._read("DUO.desktop"))
+        self.assertIn("Desktop Entry", entries)
+        entry = entries["Desktop Entry"]
+        self.assertEqual(entry.get("Type"), "Application")
+        self.assertEqual(entry.get("Name"), "DUO")
+        self.assertIn("run.sh", entry.get("Exec", ""))
+        self.assertIn("@APP_DIR@", entry.get("Exec", ""))
+        self.assertIn("duo.png", entry.get("Icon", ""))
+        self.assertIn("Utility", entry.get("Categories", ""))
+        self.assertEqual(entry.get("Terminal"), "false")
+        self.assertIn("Comment", entry)
+
+    def test_installed_desktop_file_validates_if_validator_present(self):
+        # The file install.sh writes -- template with @APP_DIR@
+        # substituted -- must pass desktop-file-validate where the
+        # validator exists.
+        validator = shutil.which("desktop-file-validate")
+        if validator is None:
+            self.skipTest("desktop-file-validate not installed")
+        work = tempfile.mkdtemp(prefix="duo-desktop-validate-")
+        try:
+            installed = os.path.join(work, "DUO.desktop")
+            text = self._read("DUO.desktop").replace("@APP_DIR@", work)
+            with open(installed, "w", encoding="utf-8") as fh:
+                fh.write(text)
+            proc = subprocess.run(
+                [validator, installed],
+                capture_output=True, text=True, timeout=60)
+            self.assertEqual(proc.returncode, 0,
+                             proc.stdout + proc.stderr)
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+
+    def test_install_sh_installs_the_desktop_entry(self):
+        script = self._read("install.sh")
+        self.assertIn("install_desktop_entry", script)
+        self.assertIn(".local/share/applications", script)
+        self.assertIn("DUO.desktop", script)
+        self.assertIn("duo.png", script)
+        # The icon step draws from the app's own window icon, and the
+        # menu step must never fail the install.
+        self.assertIn("make_app_icon", script)
+        self.assertIn("could not add the menu entry", script)
+
+    def test_readme_notes_license_pending_and_clone_modes(self):
+        readme = self._read("README.md")
+        self.assertIn("License: not decided yet", readme)
+        self.assertIn("carries the executable bits", readme)
+        self.assertIn("uninstall.sh", readme)
+
+    def _uninstall_setup(self):
+        # A fake install: the app folder plus a fake HOME holding a
+        # DUO menu entry, another app's menu entry, and a sentinel
+        # file that must survive the uninstall.
+        work = tempfile.mkdtemp(prefix="duo-uninstall-")
+        home = tempfile.mkdtemp(prefix="duo-uninstall-home-")
+        shutil.copy(os.path.join(self._tree(), "uninstall.sh"),
+                    os.path.join(work, "uninstall.sh"))
+        with open(os.path.join(work, "dual_chat.py"), "w") as fh:
+            fh.write("# app file -- must survive\n")
+        os.mkdir(os.path.join(work, ".venv"))
+        with open(os.path.join(work, ".venv", "pyvenv.cfg"), "w") as fh:
+            fh.write("home = /usr\n")
+        for name in ("duo-pairs.json", "duo-debug.log", "duo.png"):
+            with open(os.path.join(work, name), "w") as fh:
+                fh.write("generated\n")
+        apps = os.path.join(home, ".local", "share", "applications")
+        os.makedirs(apps)
+        with open(os.path.join(apps, "DUO.desktop"), "w") as fh:
+            fh.write("[Desktop Entry]\nName=DUO\n")
+        with open(os.path.join(apps, "other.desktop"), "w") as fh:
+            fh.write("[Desktop Entry]\nName=Other\n")
+        with open(os.path.join(home, "keep-me.txt"), "w") as fh:
+            fh.write("sentinel\n")
+        return work, home
+
+    def _run_uninstall(self, work, home, answer):
+        env = dict(os.environ)
+        env["HOME"] = home
+        return subprocess.run(
+            ["bash", "uninstall.sh"], cwd=work, env=env,
+            input=answer + "\n",
+            capture_output=True, text=True, timeout=60)
+
+    def test_uninstall_yes_removes_only_duo_files(self):
+        work, home = self._uninstall_setup()
+        try:
+            proc = self._run_uninstall(work, home, "y")
+            self.assertEqual(proc.returncode, 0,
+                             proc.stdout + proc.stderr)
+            apps = os.path.join(home, ".local", "share", "applications")
+            self.assertFalse(os.path.exists(
+                os.path.join(apps, "DUO.desktop")))
+            for name in (".venv", "duo-pairs.json", "duo-debug.log",
+                         "duo.png"):
+                self.assertFalse(os.path.exists(
+                    os.path.join(work, name)), name)
+            # Everything else survives: the app folder's own files,
+            # the other app's menu entry, and the sentinel.
+            self.assertTrue(os.path.exists(
+                os.path.join(work, "uninstall.sh")))
+            self.assertTrue(os.path.exists(
+                os.path.join(work, "dual_chat.py")))
+            self.assertTrue(os.path.exists(
+                os.path.join(apps, "other.desktop")))
+            self.assertTrue(os.path.exists(
+                os.path.join(home, "keep-me.txt")))
+            self.assertIn("Removed:", proc.stdout)
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+            shutil.rmtree(home, ignore_errors=True)
+
+    def test_uninstall_no_keeps_everything(self):
+        work, home = self._uninstall_setup()
+        try:
+            proc = self._run_uninstall(work, home, "n")
+            self.assertEqual(proc.returncode, 0,
+                             proc.stdout + proc.stderr)
+            apps = os.path.join(home, ".local", "share", "applications")
+            self.assertTrue(os.path.exists(
+                os.path.join(apps, "DUO.desktop")))
+            for name in (".venv", "duo-pairs.json", "duo-debug.log",
+                         "duo.png"):
+                self.assertTrue(os.path.exists(
+                    os.path.join(work, name)), name)
+            self.assertIn("Nothing removed.", proc.stdout)
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+            shutil.rmtree(home, ignore_errors=True)
 
 
 if __name__ == "__main__":

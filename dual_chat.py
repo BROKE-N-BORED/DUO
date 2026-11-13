@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""DUO 0.15 - two Ollama models side by side in one desktop window.
+"""DUO 0.16 - two Ollama models side by side in one desktop window.
 
 Item 1: the shell, the model pickers, and send-to-A/B/both.
 Item 2: the auto-relay AI-to-AI loop. The user types a seed message, picks
@@ -78,6 +78,11 @@ v0.15: the window finished. Its size, position, and the pane split
   restore can never strand it off-screen); it has a window icon,
   drawn in code; the title shows the version; and saved pairs can
   be deleted, with a confirmation first.
+v0.16: the front door. A CHANGELOG and .gitignore, a CI workflow
+  that runs the suite on every push, a .desktop launcher the
+  installer puts in the app menu (with an icon drawn from the
+  window icon), and an uninstaller that asks first. The license is
+  still to be decided.
 """
 
 import datetime
@@ -176,7 +181,7 @@ def make_debug_logger(log_dir=None):
         return _NullLogger()
 
 APP_NAME = "DUO"
-APP_VERSION = "0.15"
+APP_VERSION = "0.16"
 DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434"
 OLLAMA_URL_ENV = "DUAL_CHAT_OLLAMA_URL"
 

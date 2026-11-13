@@ -8,6 +8,9 @@ Or start a relay: type a seed message, press Start Relay, and the two
 models talk to each other — each reply is handed to the other model,
 one turn at a time, until the turn cap or a stop condition.
 
+License: not decided yet — the project owner will pick one. Version
+history lives in CHANGELOG.md.
+
 Everything in one app:
 
 - **Chat** — two panes, each with its own model picker and
@@ -77,6 +80,17 @@ package is missing it says so and stops, and if the machine's Qt
 libraries can't start the window it warns and names the missing
 library. If you start DUO before installing, it tells you to run
 the installer first — no traceback, no guessing.
+
+The installer also adds DUO to the app menu, with an icon drawn from
+the app's own window icon. If the icon can't be drawn on your
+machine, the menu entry still appears, just without an icon. To
+remove DUO later, run `bash uninstall.sh` — it asks first, then
+removes the menu entry, the `.venv` folder, and the files DUO created
+(saved pairs, debug log, menu icon).
+
+If you cloned the repo instead of downloading a Release, the scripts
+may not be executable — run them with `bash`, as above. The Release
+zip is the install path and carries the executable bits.
 
 ## Run
 

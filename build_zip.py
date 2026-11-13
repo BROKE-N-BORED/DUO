@@ -8,7 +8,7 @@ import os
 import zipfile
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
-OUT = os.path.join(os.path.dirname(ROOT), "duo-v0.15.zip")
+OUT = os.path.join(os.path.dirname(ROOT), "duo-v0.16.zip")
 
 FILES = {
     "dual_chat.py": 0o100644,
@@ -17,7 +17,12 @@ FILES = {
     "tests/test_dual_chat.py": 0o100644,
     "install.sh": 0o100755,
     "run.sh": 0o100755,
+    "uninstall.sh": 0o100755,
     "README.md": 0o100644,
+    "CHANGELOG.md": 0o100644,
+    ".gitignore": 0o100644,
+    ".github/workflows/ci.yml": 0o100644,
+    "DUO.desktop": 0o100644,
     "build_zip.py": 0o100644,
 }
 

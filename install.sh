@@ -43,6 +43,46 @@ if ! .venv/bin/python -c "import importlib.metadata; importlib.metadata.version(
   exit 1
 fi
 
+# Menu entry (best effort -- never fails the install): put DUO in the
+# app menu, with an icon drawn from the app's own window icon. If the
+# icon cannot be drawn on this machine, the menu entry still appears,
+# just without an icon.
+install_desktop_entry() {
+  [ -n "${HOME:-}" ] || return 0
+  [ -f DUO.desktop ] || return 0
+  # Clone installs carry no execute bits -- make the launchers
+  # runnable so the menu entry works from a clone too.
+  chmod +x run.sh uninstall.sh 2>/dev/null || true
+  DESKTOP_DIR="$HOME/.local/share/applications"
+  mkdir -p "$DESKTOP_DIR" || return 1
+  ICON_OK=0
+  if QT_QPA_PLATFORM=offscreen .venv/bin/python -c "
+import sys
+from PySide6 import QtWidgets
+from dual_chat import make_app_icon
+app = QtWidgets.QApplication([])
+pixmap = make_app_icon().pixmap(64, 64)
+sys.exit(0 if not pixmap.isNull() and pixmap.save('duo.png') else 1)
+" 2>/dev/null; then
+    ICON_OK=1
+  fi
+  APP_DIR_ESC=$(printf '%s' "$PWD" | sed 's/[|&]/\\&/g')
+  if [ "$ICON_OK" = 1 ]; then
+    sed "s|@APP_DIR@|$APP_DIR_ESC|g" DUO.desktop \
+      > "$DESKTOP_DIR/DUO.desktop" || return 1
+  else
+    sed "s|@APP_DIR@|$APP_DIR_ESC|g; /^Icon=/d" DUO.desktop \
+      > "$DESKTOP_DIR/DUO.desktop" || return 1
+  fi
+  chmod +x "$DESKTOP_DIR/DUO.desktop" 2>/dev/null || true
+  if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database "$DESKTOP_DIR" 2>/dev/null || true
+  fi
+  echo "Added DUO to the app menu."
+}
+
+install_desktop_entry || echo "Note: could not add the menu entry; DUO still runs with: bash run.sh"
+
 # The package is present, but the window still needs the machine's Qt
 # system libraries. Start Qt once (offscreen -- no window appears):
 # if a library is missing, warn plainly and name it, instead of
