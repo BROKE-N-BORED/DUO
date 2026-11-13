@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""DUO 0.13 - two Ollama models side by side in one desktop window.
+"""DUO 0.14 - two Ollama models side by side in one desktop window.
 
 Item 1: the shell, the model pickers, and send-to-A/B/both.
 Item 2: the auto-relay AI-to-AI loop. The user types a seed message, picks
@@ -68,6 +68,11 @@ v0.13: keyboard send and the composer cap gone. Ctrl+Enter sends to
   runs) makes plain Enter send too, with Shift+Enter still adding a
   new line. The composer no longer drops pasted paragraphs -- the
   5-block cap is removed entirely.
+v0.14: the first-run path guarded. If PySide6 is missing, main()
+  says so in plain language (stderr, plus a small dialog when
+  tkinter is available) and exits cleanly -- never a raw traceback.
+  install.sh pins PySide6-Essentials and checks the install before
+  calling it done; run.sh no longer falls back to system Python.
 """
 
 import datetime
@@ -166,7 +171,7 @@ def make_debug_logger(log_dir=None):
         return _NullLogger()
 
 APP_NAME = "DUO"
-APP_VERSION = "0.13"
+APP_VERSION = "0.14"
 DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434"
 OLLAMA_URL_ENV = "DUAL_CHAT_OLLAMA_URL"
 
@@ -194,6 +199,15 @@ MSG_PHONE_BUSY = "DUO is busy right now. Wait for the current turn to finish, th
 MSG_PHONE_RELAY = "A relay is running. Stop the relay before sending from your phone."
 MSG_PHONE_TASK = "A task is running. Wait for it to finish, then send again."
 MSG_PHONE_TARGET = "Pick who to send to: A, B, or Both."
+MSG_PYSIDE6_MISSING = (
+    "DUO needs PySide6 to open its window, and it isn't installed.\n"
+    "Run the installer first:\n"
+    "\n"
+    "    bash install.sh\n"
+    "\n"
+    "Then start DUO again with:\n"
+    "\n"
+    "    bash run.sh\n")
 
 # Persisted preferences (QSettings): the "Enter to send" tickbox is
 # remembered between runs. Explicit org/app names so the setting
@@ -3587,6 +3601,24 @@ def build_window(client=None, logger=None, deck_port=None):
     return window
 
 
+def _show_missing_pyside6():
+    """First-run guard: PySide6 is missing. Print a plain-language
+    message to stderr and, when tkinter is available, show it in a
+    small dialog too (the app may have been double-clicked, so stderr
+    alone may never be seen). Never raises -- a missing GUI toolkit
+    must not crash with a traceback."""
+    print(MSG_PYSIDE6_MISSING, file=sys.stderr)
+    try:
+        import tkinter
+        from tkinter import messagebox
+        root = tkinter.Tk()
+        root.withdraw()
+        messagebox.showerror("DUO needs PySide6", MSG_PYSIDE6_MISSING)
+        root.destroy()
+    except Exception:
+        pass
+
+
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     base_url = None
@@ -3594,7 +3626,14 @@ def main(argv=None):
         i = argv.index("--ollama-url")
         if i + 1 < len(argv):
             base_url = argv[i + 1]
-    from PySide6 import QtWidgets
+    try:
+        from PySide6 import QtWidgets
+    except ImportError:
+        # First-run guard (v0.14): PySide6 is the one package DUO
+        # needs, and a fresh install may not have it yet. Say so in
+        # plain language and exit cleanly -- never a raw traceback.
+        _show_missing_pyside6()
+        return 1
     app = QtWidgets.QApplication(argv)
     logger = make_debug_logger()
     logger.install_crash_handler()

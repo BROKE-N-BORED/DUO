@@ -66,7 +66,13 @@ bash install.sh
 ```
 
 This creates a private `.venv` folder in the app folder with
-PySide6-Essentials. Nothing is installed system-wide, no sudo needed.
+PySide6-Essentials, pinned to the version DUO was built and verified
+against (6.12.0). Nothing is installed system-wide, no sudo needed.
+The installer checks the install before calling it done: if the
+package is missing it says so and stops, and if the machine's Qt
+libraries can't start the window it warns and names the missing
+library. If you start DUO before installing, it tells you to run
+the installer first — no traceback, no guessing.
 
 ## Run
 

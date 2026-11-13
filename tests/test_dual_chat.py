@@ -11,6 +11,7 @@ import os
 import shutil
 import socket
 import struct
+import subprocess
 import sys
 import tempfile
 import threading
@@ -4672,6 +4673,133 @@ class KeyboardSendGuiTests(unittest.TestCase):
         self.app.processEvents()
         self.assertEqual(composer.toPlainText(), "\n".join(paragraphs))
         self.assertEqual(composer.blockCount(), 12)
+
+
+# ---------------------------------------------------------------------------
+# First-run guard (v0.14, audit T3)
+# ---------------------------------------------------------------------------
+
+class FirstRunGuardTests(unittest.TestCase):
+    """A fresh install with PySide6 missing must fail plainly, never
+    with a traceback: the app guard, the installer's post-install
+    check, and run.sh with no .venv."""
+
+    # The post-install check, exactly as install.sh runs it. Kept in
+    # sync with install.sh by
+    # test_install_sh_pins_pyside6_and_contains_the_check.
+    INSTALL_CHECK = (
+        "import importlib.metadata; "
+        "importlib.metadata.version('PySide6-Essentials')")
+
+    def _tree(self):
+        return os.path.dirname(
+            os.path.dirname(os.path.abspath(__file__)))
+
+    def test_main_without_pyside6_prints_plain_message_and_exits(self):
+        # Run main() in a subprocess with PySide6 blocked at import
+        # time: exit non-zero, plain message on stderr, no traceback
+        # anywhere. DISPLAY is stripped so no dialog can appear.
+        blocker = (
+            "import importlib.abc, importlib.machinery, sys\n"
+            "class _RaisingLoader(importlib.abc.Loader):\n"
+            "    def create_module(self, spec):\n"
+            "        return None\n"
+            "    def exec_module(self, module):\n"
+            "        raise ImportError(\"No module named 'PySide6' "
+            "(blocked for test)\")\n"
+            "class _BlockPySide6(importlib.abc.MetaPathFinder):\n"
+            "    def find_spec(self, fullname, path=None, target=None):\n"
+            "        if fullname == 'PySide6' or "
+            "fullname.startswith('PySide6.'):\n"
+            "            return importlib.machinery.ModuleSpec("
+            "fullname, _RaisingLoader())\n"
+            "        return None\n"
+            "sys.meta_path.insert(0, _BlockPySide6())\n"
+            "sys.path.insert(0, %r)\n"
+            "import dual_chat\n"
+            "sys.exit(dual_chat.main([]))\n" % self._tree()
+        )
+        env = dict(os.environ)
+        env.pop("DISPLAY", None)
+        proc = subprocess.run(
+            [sys.executable, "-c", blocker],
+            capture_output=True, text=True, timeout=60, env=env)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("PySide6", proc.stderr)
+        self.assertIn("install.sh", proc.stderr)
+        self.assertNotIn("Traceback", proc.stderr)
+        self.assertNotIn("Traceback", proc.stdout)
+
+    def test_install_check_fails_without_pyside6_and_passes_with_it(self):
+        # With PySide6 present the check passes...
+        present = subprocess.run(
+            [sys.executable, "-c", self.INSTALL_CHECK],
+            capture_output=True, text=True, timeout=60)
+        self.assertEqual(present.returncode, 0)
+        # ...and a bare venv with no PySide6 fails it.
+        venv_dir = tempfile.mkdtemp(prefix="duo-no-pyside6-")
+        try:
+            subprocess.run(
+                [sys.executable, "-m", "venv", venv_dir],
+                capture_output=True, timeout=120, check=True)
+            venv_python = os.path.join(venv_dir, "bin", "python")
+            absent = subprocess.run(
+                [venv_python, "-c", self.INSTALL_CHECK],
+                capture_output=True, text=True, timeout=60)
+            self.assertNotEqual(absent.returncode, 0)
+        finally:
+            shutil.rmtree(venv_dir, ignore_errors=True)
+
+    def test_install_sh_pins_pyside6_and_contains_the_check(self):
+        with open(os.path.join(self._tree(), "install.sh"),
+                  encoding="utf-8") as fh:
+            script = fh.read()
+        self.assertIn("PySide6-Essentials==6.12.0", script)
+        self.assertIn(self.INSTALL_CHECK, script)
+        self.assertIn("QApplication([])", script)
+
+    def test_qt_start_check_passes_when_qt_works_and_fails_without_it(self):
+        # The installer's Qt check: start Qt offscreen. Passes with
+        # working Qt, fails with a bogus platform -- so a machine
+        # whose Qt cannot start trips the installer's warning.
+        start = ("from PySide6 import QtWidgets; "
+                 "QtWidgets.QApplication([])")
+        env = dict(os.environ)
+        env["QT_QPA_PLATFORM"] = "offscreen"
+        ok = subprocess.run(
+            [sys.executable, "-c", start],
+            capture_output=True, text=True, timeout=60, env=env)
+        self.assertEqual(ok.returncode, 0)
+        env["QT_QPA_PLATFORM"] = "no-such-platform"
+        bad = subprocess.run(
+            [sys.executable, "-c", start],
+            capture_output=True, text=True, timeout=60, env=env)
+        self.assertNotEqual(bad.returncode, 0)
+
+    def test_run_sh_without_venv_prints_plain_message_and_exits(self):
+        # A folder with the app but no .venv: run.sh must say to run
+        # the installer and exit non-zero -- never fall back to
+        # system python and crash on the missing PySide6.
+        work = tempfile.mkdtemp(prefix="duo-no-venv-")
+        try:
+            for name in ("run.sh", "dual_chat.py"):
+                shutil.copy(os.path.join(self._tree(), name),
+                            os.path.join(work, name))
+            proc = subprocess.run(
+                ["bash", "run.sh"], cwd=work,
+                capture_output=True, text=True, timeout=60)
+            self.assertNotEqual(proc.returncode, 0)
+            output = proc.stdout + proc.stderr
+            self.assertIn("install.sh", output)
+            self.assertNotIn("Traceback", output)
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+
+    def test_run_sh_has_no_system_python_fallback(self):
+        with open(os.path.join(self._tree(), "run.sh"),
+                  encoding="utf-8") as fh:
+            script = fh.read()
+        self.assertNotIn("exec python3", script)
 
 
 if __name__ == "__main__":
