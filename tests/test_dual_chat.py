@@ -30,6 +30,7 @@ from dual_chat import (  # noqa: E402
     MSG_OLLAMA_NOT_INSTALLED, MSG_OLLAMA_SLOW, MSG_OLLAMA_START_FAILED,
     MSG_PHONE_BUSY, MSG_PHONE_RELAY, MSG_PHONE_TARGET,
     SETTINGS_APP, SETTINGS_ORG, SETTING_ENTER_TO_SEND,
+    SETTING_SPLITTER_STATE, SETTING_WINDOW_GEOMETRY,
     TASK_CONTINUE_TEMPLATE, TASK_FOLLOW_UPS, TASK_REVIEW_TEMPLATE,
     AttachmentError, Cancelled,
     ChatSide, Conversation, DeckServer, HISTORY_BUDGET_CHARS,
@@ -39,7 +40,8 @@ from dual_chat import (  # noqa: E402
     TaskSession, attachment_tag, build_attached_message,
     build_deck_state, compute_turn_stats, default_both_filename,
     default_debug_filename,
-    default_full_filename, default_side_filename, format_both_transcript,
+    default_full_filename, default_side_filename, delete_pair,
+    format_both_transcript,
     format_full_transcript, format_ram, format_side_transcript,
     format_stats_line, get_lan_ip, load_attachment, load_pairs,
     make_debug_logger,
@@ -1363,6 +1365,23 @@ class PairsTests(unittest.TestCase):
         self.assertEqual(set(pairs), {"one", "two"})
         self.assertEqual(pairs["one"]["model_a"], "z")
         self.assertEqual(pairs["two"]["model_a"], "b")
+
+    def test_delete_pair_removes_only_that_pair(self):
+        save_pair(self.path, "one", {"model_a": "a", "model_b": None,
+                                     "instruction_a": "", "instruction_b": ""})
+        save_pair(self.path, "two", {"model_a": "b", "model_b": "c",
+                                     "instruction_a": "x", "instruction_b": "y"})
+        self.assertTrue(delete_pair(self.path, "one"))
+        pairs = load_pairs(self.path)
+        self.assertEqual(set(pairs), {"two"})
+        self.assertEqual(pairs["two"]["model_a"], "b")
+
+    def test_delete_pair_missing_name_is_noop(self):
+        save_pair(self.path, "one", {"model_a": "a", "model_b": None,
+                                     "instruction_a": "", "instruction_b": ""})
+        self.assertFalse(delete_pair(self.path, "nope"))
+        self.assertEqual(set(load_pairs(self.path)), {"one"})
+        self.assertFalse(delete_pair(self.path, "nope"))
 
     def test_pairs_path_env_override(self):
         with mock.patch.dict(os.environ,
@@ -4800,6 +4819,194 @@ class FirstRunGuardTests(unittest.TestCase):
                   encoding="utf-8") as fh:
             script = fh.read()
         self.assertNotIn("exec python3", script)
+
+
+# ---------------------------------------------------------------------------
+# Window finish GUI tests (v0.15, audit T4)
+# ---------------------------------------------------------------------------
+
+@unittest.skipUnless(os.environ.get("DUAL_CHAT_GUI_TESTS") == "1",
+                     "GUI tests run with DUAL_CHAT_GUI_TESTS=1")
+class WindowFinishGuiTests(unittest.TestCase):
+    """The window remembers its size/position and pane split, has an
+    icon and the version in its title, and saved pairs can be deleted
+    (with a confirmation first)."""
+    @classmethod
+    def setUpClass(cls):
+        from PySide6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+        cls.client = FakeGuiClient()
+
+    def setUp(self):
+        # Geometry and the split persist, so clear them before every
+        # window: each test starts from the defaults.
+        self._clear_window_settings()
+        self.client.reset()
+        # Pairs go to a temp file so tests never touch the real one.
+        self.tmp = tempfile.TemporaryDirectory()
+        self.pairs_file = os.path.join(self.tmp.name, "duo-pairs.json")
+        self._env = mock.patch.dict(
+            os.environ, {"DUAL_CHAT_PAIRS_FILE": self.pairs_file})
+        self._env.start()
+        from dual_chat import build_window
+        self.window = build_window(self.client, logger=TEST_LOGGER)
+        self.window.show()
+        self.state = self.window._dual_chat
+        self._wait_for(lambda: self.state["widgets"]["A"]["picker"].count() == 2)
+
+    def tearDown(self):
+        self.window.close()
+        self._env.stop()
+        self.tmp.cleanup()
+        self._clear_window_settings()
+
+    def _clear_window_settings(self):
+        from PySide6.QtCore import QSettings
+        settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
+        settings.remove(SETTING_WINDOW_GEOMETRY)
+        settings.remove(SETTING_SPLITTER_STATE)
+        settings.sync()
+
+    def _wait_for(self, cond, timeout=10.0):
+        from PySide6.QtTest import QTest
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            QTest.qWait(50)
+            if cond():
+                return True
+        return cond()
+
+    def _seed_pairs(self, *names):
+        for name in names:
+            save_pair(self.pairs_file, name,
+                      {"model_a": "fake-a:latest", "model_b": None,
+                       "instruction_a": "", "instruction_b": ""})
+        self.state["refresh_pair_combo"]()
+        self.app.processEvents()
+
+    def test_title_shows_version(self):
+        self.assertEqual(self.window.windowTitle(), "DUO 0.15")
+
+    def test_window_has_icon(self):
+        self.assertFalse(self.window.windowIcon().isNull())
+
+    def test_geometry_and_splitter_round_trip(self):
+        from dual_chat import build_window
+        self.window.resize(1000, 600)
+        self.window.move(40, 30)
+        panes = self.state["panes"]
+        panes.setSizes([650, 350])
+        self.app.processEvents()
+        # Capture what the window actually is (the frame offset makes
+        # the client rect differ from the move/resize arguments by a
+        # couple of pixels): the restore must reproduce exactly this.
+        rect_before = self.window.geometry()
+        sizes_before = list(panes.sizes())
+        self.window.close()
+        self.app.processEvents()
+        window2 = build_window(self.client, logger=TEST_LOGGER)
+        try:
+            window2.show()
+            state2 = window2._dual_chat
+            self.assertTrue(self._wait_for(
+                lambda: state2["widgets"]["A"]["picker"].count() == 2))
+            self.app.processEvents()
+            self.assertEqual(window2.geometry(), rect_before)
+            sizes_after = list(state2["panes"].sizes())
+            self.assertEqual(len(sizes_after), len(sizes_before))
+            for before, after in zip(sizes_before, sizes_after):
+                self.assertAlmostEqual(before, after, delta=3)
+        finally:
+            window2.close()
+
+    def test_offscreen_geometry_is_clamped_on_restore(self):
+        from dual_chat import build_window
+        # Park the window far off-screen and close it: the close
+        # saves that geometry. A fresh window must come back
+        # on-screen, title bar reachable.
+        self.window.setGeometry(10000, 10000, 1000, 600)
+        self.app.processEvents()
+        self.window.close()
+        self.app.processEvents()
+        window2 = build_window(self.client, logger=TEST_LOGGER)
+        try:
+            window2.show()
+            state2 = window2._dual_chat
+            self.assertTrue(self._wait_for(
+                lambda: state2["widgets"]["A"]["picker"].count() == 2))
+            self.app.processEvents()
+            avail = self.app.primaryScreen().availableGeometry()
+            geom = window2.geometry()
+            self.assertTrue(avail.intersects(geom),
+                            "restored window must overlap the screen: %s "
+                            "vs available %s" % (geom.getRect(),
+                                                avail.getRect()))
+            self.assertTrue(avail.contains(geom.topLeft()),
+                            "title bar must be on screen: %s"
+                            % (geom.getRect(),))
+            if avail.width() >= window2.minimumWidth():
+                self.assertLessEqual(geom.width(), avail.width())
+            if avail.height() >= window2.minimumHeight():
+                self.assertLessEqual(geom.height(), avail.height())
+        finally:
+            window2.close()
+
+    def test_pair_delete_disabled_with_nothing_selected(self):
+        # No pairs saved, nothing selected: Delete is off.
+        self.assertFalse(self.state["pair_delete"].isEnabled())
+        self._seed_pairs("one", "two")
+        # Still nothing selected after the reload: still off.
+        self.assertEqual(self.state["pair_combo"].currentIndex(), -1)
+        self.assertFalse(self.state["pair_delete"].isEnabled())
+        # Pick one: Delete comes on.
+        self.state["pair_combo"].setCurrentIndex(0)
+        self.app.processEvents()
+        self.assertTrue(self.state["pair_delete"].isEnabled())
+
+    def test_pair_delete_removes_pair_from_file_and_picker(self):
+        from PySide6.QtWidgets import QMessageBox
+        self._seed_pairs("one", "two")
+        self.state["pair_combo"].setCurrentIndex(0)
+        self.app.processEvents()
+        self.assertEqual(self.state["pair_combo"].currentText(), "one")
+        with mock.patch.object(
+                QMessageBox, "question",
+                return_value=QMessageBox.StandardButton.Yes):
+            self.state["pair_delete"].click()
+        self.app.processEvents()
+        self.assertEqual(set(load_pairs(self.pairs_file)), {"two"})
+        self.assertEqual(self.state["pair_combo"].count(), 1)
+        self.assertEqual(self.state["pair_combo"].itemText(0), "two")
+        # Nothing is selected after a delete -- never auto-pick.
+        self.assertEqual(self.state["pair_combo"].currentIndex(), -1)
+        self.assertFalse(self.state["pair_delete"].isEnabled())
+        # Delete the last one: the picker is empty, still nothing
+        # selected, Delete stays off.
+        self.state["pair_combo"].setCurrentIndex(0)
+        self.app.processEvents()
+        with mock.patch.object(
+                QMessageBox, "question",
+                return_value=QMessageBox.StandardButton.Yes):
+            self.state["pair_delete"].click()
+        self.app.processEvents()
+        self.assertEqual(load_pairs(self.pairs_file), {})
+        self.assertEqual(self.state["pair_combo"].count(), 0)
+        self.assertEqual(self.state["pair_combo"].currentIndex(), -1)
+        self.assertFalse(self.state["pair_delete"].isEnabled())
+
+    def test_pair_delete_reject_keeps_pair(self):
+        from PySide6.QtWidgets import QMessageBox
+        self._seed_pairs("one", "two")
+        self.state["pair_combo"].setCurrentIndex(0)
+        self.app.processEvents()
+        with mock.patch.object(
+                QMessageBox, "question",
+                return_value=QMessageBox.StandardButton.No):
+            self.state["pair_delete"].click()
+        self.app.processEvents()
+        self.assertEqual(set(load_pairs(self.pairs_file)),
+                         {"one", "two"})
+        self.assertEqual(self.state["pair_combo"].count(), 2)
 
 
 if __name__ == "__main__":

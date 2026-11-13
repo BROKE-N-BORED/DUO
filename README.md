@@ -51,6 +51,10 @@ Everything in one app:
   model is thinking, you can send messages from the phone, and one
   Export button downloads the full transcript. It only works on
   your home WiFi, and anyone on that WiFi can open it.
+- **Remembers the window** — the window's size and position and
+  the split between the panes are remembered between runs, so it
+  opens where you left it. The title bar shows the version, and
+  the window has its own icon.
 
 ## What you need
 
@@ -96,6 +100,8 @@ bash run.sh
 - Stop ends the turn in progress on that side. Clear wipes that side's
   conversation. Conversations are not saved between runs — use the
   Save buttons to keep a transcript as a text file.
+- The window remembers its size, position, and the split between
+  the panes, so it opens where you left it.
 - If Ollama isn't running, the pane says so in plain words.
 
 ## Relay
@@ -133,7 +139,8 @@ bash run.sh
 - Pairs: the Pair row saves the current setup — both models plus both
   instruction fields — under a name, and loads it back from the
   dropdown. Pairs live in duo-pairs.json next to the app. Nothing is
-  saved or loaded unless you ask for it.
+  saved or loaded unless you ask for it. Delete pair removes the
+  selected pair, after asking first.
 - Compare: after Send to Both, each pane gets a Use this button. Tap
   it and that reply is sent to the other side ("You picked this
   answer: ...") so the conversation continues from the better answer.

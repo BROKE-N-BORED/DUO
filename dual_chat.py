@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""DUO 0.14 - two Ollama models side by side in one desktop window.
+"""DUO 0.15 - two Ollama models side by side in one desktop window.
 
 Item 1: the shell, the model pickers, and send-to-A/B/both.
 Item 2: the auto-relay AI-to-AI loop. The user types a seed message, picks
@@ -73,6 +73,11 @@ v0.14: the first-run path guarded. If PySide6 is missing, main()
   tkinter is available) and exits cleanly -- never a raw traceback.
   install.sh pins PySide6-Essentials and checks the install before
   calling it done; run.sh no longer falls back to system Python.
+v0.15: the window finished. Its size, position, and the pane split
+  are remembered between runs (clamped to the screen, so a stale
+  restore can never strand it off-screen); it has a window icon,
+  drawn in code; the title shows the version; and saved pairs can
+  be deleted, with a confirmation first.
 """
 
 import datetime
@@ -171,7 +176,7 @@ def make_debug_logger(log_dir=None):
         return _NullLogger()
 
 APP_NAME = "DUO"
-APP_VERSION = "0.14"
+APP_VERSION = "0.15"
 DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434"
 OLLAMA_URL_ENV = "DUAL_CHAT_OLLAMA_URL"
 
@@ -215,6 +220,10 @@ MSG_PYSIDE6_MISSING = (
 SETTINGS_ORG = "BrokeNBored"
 SETTINGS_APP = "DUO"
 SETTING_ENTER_TO_SEND = "composer/enter_to_send"
+# Window finish (v0.15): the window's size/position and the pane
+# split are remembered the same way, saved when the window closes.
+SETTING_WINDOW_GEOMETRY = "window/geometry"
+SETTING_SPLITTER_STATE = "window/splitter"
 
 # Agreement stop: simple case-insensitive substring matching on this
 # fixed list. No LLM judge -- the 2B models are slow enough already.
@@ -869,6 +878,20 @@ def save_pair(path, name, setup):
     with open(path, "w", encoding="utf-8") as fh:
         json.dump({"pairs": pairs}, fh, indent=2, sort_keys=True)
         fh.write("\n")
+
+
+def delete_pair(path, name):
+    """Remove one pair from the JSON file. Returns True when a pair
+    was actually removed; a missing name is a no-op returning False.
+    """
+    pairs = load_pairs(path)
+    if name not in pairs:
+        return False
+    del pairs[name]
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump({"pairs": pairs}, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+    return True
 
 
 class AttachmentError(Exception):
@@ -1607,6 +1630,27 @@ def render_qr_pixmap(url, scale=6, border=4):
     return QtGui.QPixmap.fromImage(image)
 
 
+def make_app_icon():
+    """The DUO window icon: two side-by-side panes in a dark rounded
+    square, drawn in code -- no image file to ship (the push path
+    cannot carry binaries)."""
+    from PySide6 import QtCore, QtGui
+    size = 64
+    image = QtGui.QImage(size, size, QtGui.QImage.Format_ARGB32)
+    image.fill(QtCore.Qt.transparent)
+    painter = QtGui.QPainter(image)
+    painter.setRenderHint(QtGui.QPainter.Antialiasing)
+    painter.setPen(QtCore.Qt.NoPen)
+    painter.setBrush(QtGui.QColor("#1f2a33"))
+    painter.drawRoundedRect(2, 2, size - 4, size - 4, 12, 12)
+    painter.setBrush(QtGui.QColor("#5b9bd5"))
+    painter.drawRoundedRect(10, 14, 20, 36, 4, 4)
+    painter.setBrush(QtGui.QColor("#70ad47"))
+    painter.drawRoundedRect(34, 14, 20, 36, 4, 4)
+    painter.end()
+    return QtGui.QIcon(QtGui.QPixmap.fromImage(image))
+
+
 # ---------------------------------------------------------------------------
 # Qt GUI
 # ---------------------------------------------------------------------------
@@ -1746,7 +1790,8 @@ def build_window(client=None, logger=None, deck_port=None):
     convo = Conversation()
 
     window = QtWidgets.QMainWindow()
-    window.setWindowTitle(APP_NAME)
+    window.setWindowTitle("%s %s" % (APP_NAME, APP_VERSION))
+    window.setWindowIcon(make_app_icon())
     window.resize(1100, 680)  # Fits a 1366x768 screen with room to spare.
     window.setMinimumSize(900, 540)
 
@@ -1999,6 +2044,9 @@ def build_window(client=None, logger=None, deck_port=None):
     pair_row.addWidget(pair_name, stretch=1)
     pair_save = QtWidgets.QPushButton("Save pair")
     pair_row.addWidget(pair_save)
+    pair_delete = QtWidgets.QPushButton("Delete pair")
+    pair_delete.setEnabled(False)
+    pair_row.addWidget(pair_delete)
     d_layout.addLayout(pair_row)
 
     # --- task row ---------------------------------------------------------
@@ -2235,6 +2283,10 @@ def build_window(client=None, logger=None, deck_port=None):
         pair_combo.setEnabled(pairs_idle)
         pair_name.setEnabled(pairs_idle)
         pair_save.setEnabled(pairs_idle)
+        # Delete needs a pair selected as well as idle -- with
+        # nothing selected there is nothing to delete.
+        pair_delete.setEnabled(pairs_idle
+                               and pair_combo.currentIndex() >= 0)
         # Saving is idle-only too: the transcript is moving
         # mid-generation or mid-relay, so a save then would catch a
         # half-written turn.
@@ -3225,6 +3277,9 @@ def build_window(client=None, logger=None, deck_port=None):
         else:
             pair_combo.setCurrentIndex(-1)
         pair_combo.blockSignals(False)
+        # The Delete button follows the selection, and this rebuild
+        # runs with signals blocked, so refresh the buttons here.
+        refresh_buttons()
         return pairs
 
     def on_pair_save():
@@ -3272,7 +3327,24 @@ def build_window(client=None, logger=None, deck_port=None):
             statusbar.showMessage("Pair '%s' loaded." % name, 3000)
         refresh_buttons()
 
+    def on_pair_delete():
+        index = pair_combo.currentIndex()
+        if index < 0:
+            return
+        name = pair_combo.currentText()
+        answer = QtWidgets.QMessageBox.question(
+            window, "Delete pair?",
+            "Delete the saved pair '%s'? This can't be undone." % name,
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.No)
+        if answer != QtWidgets.QMessageBox.Yes:
+            return
+        delete_pair(pairs_path(), name)
+        refresh_pair_combo()
+        statusbar.showMessage("Pair '%s' deleted." % name, 3000)
+
     pair_save.clicked.connect(on_pair_save)
+    pair_delete.clicked.connect(on_pair_delete)
     # Both signals: currentIndexChanged covers picking a different pair,
     # activated covers re-picking the pair that is already selected
     # (choosing the same item again fires no index change, but the user
@@ -3523,7 +3595,7 @@ def build_window(client=None, logger=None, deck_port=None):
 
     window._dual_chat = {  # test hooks (not part of the UI)
         "convo": convo, "runner": runner, "signals": signals,
-        "widgets": widgets, "composer": composer,
+        "widgets": widgets, "composer": composer, "panes": panes,
         "enter_send_check": enter_send_check,
         "send_a": send_a, "send_b": send_b, "send_both": send_both,
         "do_send": do_send, "load_models": load_models, "state": state,
@@ -3538,7 +3610,9 @@ def build_window(client=None, logger=None, deck_port=None):
         "review_forward_edited": review_forward_edited,
         "review_skip": review_skip, "review_stop": review_stop,
         "pair_combo": pair_combo, "pair_name": pair_name,
-        "pair_save": pair_save, "refresh_pair_combo": refresh_pair_combo,
+        "pair_save": pair_save, "pair_delete": pair_delete,
+        "on_pair_delete": on_pair_delete,
+        "refresh_pair_combo": refresh_pair_combo,
         "use_this": use_this, "do_forward": do_forward,
         "render_transcript": render_transcript,
         "refresh_history_list": refresh_history_list,
@@ -3572,6 +3646,19 @@ def build_window(client=None, logger=None, deck_port=None):
     _orig_close_event = window.closeEvent
 
     def _on_close(event):
+        # Remember the window for next time: size/position and the
+        # pane split. Saved on close (not on every move/resize) so a
+        # crash mid-session keeps the last clean state. The geometry
+        # is stored as a plain rect (not saveGeometry bytes): Qt's
+        # own restore clamps to the screen behind our backs, which
+        # makes the round-trip untestable; a rect plus the clamp
+        # below is fully deterministic. A maximized window saves its
+        # normal geometry, so it reopens at its old size.
+        geom = (window.normalGeometry() if window.isMaximized()
+                else window.geometry())
+        prefs.setValue(SETTING_WINDOW_GEOMETRY, geom)
+        prefs.setValue(SETTING_SPLITTER_STATE, panes.saveState())
+        prefs.sync()
         # Closing mid-generation must stop the work: without this,
         # the runner thread keeps a relay going in the closed window,
         # still calling Ollama after DUO is gone (and, in the tests,
@@ -3594,6 +3681,39 @@ def build_window(client=None, logger=None, deck_port=None):
         _orig_close_event(event)
 
     window.closeEvent = _on_close
+
+    # --- remember the window (v0.15) -----------------------------------
+    # Restore the saved size/position and pane split. A stale restore
+    # is clamped to the available screen: the size is capped at the
+    # screen when the screen can hold the window's minimum size, and
+    # the position keeps at least 100 px of width and 50 px of height
+    # on screen, so the title bar is always reachable and the window
+    # can be dragged back. A missing or corrupt saved value keeps the
+    # defaults above.
+    def _clamp_rect(rect, avail, min_w, min_h):
+        width = rect.width()
+        height = rect.height()
+        if avail.width() >= min_w:
+            width = max(min_w, min(width, avail.width()))
+        if avail.height() >= min_h:
+            height = max(min_h, min(height, avail.height()))
+        x = max(avail.left(), min(rect.x(), avail.right() - 100))
+        y = max(avail.top(), min(rect.y(), avail.bottom() - 50))
+        return QtCore.QRect(x, y, width, height)
+
+    saved_geometry = prefs.value(SETTING_WINDOW_GEOMETRY)
+    if isinstance(saved_geometry, QtCore.QRect):
+        screen = QtWidgets.QApplication.primaryScreen()
+        if screen is not None:
+            clamped = _clamp_rect(
+                saved_geometry, screen.availableGeometry(),
+                window.minimumWidth(), window.minimumHeight())
+            window.setGeometry(clamped)
+        else:
+            window.setGeometry(saved_geometry)
+    saved_splitter = prefs.value(SETTING_SPLITTER_STATE)
+    if saved_splitter is not None:
+        panes.restoreState(saved_splitter)
 
     refresh_pair_combo()
     load_models()
