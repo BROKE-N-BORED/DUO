@@ -35,6 +35,16 @@ Everything in one app:
 - **Readable chat** — messages in the window are separated by a blank
   line, with the sender's name in bold, so a long reply never runs
   into the next message.
+- **Stays connected** — if Ollama stalls briefly while the computer
+  is busy, a turn retries a few times instead of giving up, and a
+  slow Ollama is never reported as "not running". If Ollama really
+  is down, a Start Ollama button appears in the bottom bar and
+  starts it from inside DUO.
+- **Debug report** — DUO keeps a log of what it does (events and
+  timings only, never your messages). The Debug report button
+  writes one file with the app version, Ollama's status, the
+  session log, and recent errors — ready to email when something
+  breaks.
 
 ## What you need
 
@@ -199,6 +209,28 @@ GUI tests need a display or offscreen Qt plus the flag:
 ```sh
 DUAL_CHAT_GUI_TESTS=1 QT_QPA_PLATFORM=offscreen python3 -m unittest discover -s tests -v
 ```
+
+## When Ollama stops answering
+
+On a slow computer Ollama can stall for a moment while it is busy
+generating. DUO handles that: a turn retries a few times with a
+pause between tries before it fails, and a relay keeps going when a
+hop succeeds on a retry. If a reply was already streaming when the
+connection dropped, the partial reply stays in the pane with a plain
+note — DUO never retries a half-streamed turn, because that would
+repeat the part you already saw.
+
+If Ollama has genuinely stopped, the panes say so in plain words and
+a Start Ollama button appears in the bottom bar. Press it and DUO
+starts Ollama itself — no terminal, no extra steps. When DUO closes,
+it stops only the server it started; a server you started yourself
+is left alone.
+
+If something keeps going wrong, press Debug report (next to the save
+buttons) and send the file it writes. It holds the app version,
+Ollama's status, what DUO was doing, and the errors — never your
+messages or your attached files. DUO also keeps a rotating log next
+to the app (`duo-debug.log`) so the last few runs are on hand.
 
 ## Testing knob
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""DUO (Item 7) - two Ollama models side by side in one desktop window.
+"""DUO 0.10 - two Ollama models side by side in one desktop window.
 
 Item 1: the shell, the model pickers, and send-to-A/B/both.
 Item 2: the auto-relay AI-to-AI loop. The user types a seed message, picks
@@ -43,8 +43,17 @@ Item 7: transcripts. Save one side's conversation, or both sides in
   Attached file contents are never pasted in -- the short tag is all
   the file carries. Saving is idle-only: never mid-generation or
   mid-relay, when the transcript is moving.
-
-NOT in Item 7 (later items): provider APIs.
+Item 8: final pass. The status-line nit (a stale "Attached: ..." note
+  after a send) fixed, and the README rewritten for the complete app.
+Item 9: chat layout (blank line between messages, bold sender
+  labels, explicit word wrap) and the full transcript export: both
+  sides interleaved in the order the conversation actually happened.
+v0.10: Ollama reliability. Chat turns retry transient failures with
+  a pause between attempts and wait as long as Code Forge does; a
+  Start Ollama button starts the server from inside DUO when it is
+  down; and a debug log layer (the BNB T21 standard, vendored as
+  debug_log.py) records events and writes a report to email when
+  something breaks. The log never holds message or file contents.
 """
 
 import datetime
@@ -59,12 +68,90 @@ import time
 import urllib.error
 import urllib.request
 
+# Debug log layer: the BNB T21 standard, vendored as debug_log.py next
+# to this file. Logging must never break the app, so a missing module
+# falls back to a do-nothing logger instead of crashing the import.
+try:
+    import debug_log as _debug_log
+except ImportError:  # pragma: no cover - the zip always ships it
+    _debug_log = None
+
+
+class _NullLogger:
+    """Drop-in for DebugLogger when the module is missing: every call
+    is a no-op, and a report request reports that logging is off."""
+
+    def debug(self, *a, **k):
+        pass
+
+    def info(self, *a, **k):
+        pass
+
+    def warning(self, *a, **k):
+        pass
+
+    def error(self, *a, **k):
+        pass
+
+    def exception(self, *a, **k):
+        pass
+
+    def action(self, *a, **k):
+        pass
+
+    def set_setting(self, *a, **k):
+        pass
+
+    def register_service(self, *a, **k):
+        pass
+
+    def register_dependency(self, *a, **k):
+        pass
+
+    def build_report(self):
+        return "DEBUG REPORT — %s %s\n\nLogging is not available.\n" % (
+            APP_NAME, APP_VERSION)
+
+    def generate_report(self, path=None):
+        if path is None:
+            path = "debug-report-unavailable.txt"
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(self.build_report())
+        return path
+
+    def install_crash_handler(self):
+        pass
+
+    def uninstall_crash_handler(self):
+        pass
+
+
+def make_debug_logger(log_dir=None):
+    """A DebugLogger for this app, or a null logger when the vendored
+    module is missing. The log file lives next to the app
+    (duo-debug.log), rotating so it never grows without bound."""
+    if _debug_log is None:
+        return _NullLogger()
+    if log_dir is None:
+        log_dir = os.path.dirname(os.path.abspath(__file__))
+    try:
+        return _debug_log.DebugLogger("duo-debug", APP_VERSION,
+                                      log_dir=log_dir)
+    except OSError:
+        return _NullLogger()
+
 APP_NAME = "DUO"
+APP_VERSION = "0.10"
 DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434"
 OLLAMA_URL_ENV = "DUAL_CHAT_OLLAMA_URL"
 
 # Plain-language messages shown in the panes. No tracebacks in the UI.
 MSG_OLLAMA_DOWN = "Ollama isn't running. Start Ollama and try again."
+MSG_OLLAMA_SLOW = "Ollama is slow or busy right now. Try again in a moment."
+MSG_OLLAMA_NOT_INSTALLED = (
+    "Ollama isn't installed on this computer, so DUO can't start it.")
+MSG_OLLAMA_START_FAILED = (
+    "Ollama didn't start. Try starting it yourself and try again.")
 MSG_MODEL_FAILED = "That model couldn't be loaded. Pick another model and try again."
 MSG_NO_MODEL = "Pick a model for {side} first."
 MSG_STOPPED = "Stopped."
@@ -80,6 +167,17 @@ AWARE_TEMPLATE = ("You are talking with another AI assistant (Model %s). "
 RELAY_CAP_MIN = 1
 RELAY_CAP_MAX = 50
 RELAY_CAP_DEFAULT = 10
+
+# Chat reliability (v0.10): Code Forge waits 1800s on a chat call and
+# DUO used to wait 300s -- on a slow CPU, Ollama's HTTP server can
+# stall briefly between relay hops while the CPU is pegged at 100%
+# generating, and DUO gave up on the first failure with no retry. Now
+# a turn retries transient failures (connect/read before the first
+# content chunk) a few times with a pause between attempts, and only
+# then fails. The pauses are interruptible: Stop ends them at once.
+CHAT_TIMEOUT = 1800
+CHAT_MAX_ATTEMPTS = 3
+CHAT_RETRY_DELAYS = (2.0, 5.0)  # pause before attempt 2, then attempt 3
 
 # Summarize (Item 4): when a side's history passes this many characters
 # the pane nudges the user to summarize. Summarizing keeps the last
@@ -230,6 +328,34 @@ def format_stats_line(stats):
     return "%s · %s · %s · %s" % (tok_text, ttft_text, total_text, ram_text)
 
 
+def _ollama_failure_kind(exc):
+    """Classify a chat failure: "down" when Ollama refused the
+    connection (nothing listening), "slow" when it timed out (up but
+    not answering in time), "error" for anything else. urllib wraps
+    the real error in URLError.reason, so walk the chain."""
+    seen = set()
+    current = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, ConnectionRefusedError):
+            return "down"
+        if isinstance(current, TimeoutError):
+            return "slow"
+        current = (getattr(current, "reason", None)
+                   or getattr(current, "__cause__", None))
+    return "error"
+
+
+class _Retryable(Exception):
+    """A chat attempt failed before any content streamed: safe to try
+    again. Carries the original error and its failure kind."""
+
+    def __init__(self, error, kind):
+        super().__init__(str(error))
+        self.error = error
+        self.kind = kind
+
+
 class OllamaClient:
     """Minimal Ollama client over localhost HTTP. Stdlib only."""
 
@@ -258,8 +384,21 @@ class OllamaClient:
         except Exception:
             raise OllamaError(MSG_OLLAMA_DOWN)
 
+    def probe(self, timeout=5):
+        """True when Ollama answers /api/tags, False otherwise.
+
+        A fast liveness check: used between retries and by the Start
+        Ollama wait loop. Never raises."""
+        try:
+            req = urllib.request.Request(self.base_url + "/api/tags")
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                resp.read()
+            return True
+        except Exception:
+            return False
+
     def chat_stream(self, model, messages, on_chunk, cancel_event,
-                    timeout=300, on_metrics=None):
+                    timeout=CHAT_TIMEOUT, on_metrics=None, on_retry=None):
         """Stream one chat turn. Calls on_chunk(text) per delta.
 
         Returns the full reply text. Raises Cancelled if cancel_event is
@@ -268,17 +407,72 @@ class OllamaClient:
         on_metrics (optional) is called once at the end with the turn's
         timing: eval_count and eval_duration_ns from the streamed done
         chunk, plus client-side ttft_s (request start to first content
-        chunk) and total_s. Missing fields are None.
+        chunk) and total_s. Missing fields are None. Both timings span
+        the whole turn, retries included -- that is what the user waited.
+
+        on_retry (optional) is called before each retry with
+        (attempt, delay_seconds, kind): attempt is the attempt that
+        just failed (1-based), kind is "down", "slow", or "error".
+
+        Retry rule: failures BEFORE the first content chunk (connect
+        refused, timeout waiting for the first token, connection cut
+        early) are retried up to CHAT_MAX_ATTEMPTS times, with a pause
+        between attempts that Stop interrupts at once. Once content
+        has streamed, a failure ends the turn: the partial text the
+        caller already received stays, and the turn fails with the
+        slow/busy message -- never retry a half-streamed turn, it
+        would duplicate the partial reply.
+        """
+        started = time.monotonic()
+        for attempt in range(1, CHAT_MAX_ATTEMPTS + 1):
+            if cancel_event is not None and cancel_event.is_set():
+                raise Cancelled()
+            try:
+                return self._chat_attempt(
+                    model, messages, on_chunk, cancel_event,
+                    timeout, started, on_metrics)
+            except _Retryable as exc:
+                if attempt >= CHAT_MAX_ATTEMPTS:
+                    raise self._final_ollama_error(exc)
+                delay = CHAT_RETRY_DELAYS[attempt - 1]
+                if on_retry is not None:
+                    on_retry(attempt, delay, exc.kind)
+                # Interruptible pause: Stop ends the wait at once
+                # instead of sleeping through it.
+                if (cancel_event is not None
+                        and cancel_event.wait(delay)):
+                    raise Cancelled()
+        raise OllamaError(MSG_OLLAMA_DOWN)  # unreachable
+
+    def _final_ollama_error(self, retryable):
+        """The plain error for a turn that exhausted its retries.
+
+        A fresh probe decides the message: Ollama answering now means
+        it was slow or busy, not down -- never call a slow Ollama
+        "not running". Only a probe that fails too earns the down
+        message."""
+        if self.probe():
+            return OllamaError(MSG_OLLAMA_SLOW)
+        return OllamaError(MSG_OLLAMA_DOWN)
+
+    def _chat_attempt(self, model, messages, on_chunk, cancel_event,
+                      timeout, started, on_metrics):
+        """One try at a chat turn. Returns the full reply text.
+
+        Raises Cancelled, OllamaError (model failure, or a mid-stream
+        failure after content already streamed), or _Retryable (a
+        failure before any content streamed -- safe to try again).
         """
         body = json.dumps(
             {"model": model, "messages": messages, "stream": True}).encode("utf-8")
         req = urllib.request.Request(
             self.base_url + "/api/chat", data=body,
             headers={"Content-Type": "application/json"}, method="POST")
-        started = time.monotonic()
         try:
             resp = urllib.request.urlopen(req, timeout=timeout)
         except urllib.error.HTTPError as exc:
+            # Ollama answered with a status: it is up, and a missing
+            # model will not fix itself by retrying.
             try:
                 detail = json.loads(exc.read().decode("utf-8")).get("error", "")
             except Exception:
@@ -286,8 +480,8 @@ class OllamaClient:
             if "not found" in detail.lower() or "model" in detail.lower():
                 raise OllamaError(MSG_MODEL_FAILED)
             raise OllamaError(MSG_MODEL_FAILED)
-        except Exception:
-            raise OllamaError(MSG_OLLAMA_DOWN)
+        except Exception as exc:
+            raise _Retryable(exc, _ollama_failure_kind(exc))
         full = []
         ttft = None
         final = {}
@@ -295,7 +489,14 @@ class OllamaClient:
             while True:
                 if cancel_event is not None and cancel_event.is_set():
                     raise Cancelled()
-                line = resp.readline()
+                try:
+                    line = resp.readline()
+                except Exception as exc:
+                    if full:
+                        # Content already streamed: keep the partial
+                        # text, fail the turn, never retry.
+                        raise OllamaError(MSG_OLLAMA_SLOW)
+                    raise _Retryable(exc, _ollama_failure_kind(exc))
                 if not line:
                     break
                 line = line.strip()
@@ -339,6 +540,108 @@ class OllamaClient:
                 return parse_ps_payload(json.loads(resp.read().decode("utf-8")))
         except Exception:
             raise OllamaError(MSG_OLLAMA_DOWN)
+
+
+class OllamaServerManager:
+    """Starts `ollama serve` from inside DUO and cleans it up.
+
+    Only ever manages a server DUO itself started: the process handle
+    is tracked here, and stop() terminates just that process. A server
+    the user started themselves is never touched.
+
+    start() is blocking (it waits for the probe, up to ``timeout``
+    seconds) -- call it off the GUI thread. It returns (ok, message):
+    ok is True with "Ollama is running." on success, False with a
+    plain-language reason otherwise.
+    """
+
+    START_TIMEOUT = 15.0
+    PROBE_INTERVAL = 0.5
+
+    def __init__(self, client):
+        self.client = client
+        self._process = None
+        self._lock = threading.Lock()
+
+    @property
+    def running(self):
+        """True while a DUO-started server process is alive."""
+        with self._lock:
+            return self._process is not None and self._process.poll() is None
+
+    def start(self, timeout=None):
+        """Start Ollama if it is not already answering.
+
+        Already running (by anyone) counts as success -- nothing is
+        spawned. Returns (ok, message); never raises.
+        """
+        if timeout is None:
+            timeout = self.START_TIMEOUT
+        try:
+            if self.client.probe():
+                return True, "Ollama is running."
+        except Exception:
+            pass
+        if shutil.which("ollama") is None:
+            return False, MSG_OLLAMA_NOT_INSTALLED
+        with self._lock:
+            process = self._process
+        if process is not None and process.poll() is None:
+            # A previous start is still coming up: wait on it instead
+            # of spawning a second server and orphaning the first.
+            pass
+        else:
+            try:
+                process = subprocess.Popen(
+                    ["ollama", "serve"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    stdin=subprocess.DEVNULL, start_new_session=True)
+            except OSError:
+                return False, MSG_OLLAMA_START_FAILED
+            with self._lock:
+                self._process = process
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                if self.client.probe(timeout=2):
+                    return True, "Ollama is running."
+            except Exception:
+                pass
+            if process.poll() is not None:
+                # The server died on its own (already running under
+                # another user, bad install, ...): one last probe in
+                # case another server is actually answering.
+                try:
+                    if self.client.probe(timeout=2):
+                        return True, "Ollama is running."
+                except Exception:
+                    pass
+                with self._lock:
+                    self._process = None
+                return False, MSG_OLLAMA_START_FAILED
+            time.sleep(self.PROBE_INTERVAL)
+        return False, MSG_OLLAMA_START_FAILED
+
+    def stop(self):
+        """Stop the server DUO started, if it is still running.
+
+        Terminates only DUO's own process; a server started any other
+        way is left alone. Never raises."""
+        with self._lock:
+            process = self._process
+            self._process = None
+        if process is None:
+            return
+        try:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
+        except Exception:
+            pass
 
 
 class ChatSide:
@@ -593,6 +896,13 @@ def default_full_filename(today=None):
     "duo-full-2026-11-12.txt"."""
     day = (today or datetime.date.today()).strftime("%Y-%m-%d")
     return "duo-full-%s.txt" % day
+
+
+def default_debug_filename(today=None):
+    """Suggested filename for the debug report export, e.g.
+    "duo-debug-report-2026-11-12.txt"."""
+    day = (today or datetime.date.today()).strftime("%Y-%m-%d")
+    return "duo-debug-report-%s.txt" % day
 
 
 def _saved_stamp(when):
@@ -891,6 +1201,7 @@ class _SignalObject:
             idle = Signal()
             models_loaded = Signal(list)
             models_failed = Signal(str)
+            ollama_started = Signal(bool, str)
 
         self._inner = _Obj()
         self.started = self._inner.started
@@ -901,27 +1212,58 @@ class _SignalObject:
         self.idle = self._inner.idle
         self.models_loaded = self._inner.models_loaded
         self.models_failed = self._inner.models_failed
+        self.ollama_started = self._inner.ollama_started
 
 
 class _ModelLoader:
-    """Loads the model list off the GUI thread."""
+    """Loads the model list off the GUI thread.
 
-    def __init__(self, client, signals):
+    on_result (optional) is called in the loader thread with
+    (ok, models_or_message, seconds) -- the debug log uses it to
+    record the probe outcome and its latency.
+    """
+
+    def __init__(self, client, signals, on_result=None):
         from PySide6.QtCore import QThread
 
         class _Thread(QThread):
             def run(self):
+                started = time.monotonic()
                 try:
                     models = client.list_models()
+                    if on_result is not None:
+                        on_result(True, models,
+                                  time.monotonic() - started)
                     try:
                         signals.models_loaded.emit(models)
                     except RuntimeError:
                         pass  # Window gone; nothing left to update.
                 except OllamaError as exc:
+                    if on_result is not None:
+                        on_result(False, str(exc),
+                                  time.monotonic() - started)
                     try:
                         signals.models_failed.emit(str(exc))
                     except RuntimeError:
                         pass  # Window gone; nothing left to update.
+
+        self.thread = _Thread()
+
+
+class _OllamaStarter:
+    """Starts Ollama off the GUI thread (the wait for the probe can
+    take seconds). Emits (ok, message) through signals.ollama_started."""
+
+    def __init__(self, manager, signals):
+        from PySide6.QtCore import QThread
+
+        class _Thread(QThread):
+            def run(self):
+                ok, message = manager.start()
+                try:
+                    signals.ollama_started.emit(ok, message)
+                except RuntimeError:
+                    pass  # Window gone; nothing left to update.
 
         self.thread = _Thread()
 
@@ -932,12 +1274,31 @@ class MainWindow:
     pass
 
 
-def build_window(client=None):
-    """Create the main window. Returns (window, app_state_dict)."""
+def build_window(client=None, logger=None):
+    """Create the main window. Returns (window, app_state_dict).
+
+    ``logger`` is a DebugLogger (tests pass one writing to a temp
+    dir); without one, a logger is created with its log file next
+    to the app (duo-debug.log).
+    """
     from PySide6 import QtCore, QtGui, QtWidgets
     import shiboken6
 
     client = client or OllamaClient()
+    if logger is None:
+        logger = make_debug_logger()
+    # The debug log records events and timings only -- never message
+    # or attached-file contents. That rule is load-bearing: the report
+    # is meant to be emailed, so nothing private may reach the log.
+    ollama_url = getattr(client, "base_url", DEFAULT_OLLAMA_URL)
+    logger.set_setting("ollama_url", ollama_url)
+    if _debug_log is not None:
+        logger.register_service(
+            "ollama",
+            lambda: _debug_log.check_ollama(ollama_url))
+    logger.register_dependency("PySide6-Essentials")
+    logger.action("DUO %s started" % APP_VERSION)
+    ollama_manager = OllamaServerManager(client)
     signals = _Signals()
     convo = Conversation()
 
@@ -1131,6 +1492,8 @@ def build_window(client=None):
     btn_row.addWidget(save_both)
     save_full = QtWidgets.QPushButton("Save full transcript")
     btn_row.addWidget(save_full)
+    debug_btn = QtWidgets.QPushButton("Debug report")
+    btn_row.addWidget(debug_btn)
     d_layout.addLayout(btn_row)
 
     # --- relay row ---------------------------------------------------------
@@ -1231,6 +1594,12 @@ def build_window(client=None):
 
     statusbar = window.statusBar()
     statusbar.showMessage("Loading models...")
+    # Start Ollama lives in the status bar, where the Ollama-down note
+    # appears -- and only shows when Ollama is actually down or
+    # unresponsive, so the window stays uncrowded the rest of the time.
+    start_ollama_btn = QtWidgets.QPushButton("Start Ollama")
+    start_ollama_btn.setVisible(False)
+    statusbar.addPermanentWidget(start_ollama_btn)
 
     state = {"busy": False, "active": set(), "queued": set(), "relay": None,
              # Compare mode: the latest reply per side from a Send to
@@ -1474,12 +1843,22 @@ def build_window(client=None):
             return "%s in RAM" % format_ram(running[model])
         return "not loaded"
 
+    def show_start_ollama(show):
+        """Show the Start Ollama button when Ollama is down or
+        unresponsive, hide it once Ollama is confirmed up again."""
+        start_ollama_btn.setVisible(show)
+
     def make_job_fn(job_id, model, messages, track_stats=True):
         holder = {"metrics": None, "ram": None}
         job_stats[job_id] = holder
 
+        def _on_retry(attempt, delay, kind):
+            logger.warning(
+                "chat retry: model %s, attempt %d failed (%s), "
+                "retrying in %.1fs", model, attempt, kind, delay)
+
         def fn(emit, cancel_event):
-            kwargs = {}
+            kwargs = {"on_retry": _on_retry}
             if track_stats:
                 kwargs["on_metrics"] = (
                     lambda m: holder.update(metrics=m))
@@ -1563,10 +1942,16 @@ def build_window(client=None):
         if session is None:
             return
         session.active = False
+        # Reasons that are full sentences (the Ollama messages) already
+        # end with a period; the status line adds its own, so strip
+        # one to avoid "Try again in a moment..".
+        reason = reason.rstrip(".")
         session.stop_reason = reason
         state["relay"] = None
         state["pending_hop"] = None
         review_frame.setVisible(False)
+        logger.action("relay ended after %d turn(s): %s"
+                      % (session.turns_done, reason))
         # If nothing is still generating or queued (e.g. the relay ended
         # from a review pause, where no job runs), the window is idle
         # again -- no on_idle signal will come to say so.
@@ -1607,6 +1992,7 @@ def build_window(client=None):
             return
         state["task"].active = False
         state["task"] = None
+        logger.action("task ended: %s" % (status_message or "done"))
         if status_message:
             statusbar.showMessage(status_message, 4000)
         refresh_buttons()
@@ -1710,10 +2096,16 @@ def build_window(client=None):
             stats["ram"] = holder.get("ram")
             state["stats"][side] = stats
             refresh_stats_label(side)
+            logger.info(
+                "turn done: side %s, model %s, %d chars, %s"
+                % (side, convo.sides[side].model, len(text),
+                   format_stats_line(stats)))
         session = state.get("relay")
         task = state.get("task")
         if session is not None and session.active:
             session.turns_done += 1
+            logger.info("relay turn %d/%d done on side %s"
+                        % (session.turns_done, session.turn_cap, side))
             reason = session.check_stop(text)
             if reason is not None:
                 end_relay(reason, note_side=side)
@@ -1744,12 +2136,21 @@ def build_window(client=None):
             state["summarizing"] = None
             append_note(side, "(Summarize failed: %s)" % message)
             set_status(side, "Idle")
+            logger.error("summarize failed: side %s: %s" % (side, message))
             refresh_buttons()
             return
         finish_reply(side)
         append_note(side, "(%s)" % message)
         state["active"].discard(side)
         set_status(side, "Idle")
+        logger.error("turn failed: side %s, model %s: %s"
+                     % (side, convo.sides[side].model, message))
+        # Ollama down or unresponsive: offer the Start Ollama button.
+        # A slow Ollama gets the offer too -- restarting it is the
+        # sensible remedy for both, and the button reports its own
+        # outcome honestly.
+        if message in (MSG_OLLAMA_DOWN, MSG_OLLAMA_SLOW):
+            show_start_ollama(True)
         if state.get("relay") is not None:
             end_relay(message)
         if state.get("task") is not None:
@@ -1943,6 +2344,29 @@ def build_window(client=None):
             format_full_transcript(state["full_log"]),
             default_full_filename())
 
+    # --- debug report ------------------------------------------------------
+    def do_debug_report():
+        """Write the debug report to a file the user picks: app
+        version, Ollama status, the session log, and recent errors.
+        The report never holds message or attached-file contents, so
+        it is safe to email. Cancelling writes nothing."""
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            window, "Save debug report", default_debug_filename(),
+            "Text files (*.txt)")
+        if not path:
+            return
+        try:
+            written = logger.generate_report(path)
+        except OSError as exc:
+            reason = exc.strerror or str(exc)
+            statusbar.showMessage(
+                "Couldn't save to %s: %s" % (path, reason), 5000)
+            return
+        logger.action("debug report written to %s" % written)
+        statusbar.showMessage("Debug report saved to %s" % written, 5000)
+
+    debug_btn.clicked.connect(do_debug_report)
+
     attach_btn.clicked.connect(on_attach_clicked)
 
     # --- sends ------------------------------------------------------------
@@ -1981,6 +2405,9 @@ def build_window(client=None):
             refresh_history_list(side)
             state["queued"].add(side)
             set_status(side, "Queued...")
+            logger.action(
+                "send to %s: model %s, message %d chars, %d attachment(s)"
+                % (side, side_obj.model, len(text), len(attachments)))
             runner.submit(side, make_job_fn(
                 side, side_obj.model, side_obj.messages_for_model()))
         refresh_buttons()
@@ -2051,6 +2478,11 @@ def build_window(client=None):
         attachments = list(state["attachments"])
         full = build_attached_message(
             [(a["name"], a["text"]) for a in attachments], text)
+        logger.action(
+            "relay started: start %s, cap %d, mode %s, seed %d chars, "
+            "%d attachment(s)"
+            % (start_side, session.turn_cap, session.mode, len(text),
+               len(attachments)))
         display = None
         if attachments:
             display = "%s\n%s" % (
@@ -2128,6 +2560,9 @@ def build_window(client=None):
         state["compare"] = {}
         state["compare_round"] = False
         state["task"] = TaskSession(worker, follow_up)
+        logger.action(
+            "task started: worker %s, follow-up %s, task %d chars"
+            % (worker, follow_up, len(text)))
         # Attachments never ride on tasks -- tasks are text-only, and
         # the attached files stay put for the next normal send.
         task_edit.clear()
@@ -2424,12 +2859,15 @@ def build_window(client=None):
         else:
             statusbar.showMessage(
                 "Ollama connected but no models found. Pull a model first.")
+        show_start_ollama(False)
         refresh_buttons()
 
     def on_models_failed(message):
         if not alive():
             return
         statusbar.showMessage(message)
+        if message in (MSG_OLLAMA_DOWN, MSG_OLLAMA_SLOW):
+            show_start_ollama(True)
         refresh_buttons()
 
     signals.models_loaded.connect(populate_models)
@@ -2437,13 +2875,53 @@ def build_window(client=None):
 
     loaders = []
 
+    def _on_probe_result(ok, models_or_message, seconds):
+        """Log the model-list probe: up/down plus its latency."""
+        if ok:
+            logger.info("Ollama probe: up, %d model(s), %.2fs"
+                        % (len(models_or_message), seconds))
+        else:
+            logger.warning("Ollama probe: down (%.2fs): %s"
+                           % (seconds, models_or_message))
+
     def load_models():
         statusbar.showMessage("Loading models...")
-        loader = _ModelLoader(client, signals)
+        loader = _ModelLoader(client, signals, on_result=_on_probe_result)
         loaders.append(loader)
         loader.thread.finished.connect(
             lambda: loaders.remove(loader) if loader in loaders else None)
         loader.thread.start()
+
+    # --- Start Ollama ------------------------------------------------------
+    starters = []
+
+    def do_start_ollama():
+        """Start Ollama from inside DUO (off the GUI thread -- the
+        wait for the probe can take seconds)."""
+        logger.action("Start Ollama pressed")
+        start_ollama_btn.setEnabled(False)
+        statusbar.showMessage("Starting Ollama...")
+        starter = _OllamaStarter(ollama_manager, signals)
+        starters.append(starter)
+        starter.thread.finished.connect(
+            lambda: starters.remove(starter) if starter in starters else None)
+        starter.thread.start()
+
+    def on_ollama_started(ok, message):
+        if not alive():
+            return
+        start_ollama_btn.setEnabled(True)
+        logger.action("Start Ollama finished: %s" % message)
+        statusbar.showMessage(message, 5000)
+        if ok:
+            show_start_ollama(False)
+            load_models()
+        else:
+            show_start_ollama(True)
+        refresh_buttons()
+
+    signals.ollama_started.connect(on_ollama_started)
+    start_ollama_btn.clicked.connect(do_start_ollama)
 
     for side in ("A", "B"):
         widgets[side]["refresh"].clicked.connect(load_models)
@@ -2480,7 +2958,25 @@ def build_window(client=None):
         "do_save_both": do_save_both,
         "save_full": save_full, "do_save_full": do_save_full,
         "save_text_to_file": save_text_to_file,
+        "debug_btn": debug_btn, "do_debug_report": do_debug_report,
+        "debug_logger": logger,
+        "start_ollama_btn": start_ollama_btn,
+        "ollama_manager": ollama_manager,
+        "do_start_ollama": do_start_ollama,
+        "show_start_ollama": show_start_ollama,
     }
+
+    # Closing the window stops a server DUO itself started -- no orphan
+    # `ollama serve` processes left behind. A server started any other
+    # way is untouched.
+    _orig_close_event = window.closeEvent
+
+    def _on_close(event):
+        ollama_manager.stop()
+        logger.action("DUO closed")
+        _orig_close_event(event)
+
+    window.closeEvent = _on_close
 
     refresh_pair_combo()
     load_models()
@@ -2497,7 +2993,9 @@ def main(argv=None):
             base_url = argv[i + 1]
     from PySide6 import QtWidgets
     app = QtWidgets.QApplication(argv)
-    window = build_window(OllamaClient(base_url))
+    logger = make_debug_logger()
+    logger.install_crash_handler()
+    window = build_window(OllamaClient(base_url), logger=logger)
     window.show()
     return app.exec()
 
