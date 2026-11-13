@@ -1772,9 +1772,18 @@ def build_window(client=None):
             refresh_attach_list()
 
     def clear_attachments():
-        """Drop every attachment (after a send)."""
+        """Drop every attachment (after a send).
+
+        The "Attached: ..." note in the status bar is stale once the
+        files have gone with the message, so clear it too -- but only
+        when files were actually attached, so an unrelated note (a
+        saved pair, say) survives an ordinary send.
+        """
+        had = bool(state["attachments"])
         state["attachments"] = []
         refresh_attach_list()
+        if had:
+            statusbar.clearMessage()
 
     def on_attach_clicked():
         paths, _ = QtWidgets.QFileDialog.getOpenFileNames(

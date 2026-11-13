@@ -8,12 +8,28 @@ Or start a relay: type a seed message, press Start Relay, and the two
 models talk to each other — each reply is handed to the other model,
 one turn at a time, until the turn cap or a stop condition.
 
-This is Item 7 of the project: the shell, the model pickers,
-send-to-A/B/both, the auto-relay loop, the director controls
-(history editing, hop review, instructions, saved pairs, compare
-mode), long-loop support (summarize, budget nudge, per-turn
-speed and RAM readout), file upload, tasks, and transcript
-save/export. The rest comes later.
+Everything in one app:
+
+- **Chat** — two panes, each with its own model picker and
+  conversation; send to A, to B, or to both. One model generates at
+  a time, so the PC never runs two models at once.
+- **Relay** — the two models talk to each other, blind (each thinks
+  it's talking to a person) or aware (they know it's another AI),
+  with a turn cap, stop phrases, stop on agreement, and an option to
+  review each hop before it forwards.
+- **Director controls** — reorder or delete messages in a side's
+  history, per-side instructions, saved model pairs, and compare
+  mode (send to both, pick the better answer, it carries into the
+  other side).
+- **Long loops** — Summarize folds a long conversation into a short
+  summary so it keeps fitting a small model's context, a nudge
+  suggests it when a history gets long, and every turn shows its
+  speed and the model's RAM.
+- **Files** — attach text files to a message and the model reads
+  them with it.
+- **Tasks** — give one model a job and have the other review it or
+  continue it.
+- **Transcripts** — save either side, or both, to a plain text file.
 
 ## What you need
 

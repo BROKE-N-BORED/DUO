@@ -2226,6 +2226,24 @@ class Item5GuiTests(unittest.TestCase):
         self.assertEqual(self.state["state"]["attachments"], [])
         self.assertFalse(self.state["attach_frame"].isVisible())
 
+    def test_status_line_clears_stale_attach_note_after_send(self):
+        # Regression: the "Attached: ..." status note used to linger
+        # after the send even though the attachments had cleared.
+        self._attach(self._write("notes.txt", "AAA"))
+        self.assertIn("Attached: notes.txt.",
+                      self.window.statusBar().currentMessage())
+        self.state["composer"].setPlainText("read this")
+        self.state["send_both"].click()
+        # Assert right after the click, before the 3-second note
+        # timeout could expire and hide the bug.
+        self.app.processEvents()
+        self.assertNotIn("Attached:",
+                         self.window.statusBar().currentMessage())
+        # Let the turn finish so the window closes cleanly.
+        self.assertTrue(self._wait_for(lambda: (
+            len(self.state["convo"].sides["A"].history) >= 2
+            and not self.state["state"]["busy"]), timeout=15))
+
     def test_remove_button_drops_one_file(self):
         self._attach(self._write("a.txt", "AAA"),
                      self._write("b.txt", "BBB"))
