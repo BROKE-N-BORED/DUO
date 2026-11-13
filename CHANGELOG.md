@@ -1,7 +1,17 @@
 # DUO changelog
 
 Every version, newest first. v0.1–v0.17 were built on 2026-11-12;
-v0.18–v0.24 on 2026-11-13.
+v0.18–v0.25 on 2026-11-13.
+
+## v0.25 — 2026-11-13
+
+The code is split into modules. The program used to live in one
+file of 5,165 lines; it now lives in focused modules — one for
+Ollama, one for the conversation model, one for transcripts, one
+for saved files, and so on — with the window and the entry point
+still in dual_chat.py. Nothing you can see changed: same window,
+same features, same files, same behavior. The split only makes
+the code easier to work on next.
 
 ## v0.24 — 2026-11-13
 

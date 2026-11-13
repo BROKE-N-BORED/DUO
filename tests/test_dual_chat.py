@@ -4538,7 +4538,9 @@ class OllamaClientRetryTests(unittest.TestCase):
 
     def setUp(self):
         # Fast backoff in tests; the production pauses are seconds.
-        self._patcher = mock.patch("dual_chat.CHAT_RETRY_DELAYS",
+        # The constant lives in duo_ollama since the v0.25 split --
+        # patch it there, where the client reads it.
+        self._patcher = mock.patch("duo_ollama.CHAT_RETRY_DELAYS",
                                    (0.01, 0.01))
         self._patcher.start()
         self._servers = []
@@ -4603,7 +4605,7 @@ class OllamaClientRetryTests(unittest.TestCase):
     def test_cancel_interrupts_backoff_sleep(self):
         # Long pauses: Stop must end the wait at once, not sleep
         # through it.
-        with mock.patch("dual_chat.CHAT_RETRY_DELAYS", (30.0, 30.0)):
+        with mock.patch("duo_ollama.CHAT_RETRY_DELAYS", (30.0, 30.0)):
             client = OllamaClient("http://127.0.0.1:9")
             event = threading.Event()
             outcome = {}
@@ -6107,7 +6109,7 @@ class FrontDoorTests(unittest.TestCase):
 
     def test_changelog_covers_every_version(self):
         log = self._read("CHANGELOG.md")
-        for version in ["0.%d" % n for n in range(1, 25)]:
+        for version in ["0.%d" % n for n in range(1, 26)]:
             self.assertIn(version, log)
 
     def test_gitignore_covers_runtime_files(self):
@@ -8093,6 +8095,166 @@ class MarkdownGuiTests(unittest.TestCase):
                                   "inside the list")
             block = block.next()
         self.assertTrue(found, "second message block not found")
+
+
+# ---------------------------------------------------------------------------
+# Monolith split tests (v0.25, audit T14)
+# ---------------------------------------------------------------------------
+
+class ModuleSplitTests(unittest.TestCase):
+    """dual_chat.py is split into focused sibling modules. These tests
+    pin the split itself: every module imports standalone, dual_chat
+    re-exports the moved names (the same objects, not copies), and
+    each module's moved code still behaves. The full behavior is
+    covered by the existing tests, which import through dual_chat
+    unchanged."""
+
+    MODULES = ("duo_ollama", "duo_stats", "duo_text", "duo_tasks",
+               "duo_markdown", "duo_model", "duo_transcript",
+               "duo_storage", "duo_runner", "duo_icon")
+
+    def _tree(self):
+        return os.path.dirname(
+            os.path.dirname(os.path.abspath(__file__)))
+
+    def test_each_module_imports_standalone(self):
+        import importlib
+        for name in self.MODULES:
+            module = importlib.import_module(name)
+            self.assertIsNotNone(module, name)
+
+    def test_each_module_file_exists_in_the_tree(self):
+        for name in self.MODULES:
+            path = os.path.join(self._tree(), name + ".py")
+            self.assertTrue(os.path.isfile(path), path)
+
+    def test_dual_chat_is_no_longer_a_monolith(self):
+        # 5,165 lines before the split. If the window genuinely grows
+        # past this, update the bound -- but a jump back toward the
+        # monolith means the split is being undone.
+        path = os.path.join(self._tree(), "dual_chat.py")
+        with open(path, encoding="utf-8") as fh:
+            count = sum(1 for _ in fh)
+        self.assertLess(count, 4000, count)
+
+    def test_reexports_are_the_same_objects(self):
+        import dual_chat
+        import duo_icon
+        import duo_markdown
+        import duo_model
+        import duo_ollama
+        import duo_runner
+        import duo_stats
+        import duo_storage
+        import duo_tasks
+        import duo_text
+        import duo_transcript
+        pairs = [
+            (dual_chat.make_app_icon, duo_icon.make_app_icon),
+            (dual_chat.markdown_to_html, duo_markdown.markdown_to_html),
+            (dual_chat.ChatSide, duo_model.ChatSide),
+            (dual_chat.Conversation, duo_model.Conversation),
+            (dual_chat.NoModelSelected, duo_model.NoModelSelected),
+            (dual_chat.OllamaClient, duo_ollama.OllamaClient),
+            (dual_chat.OllamaError, duo_ollama.OllamaError),
+            (dual_chat.Cancelled, duo_ollama.Cancelled),
+            (dual_chat.CHAT_RETRY_DELAYS, duo_ollama.CHAT_RETRY_DELAYS),
+            (dual_chat.SerialRunner, duo_runner.SerialRunner),
+            (dual_chat.compute_turn_stats, duo_stats.compute_turn_stats),
+            (dual_chat.format_stats_line, duo_stats.format_stats_line),
+            (dual_chat.write_text_atomic, duo_storage.write_text_atomic),
+            (dual_chat.save_pair, duo_storage.save_pair),
+            (dual_chat.ConversationError, duo_storage.ConversationError),
+            (dual_chat.TaskSession, duo_tasks.TaskSession),
+            (dual_chat.phrase_matches, duo_text.phrase_matches),
+            (dual_chat.format_side_transcript,
+             duo_transcript.format_side_transcript),
+            (dual_chat.parse_side_transcript,
+             duo_transcript.parse_side_transcript),
+            (dual_chat.TranscriptError, duo_transcript.TranscriptError),
+        ]
+        for through_dual_chat, original in pairs:
+            self.assertIs(through_dual_chat, original, original)
+
+    def test_moved_code_still_behaves(self):
+        import duo_markdown
+        import duo_model
+        import duo_ollama
+        import duo_stats
+        import duo_storage
+        import duo_tasks
+        import duo_text
+        import duo_transcript
+        # Ollama payload parsing sorts names.
+        self.assertEqual(
+            duo_ollama.parse_tags_payload(
+                {"models": [{"name": "b"}, {"name": "a"}]}),
+            ["a", "b"])
+        # Stats math: 40 tokens over 2s is 20 tok/s.
+        stats = duo_stats.compute_turn_stats(
+            {"eval_count": 40, "eval_duration_ns": 2_000_000_000,
+             "prompt_eval_count": 10, "ttft_s": 0.5, "total_s": 2.5})
+        self.assertEqual(stats["tok_per_sec"], 20.0)
+        self.assertEqual(duo_stats.format_stats_line(None),
+                         duo_stats.STATS_EMPTY_LINE)
+        # Whole-word matching: "agreed" is not "disagreed".
+        self.assertTrue(duo_text.phrase_matches("agreed", "I agreed."))
+        self.assertFalse(
+            duo_text.phrase_matches("agreed", "I disagreed."))
+        self.assertEqual(duo_text.parse_stop_phrases("a, b ,"),
+                         ["a", "b"])
+        # Tasks: "nothing" is always one round.
+        self.assertEqual(
+            duo_tasks.TaskSession("A", "nothing", rounds=5).rounds, 1)
+        # Markdown: bold renders, raw HTML shows as text.
+        self.assertIn("<b>hi</b>",
+                      duo_markdown.markdown_to_html("**hi**"))
+        self.assertIn("&lt;b&gt;",
+                      duo_markdown.markdown_to_html("<b>hi</b>"))
+        # Model: a side holds its history, labels, and display text.
+        side = duo_model.ChatSide("A")
+        side.add_user("hello", display="(short)")
+        self.assertEqual(side.display_text(0), "(short)")
+        self.assertEqual(sorted(duo_model.Conversation().sides),
+                         ["A", "B"])
+        # Transcripts: an empty log exports "No messages yet.", and
+        # a one-message export parses back.
+        self.assertIn("No messages yet.",
+                      duo_transcript.format_full_transcript([]))
+        exported = duo_transcript.format_side_transcript(side)
+        entries = duo_transcript.parse_side_transcript(exported)
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["label"], "You")
+        # Storage: atomic writes replace, presets validate.
+        folder = tempfile.mkdtemp(prefix="duo-split-")
+        try:
+            path = os.path.join(folder, "out.txt")
+            duo_storage.write_text_atomic(path, "one")
+            duo_storage.write_text_atomic(path, "two")
+            with open(path, encoding="utf-8") as fh:
+                self.assertEqual(fh.read(), "two")
+            self.assertFalse(duo_storage.is_valid_preset({}))
+            self.assertFalse(
+                duo_storage.presets_file_corrupt(
+                    os.path.join(folder, "missing.json")))
+        finally:
+            shutil.rmtree(folder, ignore_errors=True)
+
+    def test_serial_runner_still_runs_jobs_in_order(self):
+        import duo_runner
+        done = []
+        finished = threading.Event()
+
+        def on_done(job, text):
+            done.append((job["id"], text))
+            if len(done) == 2:
+                finished.set()
+
+        runner = duo_runner.SerialRunner(on_done=on_done)
+        runner.submit("first", lambda emit, ev: "one")
+        runner.submit("second", lambda emit, ev: "two")
+        self.assertTrue(finished.wait(timeout=10))
+        self.assertEqual(done, [("first", "one"), ("second", "two")])
 
 
 if __name__ == "__main__":
