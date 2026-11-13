@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""DUO (Item 5) - two Ollama models side by side in one desktop window.
+"""DUO (Item 6) - two Ollama models side by side in one desktop window.
 
 Item 1: the shell, the model pickers, and send-to-A/B/both.
 Item 2: the auto-relay AI-to-AI loop. The user types a seed message, picks
@@ -31,8 +31,13 @@ Item 5: file upload. Attach up to 5 text files (100 KB each) to a
   "Attached: ..." tag instead of the full contents. Binary files are
   skipped with a plain note. Attachments are one-shot -- they clear
   after a send, and a relay only carries them on the seed message.
+Item 6: tasks. Hand a job to one model: it answers, and then the
+  other model reviews the result, continues it, or nothing happens
+  -- one round, no loop. The task shows as "You [task]" in the
+  worker's pane and the handoff as "You [task handoff]" in the
+  other pane; the tags never reach the models.
 
-NOT in Item 5 (later items): tasks, export, provider APIs.
+NOT in Item 6 (later items): export, provider APIs.
 """
 
 import json
@@ -83,6 +88,18 @@ SUMMARIZE_PROMPT = (
 # Compare mode: the picked reply is sent to the other side as a user
 # message with this prefix, so the conversation continues from it.
 COMPARE_PREFIX = "You picked this answer: %s"
+
+# Tasks (Item 6): one round of delegation. The worker gets the bare
+# task text; the other side gets the worker's full reply framed for
+# review or continuation. "Nothing" means no second call.
+TASK_REVIEW_TEMPLATE = (
+    "Here is the result of a task. Review it and say what is good, "
+    "what is wrong, and what you would change:\n\n%s")
+TASK_CONTINUE_TEMPLATE = "Continue this work from where it left off:\n\n%s"
+TASK_FOLLOW_UPS = ("review", "continue", "nothing")
+MSG_TASK_EMPTY = "Describe the task first."
+MSG_TASK_NEEDS_WORKER = "Pick which model does the task."
+MSG_TASK_NEEDS_FOLLOW_UP = "Pick what the other model does with the result."
 
 MSG_PAIR_NEEDS_NAME = "Name the pair first."
 MSG_REVIEW_EMPTY = "Nothing to forward -- edit the text or skip this hop."
@@ -616,6 +633,45 @@ class RelaySession:
             self.hop_from, self.current_side)
 
 
+class TaskSession:
+    """One task run: the worker side, the follow-up, and the phase.
+
+    Pure logic, no Qt -- the GUI drives it from the runner callbacks.
+    A task is exactly one round: the worker answers, then (unless the
+    follow-up is "nothing") the other side reviews or continues the
+    result. No loop -- the relay covers loops.
+    """
+
+    def __init__(self, worker, follow_up):
+        self.worker = worker  # "A" or "B"
+        self.follow_up = follow_up  # "review", "continue", "nothing"
+        self.phase = "worker"  # "worker" -> "followup" -> done
+        self.active = True
+
+    @property
+    def other(self):
+        return "B" if self.worker == "A" else "A"
+
+    def frame(self, result):
+        """The message the other model receives for the worker's reply,
+        or None when the follow-up is "nothing" (no second call)."""
+        if self.follow_up == "review":
+            return TASK_REVIEW_TEMPLATE % result
+        if self.follow_up == "continue":
+            return TASK_CONTINUE_TEMPLATE % result
+        return None
+
+    def handoff_note(self):
+        """The short note shown in the window for the handoff entry --
+        the transcript stays readable instead of repeating the full
+        framed result."""
+        if self.follow_up == "review":
+            return "Task result from Model %s, for review." % self.worker
+        if self.follow_up == "continue":
+            return "Task result from Model %s, to continue." % self.worker
+        return "Task result from Model %s." % self.worker
+
+
 class SerialRunner:
     """Runs generation jobs strictly one at a time, in submit order.
 
@@ -685,6 +741,13 @@ class SerialRunner:
                     with self._cancel_lock:
                         self._current_id = None
                         self._current_event = None
+                        # A cancel that landed while this job ran must
+                        # not poison the next job with the same id: the
+                        # entry was for THIS job, and no other job with
+                        # this id can be queued while it runs (the GUI
+                        # submits a side's next job only after the
+                        # previous one finishes).
+                        self._cancelled.discard(job_id)
             self._queue.task_done()
             if self._queue.empty():
                 self.on_idle()
@@ -994,6 +1057,33 @@ def build_window(client=None):
     pair_row.addWidget(pair_save)
     d_layout.addLayout(pair_row)
 
+    # --- task row ---------------------------------------------------------
+    # Tasks (Item 6): hand a job to one model, and optionally have the
+    # other model review or continue the result. Nothing pre-selected.
+    task_edit = QtWidgets.QPlainTextEdit()
+    task_edit.setPlaceholderText("Describe a task for one model...")
+    task_edit.setFixedHeight(44)
+    d_layout.addWidget(task_edit)
+
+    task_row = QtWidgets.QHBoxLayout()
+    task_row.addWidget(QtWidgets.QLabel("Task:"))
+    task_worker = QtWidgets.QComboBox()
+    task_worker.addItems(["Model A", "Model B"])
+    task_worker.setPlaceholderText("Who does it")
+    task_worker.setCurrentIndex(-1)
+    task_row.addWidget(task_worker)
+    task_row.addWidget(QtWidgets.QLabel("Then the other side:"))
+    task_follow_up = QtWidgets.QComboBox()
+    task_follow_up.addItems(["Review it", "Continue it", "Nothing"])
+    task_follow_up.setPlaceholderText("What next")
+    task_follow_up.setCurrentIndex(-1)
+    task_row.addWidget(task_follow_up)
+    task_run = QtWidgets.QPushButton("Run Task")
+    task_run.setEnabled(False)
+    task_row.addWidget(task_run)
+    task_row.addStretch(1)
+    d_layout.addLayout(task_row)
+
     # --- hop review (shown only while a relay waits on a review) ----------
     review_frame = QtWidgets.QFrame()
     review_frame.setFrameShape(QtWidgets.QFrame.StyledPanel)
@@ -1037,7 +1127,9 @@ def build_window(client=None):
              "stats": {"A": None, "B": None}, "summarizing": None,
              # Attachments waiting for the next send: [{"name", "text"}].
              # One-shot -- they clear after a send.
-             "attachments": []}
+             "attachments": [],
+             # The task in flight (a TaskSession), or None.
+             "task": None}
 
     # --- helpers ----------------------------------------------------------
     def scroll_to_end(transcript):
@@ -1125,6 +1217,17 @@ def build_window(client=None):
         pair_combo.setEnabled(pairs_idle)
         pair_name.setEnabled(pairs_idle)
         pair_save.setEnabled(pairs_idle)
+        # Run Task: idle only, and only once the task text and both
+        # pickers are set. Nothing is pre-selected, ever. The task
+        # setup itself can't change mid-task.
+        task_active = state.get("task") is not None
+        task_ready = (not busy and not relay_active and not task_active
+                      and bool(task_edit.toPlainText().strip())
+                      and task_worker.currentIndex() >= 0
+                      and task_follow_up.currentIndex() >= 0)
+        task_run.setEnabled(task_ready)
+        for widget in (task_edit, task_worker, task_follow_up):
+            widget.setEnabled(not task_active)
         compare_ready = (not busy and not relay_active
                          and len(state.get("compare", {})) == 2)
         for side in ("A", "B"):
@@ -1305,6 +1408,42 @@ def build_window(client=None):
             next_side, convo.sides[next_side].model,
             convo.sides[next_side].messages_for_model()))
 
+    def end_task(status_message=None):
+        """End the active task. The statusbar says how it ended."""
+        if state.get("task") is None:
+            return
+        state["task"].active = False
+        state["task"] = None
+        if status_message:
+            statusbar.showMessage(status_message, 4000)
+        refresh_buttons()
+
+    def forward_task_result(session, result):
+        """Hand the worker's reply to the other side and start its turn.
+
+        ``result`` is framed for review or continuation; the window
+        shows a short handoff note, and the framed text is what the
+        other model receives. Returns False when the follow-up is
+        "nothing" (no second call).
+        """
+        framed = session.frame(result)
+        if framed is None:
+            return False
+        other = session.other
+        convo.sides[other].add_user(
+            framed, label="You [task handoff]",
+            display=session.handoff_note())
+        append_text(other, "You [task handoff]: %s\n"
+                    % session.handoff_note())
+        refresh_history_list(other)
+        session.phase = "followup"
+        state["queued"].add(other)
+        set_status(other, "Queued...")
+        runner.submit(other, make_job_fn(
+            other, convo.sides[other].model,
+            convo.sides[other].messages_for_model()))
+        return True
+
     def pause_for_review(session, from_side, reply_text):
         """Park the relay on a hop for the user to review and edit.
 
@@ -1377,6 +1516,7 @@ def build_window(client=None):
             state["stats"][side] = stats
             refresh_stats_label(side)
         session = state.get("relay")
+        task = state.get("task")
         if session is not None and session.active:
             session.turns_done += 1
             reason = session.check_stop(text)
@@ -1386,6 +1526,15 @@ def build_window(client=None):
                 pause_for_review(session, side, text)
             else:
                 forward_hop(session, side, session.frame(text, side))
+        elif task is not None and task.active:
+            if task.phase == "worker":
+                # Hand the result to the other side -- unless the
+                # follow-up is "nothing", which ends the task here.
+                if not forward_task_result(task, text):
+                    end_task("Task done.")
+            else:
+                # The follow-up turn is done: the task is over.
+                end_task("Task done.")
         elif state.get("compare_round"):
             # A Send to Both round: remember this side's reply so the
             # "Use this" buttons can offer it once both sides land.
@@ -1408,6 +1557,8 @@ def build_window(client=None):
         set_status(side, "Idle")
         if state.get("relay") is not None:
             end_relay(message)
+        if state.get("task") is not None:
+            end_task("Task failed: %s" % message)
         refresh_buttons()
 
     def on_cancelled(job_id):
@@ -1428,6 +1579,8 @@ def build_window(client=None):
         set_status(side, "Idle")
         if state.get("relay") is not None:
             end_relay(MSG_RELAY_STOPPED_BY_YOU)
+        if state.get("task") is not None:
+            end_task("Task stopped.")
         refresh_buttons()
 
     def on_idle():
@@ -1437,6 +1590,11 @@ def build_window(client=None):
         # GUI processes before this idle signal -- but the runner may
         # still report idle between hops. Stay busy while a relay runs.
         if state.get("relay") is not None:
+            refresh_buttons()
+            return
+        # Same for a task: the follow-up job is submitted from the
+        # done handler, so idle can fire between the two turns.
+        if state.get("task") is not None:
             refresh_buttons()
             return
         state["busy"] = False
@@ -1674,6 +1832,58 @@ def build_window(client=None):
             do_start_relay()
 
     relay_btn.clicked.connect(on_relay_button)
+
+    # --- tasks ------------------------------------------------------------
+    def do_run_task():
+        """Run one task: the worker answers, then the other side
+        reviews or continues the result (or nothing, if picked). One
+        round only -- the relay covers loops."""
+        if (state["busy"] or state.get("relay") is not None
+                or state.get("task") is not None):
+            return
+        text = task_edit.toPlainText().strip()
+        if not text:
+            statusbar.showMessage(MSG_TASK_EMPTY, 3000)
+            return
+        if task_worker.currentIndex() < 0:
+            statusbar.showMessage(MSG_TASK_NEEDS_WORKER, 3000)
+            return
+        if task_follow_up.currentIndex() < 0:
+            statusbar.showMessage(MSG_TASK_NEEDS_FOLLOW_UP, 3000)
+            return
+        worker = "A" if task_worker.currentIndex() == 0 else "B"
+        follow_up = TASK_FOLLOW_UPS[task_follow_up.currentIndex()]
+        worker_obj = convo.sides[worker]
+        if worker_obj.model is None:
+            statusbar.showMessage(
+                MSG_NO_MODEL.format(side="Model " + worker), 4000)
+            return
+        other = RelaySession.other(worker)
+        if follow_up != "nothing" and convo.sides[other].model is None:
+            statusbar.showMessage(
+                MSG_NO_MODEL.format(side="Model " + other), 4000)
+            return
+        state["busy"] = True
+        # A task is not a compare round: the offer is spent.
+        state["compare"] = {}
+        state["compare_round"] = False
+        state["task"] = TaskSession(worker, follow_up)
+        # Attachments never ride on tasks -- tasks are text-only, and
+        # the attached files stay put for the next normal send.
+        task_edit.clear()
+        worker_obj.add_user(text, label="You [task]")
+        append_text(worker, "You [task]: %s\n" % text)
+        refresh_history_list(worker)
+        state["queued"].add(worker)
+        set_status(worker, "Queued...")
+        runner.submit(worker, make_job_fn(
+            worker, worker_obj.model, worker_obj.messages_for_model()))
+        refresh_buttons()
+
+    task_run.clicked.connect(do_run_task)
+    task_edit.textChanged.connect(refresh_buttons)
+    task_worker.currentIndexChanged.connect(refresh_buttons)
+    task_follow_up.currentIndexChanged.connect(refresh_buttons)
 
     # --- hop review --------------------------------------------------------
     def on_review_forward():
@@ -1991,6 +2201,9 @@ def build_window(client=None):
         "attach_note": attach_note, "add_attachments": add_attachments,
         "remove_attachment": remove_attachment,
         "clear_attachments": clear_attachments,
+        "task_edit": task_edit, "task_worker": task_worker,
+        "task_follow_up": task_follow_up, "task_run": task_run,
+        "do_run_task": do_run_task,
     }
 
     refresh_pair_combo()

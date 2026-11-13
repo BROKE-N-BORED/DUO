@@ -8,12 +8,12 @@ Or start a relay: type a seed message, press Start Relay, and the two
 models talk to each other — each reply is handed to the other model,
 one turn at a time, until the turn cap or a stop condition.
 
-This is Item 5 of the project: the shell, the model pickers,
+This is Item 6 of the project: the shell, the model pickers,
 send-to-A/B/both, the auto-relay loop, the director controls
 (history editing, hop review, instructions, saved pairs, compare
 mode), long-loop support (summarize, budget nudge, per-turn
-speed and RAM readout), and file upload. Tasks and the rest
-come later.
+speed and RAM readout), file upload, and tasks. The rest
+comes later.
 
 ## What you need
 
@@ -122,6 +122,27 @@ bash run.sh
   ride with the seed message only, never with the hops.
 - You still need to type a message to send — attachments go with a
   message, they don't replace it.
+
+## Tasks
+
+- Task: describe a job in the task box, pick which model does it,
+  and pick what the other model does with the result — Review it,
+  Continue it, or Nothing — then press Run Task. Nothing is
+  pre-selected; Run Task stays off until all three are set.
+- One round only: the worker answers, then the other side reviews
+  or continues the result. The relay covers loops.
+- Review it sends the worker's full reply to the other model framed
+  as "Here is the result of a task. Review it and say what is good,
+  what is wrong, and what you would change: ...". Continue it frames
+  it as "Continue this work from where it left off: ...". Nothing
+  makes no second call — the task ends after the worker's reply.
+- In your window the task shows as "You [task]: ..." in the
+  worker's pane and the handoff as "You [task handoff]: ..." in the
+  other pane. The tags never reach the models — the worker gets the
+  bare task text.
+- The per-side Stop button cancels a running task. Attachments never
+  ride on tasks — tasks are text-only; attached files stay put for
+  the next normal send.
 
 ## Tests
 

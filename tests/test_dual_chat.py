@@ -1,4 +1,4 @@
-"""Tests for DUO Items 1-5. No real Ollama needed: a fake Ollama HTTP
+"""Tests for DUO Items 1-6. No real Ollama needed: a fake Ollama HTTP
 server (and a fake client for the GUI tests) stands in for the real one.
 
 Run from the project root:  python3 -m unittest discover -s tests -v
@@ -18,10 +18,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from dual_chat import (  # noqa: E402
     AGREEMENT_PHRASES, AWARE_TEMPLATE, COMPARE_PREFIX, MAX_ATTACHMENTS,
-    MAX_ATTACHMENT_BYTES, AttachmentError, Cancelled, ChatSide,
+    MAX_ATTACHMENT_BYTES, TASK_CONTINUE_TEMPLATE, TASK_FOLLOW_UPS,
+    TASK_REVIEW_TEMPLATE, AttachmentError, Cancelled, ChatSide,
     Conversation, HISTORY_BUDGET_CHARS, NoModelSelected, OllamaClient,
     OllamaError, RelaySession, SUMMARY_KEEP_LAST, SUMMARY_LABEL,
-    SUMMARIZE_PROMPT, SerialRunner, attachment_tag,
+    SUMMARIZE_PROMPT, SerialRunner, TaskSession, attachment_tag,
     build_attached_message, compute_turn_stats, format_ram,
     format_stats_line, load_attachment, load_pairs, pairs_path,
     parse_ollama_list_output, parse_ps_payload, parse_stop_phrases,
@@ -276,6 +277,51 @@ class RelaySessionTests(unittest.TestCase):
                          "Relay on: turn 3/10, A to B")
 
 
+class TaskSessionTests(unittest.TestCase):
+    def test_defaults(self):
+        session = TaskSession("A", "review")
+        self.assertEqual(session.worker, "A")
+        self.assertEqual(session.follow_up, "review")
+        self.assertEqual(session.phase, "worker")
+        self.assertTrue(session.active)
+        self.assertEqual(session.other, "B")
+
+    def test_other_side(self):
+        self.assertEqual(TaskSession("B", "nothing").other, "A")
+
+    def test_frame_review_exact(self):
+        session = TaskSession("A", "review")
+        self.assertEqual(
+            session.frame("The draft is done."),
+            "Here is the result of a task. Review it and say what is "
+            "good, what is wrong, and what you would change:\n\n"
+            "The draft is done.")
+        # The template constant is the source of truth.
+        self.assertEqual(session.frame("X"), TASK_REVIEW_TEMPLATE % "X")
+
+    def test_frame_continue_exact(self):
+        session = TaskSession("B", "continue")
+        self.assertEqual(
+            session.frame("Part one done."),
+            "Continue this work from where it left off:\n\n"
+            "Part one done.")
+        self.assertEqual(session.frame("X"), TASK_CONTINUE_TEMPLATE % "X")
+
+    def test_frame_nothing_is_none(self):
+        self.assertIsNone(TaskSession("A", "nothing").frame("anything"))
+
+    def test_follow_up_names(self):
+        self.assertEqual(TASK_FOLLOW_UPS, ("review", "continue", "nothing"))
+
+    def test_handoff_note(self):
+        self.assertEqual(
+            TaskSession("A", "review").handoff_note(),
+            "Task result from Model A, for review.")
+        self.assertEqual(
+            TaskSession("B", "continue").handoff_note(),
+            "Task result from Model B, to continue.")
+
+
 # ---------------------------------------------------------------------------
 # Serial runner: one at a time, in order, cancellable
 # ---------------------------------------------------------------------------
@@ -349,6 +395,34 @@ class SerialRunnerTests(unittest.TestCase):
         time.sleep(0.3)
         runner.cancel("A")
         self.assertTrue(done.wait(timeout=5))
+        self.assertEqual(cancelled, ["A"])
+
+    def test_cancel_does_not_poison_next_job_with_same_id(self):
+        # Regression: cancelling a running job used to leave its id in
+        # the cancelled set, so the NEXT job with that id (a new send
+        # to the same side) was instantly cancelled too.
+        cancelled = []
+        finished = []
+        idle = threading.Event()
+
+        def fn(emit, cancel_event):
+            while not cancel_event.is_set():
+                time.sleep(0.01)
+            raise Cancelled()
+
+        runner = SerialRunner(
+            on_done=lambda j, t: finished.append(j["id"]),
+            on_cancelled=lambda j: cancelled.append(j["id"]),
+            on_idle=lambda: idle.set())
+        runner.submit("A", fn)
+        time.sleep(0.3)
+        runner.cancel("A")
+        self.assertTrue(idle.wait(timeout=5))
+        self.assertEqual(cancelled, ["A"])
+        idle.clear()
+        runner.submit("A", lambda emit, ev: "fresh")
+        self.assertTrue(idle.wait(timeout=5))
+        self.assertEqual(finished, ["A"])
         self.assertEqual(cancelled, ["A"])
 
     def test_error_reported_plainly(self):
@@ -2217,6 +2291,261 @@ class Item5GuiTests(unittest.TestCase):
                             for item in items))
         self.assertFalse(any("secret contents here" in item
                              for item in items))
+@unittest.skipUnless(os.environ.get("DUAL_CHAT_GUI_TESTS") == "1",
+                     "GUI tests run with DUAL_CHAT_GUI_TESTS=1")
+class Item6GuiTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        from PySide6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+        cls.client = FakeGuiClient()
+
+    def setUp(self):
+        from dual_chat import build_window
+        self.client.reset()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.pairs_file = os.path.join(self.tmp.name, "duo-pairs.json")
+        self._env = mock.patch.dict(
+            os.environ, {"DUAL_CHAT_PAIRS_FILE": self.pairs_file})
+        self._env.start()
+        self.window = build_window(self.client)
+        self.window.show()
+        self.state = self.window._dual_chat
+        self._wait_for(lambda: self.state["widgets"]["A"]["picker"].count() == 2)
+        self._pick_models()
+
+    def tearDown(self):
+        self.window.close()
+        self._env.stop()
+        self.tmp.cleanup()
+
+    def _wait_for(self, cond, timeout=10.0):
+        from PySide6.QtTest import QTest
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            QTest.qWait(50)
+            if cond():
+                return True
+        return cond()
+
+    def _pick_models(self):
+        self.state["widgets"]["A"]["picker"].setCurrentIndex(0)
+        self.state["widgets"]["B"]["picker"].setCurrentIndex(1)
+        self.app.processEvents()
+
+    def _wait_idle(self, timeout=15):
+        return self._wait_for(
+            lambda: not self.state["state"]["busy"]
+            and self.state["state"]["task"] is None, timeout=timeout)
+
+    def _run_task(self, worker_index, follow_up_index, text):
+        self.state["task_edit"].setPlainText(text)
+        self.state["task_worker"].setCurrentIndex(worker_index)
+        self.state["task_follow_up"].setCurrentIndex(follow_up_index)
+        self.app.processEvents()
+        self.state["task_run"].click()
+
+    def _last_messages_for(self, model):
+        for seen_model, messages in reversed(self.client.messages_seen):
+            if seen_model == model:
+                return messages
+        return None
+
+    def test_run_task_disabled_until_all_picked(self):
+        # Nothing pre-selected: both pickers blank, Run off.
+        self.assertEqual(self.state["task_worker"].currentIndex(), -1)
+        self.assertEqual(self.state["task_follow_up"].currentIndex(), -1)
+        self.assertFalse(self.state["task_run"].isEnabled())
+        # Task text alone is not enough.
+        self.state["task_edit"].setPlainText("Write a draft.")
+        self.app.processEvents()
+        self.assertFalse(self.state["task_run"].isEnabled())
+        # Worker alone is not enough.
+        self.state["task_worker"].setCurrentIndex(0)
+        self.app.processEvents()
+        self.assertFalse(self.state["task_run"].isEnabled())
+        # All three set: Run enables.
+        self.state["task_follow_up"].setCurrentIndex(0)
+        self.app.processEvents()
+        self.assertTrue(self.state["task_run"].isEnabled())
+        # Clearing the text disables it again.
+        self.state["task_edit"].setPlainText("")
+        self.app.processEvents()
+        self.assertFalse(self.state["task_run"].isEnabled())
+
+    def test_worker_receives_bare_task_text(self):
+        self._run_task(0, 2, "Write a draft.")  # A works, Nothing follows
+        self.assertTrue(self._wait_idle())
+        self.assertEqual(self.client.calls, ["fake-a:latest"])
+        self.assertEqual(self.client.messages_seen,
+                         [("fake-a:latest",
+                           [{"role": "user", "content": "Write a draft."}])])
+        # The task box cleared after the run started.
+        self.assertEqual(self.state["task_edit"].toPlainText(), "")
+        self.assertIn("Task done.",
+                      self.window.statusBar().currentMessage())
+
+    def test_nothing_makes_no_second_call_with_b_as_worker(self):
+        self._run_task(1, 2, "Summarize this.")  # B works, Nothing follows
+        self.assertTrue(self._wait_idle())
+        self.assertEqual(self.client.calls, ["fake-b:latest"])
+        self.assertEqual(self._last_messages_for("fake-b:latest"),
+                         [{"role": "user", "content": "Summarize this."}])
+        self.assertIsNone(self._last_messages_for("fake-a:latest"))
+
+    def test_review_receives_exact_framed_result(self):
+        self.client.replies = {"fake-a:latest": ["The draft is done."]}
+        self._run_task(0, 0, "Write a draft.")  # A works, B reviews
+        self.assertTrue(self._wait_idle())
+        self.assertEqual(self.client.calls,
+                         ["fake-a:latest", "fake-b:latest"])
+        self.assertEqual(self._last_messages_for("fake-a:latest"),
+                         [{"role": "user", "content": "Write a draft."}])
+        self.assertEqual(self._last_messages_for("fake-b:latest"),
+                         [{"role": "user", "content": (
+                             "Here is the result of a task. Review it and "
+                             "say what is good, what is wrong, and what "
+                             "you would change:\n\nThe draft is done.")}])
+        # One at a time throughout.
+        self.assertEqual(self.client.max_active, 1)
+
+    def test_continue_receives_exact_framed_result(self):
+        self.client.replies = {"fake-b:latest": ["Part one done."]}
+        self._run_task(1, 1, "Start the story.")  # B works, A continues
+        self.assertTrue(self._wait_idle())
+        self.assertEqual(self.client.calls,
+                         ["fake-b:latest", "fake-a:latest"])
+        self.assertEqual(self._last_messages_for("fake-b:latest"),
+                         [{"role": "user", "content": "Start the story."}])
+        self.assertEqual(self._last_messages_for("fake-a:latest"),
+                         [{"role": "user", "content": (
+                             "Continue this work from where it left off:"
+                             "\n\nPart one done.")}])
+
+    def test_tags_in_window_only(self):
+        self.client.replies = {"fake-a:latest": ["The draft is done."]}
+        self._run_task(0, 0, "Write a draft.")
+        self.assertTrue(self._wait_idle())
+        a_text = self.state["widgets"]["A"]["transcript"].toPlainText()
+        b_text = self.state["widgets"]["B"]["transcript"].toPlainText()
+        self.assertIn("You [task]: Write a draft.", a_text)
+        self.assertIn("You [task handoff]: "
+                      "Task result from Model A, for review.", b_text)
+        # The follow-up reply landed in B's pane as a normal reply.
+        self.assertIn("fake-b:latest: Reply from fake-b:latest.", b_text)
+        # No tag ever reached either model.
+        self.assertNotIn("[task", json.dumps(self.client.messages_seen))
+        self.assertNotIn("[task handoff]",
+                         json.dumps(self.client.messages_seen))
+        # The labels live on the history entries (window-only by design).
+        self.assertEqual(self.state["convo"].sides["A"].labels[0],
+                         "You [task]")
+        self.assertEqual(self.state["convo"].sides["B"].labels[0],
+                         "You [task handoff]")
+
+    def test_run_disabled_mid_generation(self):
+        self.state["task_edit"].setPlainText("Write a draft.")
+        self.state["task_worker"].setCurrentIndex(0)
+        self.state["task_follow_up"].setCurrentIndex(0)
+        self.app.processEvents()
+        self.assertTrue(self.state["task_run"].isEnabled())
+        self.client.delay = 0.5
+        self.client.replies = {"fake-a:latest": ["one two three four five"]}
+        self.state["composer"].setPlainText("slow one")
+        self.state["send_a"].click()
+        self.assertTrue(self._wait_for(
+            lambda: self.state["state"]["busy"], timeout=5))
+        self.assertFalse(self.state["task_run"].isEnabled())
+        self.assertTrue(self._wait_idle())
+        self.assertTrue(self.state["task_run"].isEnabled())
+
+    def test_run_disabled_mid_relay(self):
+        self.state["task_edit"].setPlainText("Write a draft.")
+        self.state["task_worker"].setCurrentIndex(0)
+        self.state["task_follow_up"].setCurrentIndex(0)
+        self.app.processEvents()
+        self.assertTrue(self.state["task_run"].isEnabled())
+        self.state["cap_spin"].setValue(2)
+        self.state["composer"].setPlainText("talk")
+        self.state["relay_btn"].click()
+        self.assertTrue(self._wait_for(
+            lambda: self.state["state"]["busy"], timeout=5))
+        self.assertFalse(self.state["task_run"].isEnabled())
+        self.assertTrue(self._wait_for(
+            lambda: self.state["relay_status"].text().startswith(
+                "Relay stopped"), timeout=15))
+        self.assertTrue(self._wait_idle())
+        self.assertTrue(self.state["task_run"].isEnabled())
+
+    def test_run_disabled_mid_task(self):
+        self.client.delay = 0.5
+        self.client.replies = {"fake-a:latest": ["one two three four five"]}
+        self._run_task(0, 0, "Write a draft.")
+        self.assertTrue(self._wait_for(
+            lambda: self.state["state"]["busy"], timeout=5))
+        # The setup can't change mid-task, and Run stays off.
+        self.assertFalse(self.state["task_run"].isEnabled())
+        self.assertFalse(self.state["task_edit"].isEnabled())
+        self.assertFalse(self.state["task_worker"].isEnabled())
+        self.assertFalse(self.state["task_follow_up"].isEnabled())
+        self.assertTrue(self._wait_idle())
+        self.assertTrue(self.state["task_edit"].isEnabled())
+
+    def test_stop_mid_task_ends_task_cleanly(self):
+        self.client.delay = 0.5
+        self.client.replies = {"fake-a:latest": ["one two three four five"]}
+        self._run_task(0, 0, "Write a draft.")
+        self.assertTrue(self._wait_for(
+            lambda: self.state["state"]["busy"], timeout=5))
+        self.state["widgets"]["A"]["stop"].click()
+        self.assertTrue(self._wait_for(
+            lambda: "Task stopped." in
+            self.window.statusBar().currentMessage(), timeout=10))
+        self.assertTrue(self._wait_idle())
+        self.assertIsNone(self.state["state"]["task"])
+        # No second call: the task ended with the stop.
+        self.assertEqual(self.client.calls, ["fake-a:latest"])
+        # And a normal send still works afterwards.
+        self.client.delay = 0.02
+        self.client.replies = {}
+        self.state["composer"].setPlainText("still here")
+        self.state["send_a"].click()
+        self.assertTrue(self._wait_for(lambda: (
+            "Reply from fake-a:latest." in
+            self.state["widgets"]["A"]["transcript"].toPlainText()
+            and not self.state["state"]["busy"]), timeout=15))
+
+    def test_run_task_needs_a_model(self):
+        # Unpick both models: Run is still offered (text + pickers are
+        # set), but starting reports the missing model plainly.
+        self.state["widgets"]["A"]["picker"].setCurrentIndex(-1)
+        self.state["widgets"]["B"]["picker"].setCurrentIndex(-1)
+        self.app.processEvents()
+        self.state["task_edit"].setPlainText("Write a draft.")
+        self.state["task_worker"].setCurrentIndex(0)
+        self.state["task_follow_up"].setCurrentIndex(0)
+        self.app.processEvents()
+        self.assertTrue(self.state["task_run"].isEnabled())
+        self.state["task_run"].click()
+        self.assertIn("Pick a model for Model A first.",
+                      self.window.statusBar().currentMessage())
+        self.assertEqual(self.client.calls, [])
+        self.assertIsNone(self.state["state"]["task"])
+
+    def test_attachments_do_not_ride_on_tasks(self):
+        path = os.path.join(self.tmp.name, "notes.txt")
+        with open(path, "w") as fh:
+            fh.write("secret file contents")
+        self.assertEqual(self.state["add_attachments"]([path]), 1)
+        self.client.replies = {"fake-a:latest": ["The draft is done."]}
+        self._run_task(0, 0, "Write a draft.")
+        self.assertTrue(self._wait_idle())
+        self.assertNotIn("secret file contents",
+                         json.dumps(self.client.messages_seen))
+        # The attachment is still there for the next normal send.
+        self.assertEqual([att["name"] for att in
+                          self.state["state"]["attachments"]],
+                         ["notes.txt"])
 
 
 if __name__ == "__main__":
