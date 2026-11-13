@@ -260,7 +260,10 @@ bash run.sh
   in time order, each message prefixed with its side ("A -- You: ...",
   "B -- <model>: ..."). Reordering or deleting messages never changes
   the full transcript — it is what actually happened. Clearing a side
-  removes that side from it, since the conversation restarts.
+  removes that side from it, since the conversation restarts. The
+  full transcript keeps the most recent 2,000 messages; if a very
+  long session passes that, the oldest drop off and the saved file
+  says so at the top, so a file never silently loses old messages.
 - The file reads like the window: a header line naming DUO, the model,
   and when it was saved, then each message in order with its labels
   ([relay], [task], [task handoff], the summary entry), one blank

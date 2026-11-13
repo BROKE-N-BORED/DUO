@@ -109,18 +109,52 @@ def format_both_transcript(convo, when=None):
     return "\n\n".join(parts) + "\n"
 
 
-def format_full_transcript(log, when=None):
+def format_full_transcript(log, when=None, trimmed=False):
     """The full transcript: every logged message in arrival order,
     both sides interleaved as the conversation actually happened.
     Each message is prefixed with its side ("A -- You: ...",
     "B -- <model>: ..."), one blank line between messages. An empty
-    log gets the header plus "No messages yet."."""
+    log gets the header plus "No messages yet.". When ``trimmed``
+    is true, a plain note sits right under the header saying
+    earlier messages were dropped -- the saved file never silently
+    loses old messages. The note is export-only: it is not a log
+    entry, and the log is left untouched."""
     header = "DUO transcript -- saved %s" % _saved_stamp(when)
     if not log:
         return header + "\n\nNo messages yet.\n"
     blocks = ["%s -- %s: %s" % (side, label, text)
               for side, label, text in log]
+    if trimmed:
+        blocks.insert(0, FULL_LOG_TRIMMED_NOTE)
     return "\n\n".join([header] + blocks) + "\n"
+
+
+# The full-transcript log is bounded: a long session must not grow
+# it forever. 2,000 entries is far above any real session (a relay
+# at its 50-turn cap adds about 100 entries) and small in RAM --
+# each entry is one short (side, label, text) tuple, so even a log
+# of long replies stays in the low megabytes on an 8 GB machine.
+FULL_LOG_MAX_ENTRIES = 2000
+
+# The note the full-transcript export carries when older entries
+# were trimmed. Export-only: it is not a log entry, and it never
+# appears in the panes or the deck's live view.
+FULL_LOG_TRIMMED_NOTE = (
+    "(Earlier messages were trimmed to keep the log bounded.)")
+
+
+def append_full_log_entry(log, entry):
+    """Append one entry to a full-transcript log, trimming the
+    oldest entries first when the log passes the cap. Every path
+    that adds an entry goes through here (via log_event in the
+    window), so the bound covers sends, relay hops, tasks, notes,
+    and imports alike. Returns True when entries were trimmed."""
+    log.append(entry)
+    over = len(log) - FULL_LOG_MAX_ENTRIES
+    if over <= 0:
+        return False
+    del log[:over]
+    return True
 
 
 class TranscriptError(Exception):

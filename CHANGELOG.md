@@ -1,7 +1,19 @@
 # DUO changelog
 
 Every version, newest first. v0.1–v0.17 were built on 2026-11-12;
-v0.18–v0.26 on 2026-11-13.
+v0.18–v0.27 on 2026-11-13.
+
+## v0.27 — 2026-11-13
+
+The full transcript log is bounded now. It used to grow without
+limit across a long session — every send, relay hop, and task
+appended forever. It now keeps the most recent 2,000 entries and
+drops the oldest first when a session passes that. Nothing you
+can see changes in a normal session: 2,000 is far above any real
+conversation. If a session ever does pass it, the saved full
+transcript says so at the top, so a file never silently loses old
+messages. Your per-pane conversations are untouched — only the
+combined log is capped.
 
 ## v0.26 — 2026-11-13
 

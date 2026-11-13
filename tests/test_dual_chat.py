@@ -26,7 +26,8 @@ from dual_chat import (  # noqa: E402
     AGREEMENT_PHRASES, APP_VERSION, AWARE_TEMPLATE, CHAT_MAX_ATTEMPTS,
     CHAT_RETRY_DELAYS, CHAT_TIMEOUT, COMPARE_PREFIX,
     CONVERSATION_FORMAT_VERSION, DECK_PAGE_HTML,
-    DECK_PORT, MAX_ATTACHMENTS,
+    DECK_PORT, FULL_LOG_MAX_ENTRIES, FULL_LOG_TRIMMED_NOTE,
+    MAX_ATTACHMENTS,
     MAX_ATTACHMENT_BYTES, MSG_EMPTY, MSG_MODEL_FAILED, MSG_OLLAMA_DOWN,
     MSG_OLLAMA_NOT_INSTALLED, MSG_OLLAMA_SLOW, MSG_OLLAMA_START_FAILED,
     MSG_PHONE_BUSY, MSG_PHONE_RELAY, MSG_PHONE_TARGET,
@@ -43,7 +44,8 @@ from dual_chat import (  # noqa: E402
     NoModelSelected,
     OllamaClient, OllamaError, OllamaServerManager, RelaySession,
     SUMMARY_KEEP_LAST, SUMMARY_LABEL, SUMMARIZE_PROMPT, SerialRunner,
-    TaskSession, TranscriptError, attachment_tag, build_attached_message,
+    TaskSession, TranscriptError, append_full_log_entry, attachment_tag,
+    build_attached_message,
     build_deck_state, compute_turn_stats, conversation_to_data,
     data_to_conversation, default_both_filename,
     default_conversation_filename, default_debug_filename,
@@ -3616,6 +3618,74 @@ class FullTranscriptFormatTests(unittest.TestCase):
                          "duo-full-2026-11-12.txt")
 
 
+class FullLogCapTests(unittest.TestCase):
+    """The full-log cap (v0.27, audit T16): the combined
+    chronological log is bounded, oldest first, and the export says
+    so when entries were trimmed."""
+    WHEN = datetime.datetime(2026, 11, 13, 13, 30)
+
+    def _entry(self, n):
+        return ("A", "You", "message %d" % n)
+
+    def test_append_under_cap_never_trims(self):
+        log = []
+        for n in range(FULL_LOG_MAX_ENTRIES):
+            self.assertFalse(append_full_log_entry(log, self._entry(n)))
+        self.assertEqual(len(log), FULL_LOG_MAX_ENTRIES)
+        self.assertEqual(log[0], self._entry(0))
+        self.assertEqual(log[-1], self._entry(FULL_LOG_MAX_ENTRIES - 1))
+
+    def test_append_past_cap_trims_oldest_first(self):
+        log = [self._entry(n) for n in range(FULL_LOG_MAX_ENTRIES)]
+        trimmed = append_full_log_entry(
+            log, self._entry(FULL_LOG_MAX_ENTRIES))
+        self.assertTrue(trimmed)
+        self.assertEqual(len(log), FULL_LOG_MAX_ENTRIES)
+        # The oldest entry is gone; the newest N survive, in order.
+        self.assertEqual(
+            log, [self._entry(n)
+                  for n in range(1, FULL_LOG_MAX_ENTRIES + 1)])
+
+    def test_one_append_trims_a_log_already_over_cap(self):
+        # A log loaded from a file saved by an older version can
+        # start over the cap; the next append pulls it back down.
+        log = [self._entry(n)
+               for n in range(FULL_LOG_MAX_ENTRIES + 50)]
+        self.assertTrue(append_full_log_entry(log, self._entry(99999)))
+        self.assertEqual(len(log), FULL_LOG_MAX_ENTRIES)
+        self.assertEqual(log[0], self._entry(51))
+        self.assertEqual(log[-1], self._entry(99999))
+
+    def test_export_carries_note_only_when_trimmed(self):
+        log = [("A", "You", "hi"), ("B", "fake-b:latest", "hello")]
+        text = format_full_transcript(log, self.WHEN, trimmed=True)
+        blocks = text.split("\n\n")
+        self.assertEqual(
+            blocks[0], "DUO transcript -- saved 2026-11-13 13:30")
+        self.assertEqual(blocks[1], FULL_LOG_TRIMMED_NOTE)
+        self.assertEqual(blocks[2], "A -- You: hi")
+        self.assertEqual(blocks[3], "B -- fake-b:latest: hello\n")
+        plain = format_full_transcript(log, self.WHEN)
+        self.assertNotIn(FULL_LOG_TRIMMED_NOTE, plain)
+
+    def test_export_note_wording(self):
+        self.assertEqual(
+            FULL_LOG_TRIMMED_NOTE,
+            "(Earlier messages were trimmed to keep the log bounded.)")
+
+    def test_export_empty_log_has_no_note_even_when_trimmed(self):
+        self.assertEqual(
+            format_full_transcript([], self.WHEN, trimmed=True),
+            "DUO transcript -- saved 2026-11-13 13:30\n\n"
+            "No messages yet.\n")
+
+    def test_formatting_never_changes_the_log(self):
+        log = [("A", "You", "hi")]
+        before = list(log)
+        format_full_transcript(log, self.WHEN, trimmed=True)
+        self.assertEqual(log, before)
+
+
 class TranscriptImportTests(unittest.TestCase):
     """Transcript import (v0.23, audit T12): parsing a saved
     single-pane transcript back into history entries."""
@@ -4461,6 +4531,199 @@ class Item9GuiTests(unittest.TestCase):
         self.assertTrue(self._wait_for(
             lambda: not self.state["state"]["busy"], timeout=10))
         self.assertTrue(save_full.isEnabled())
+
+
+class FullLogCapGuiTests(unittest.TestCase):
+    """The full-log cap in the window (v0.27, audit T16): trimming
+    through the real append point, the export note, the flag rules
+    for load and clear, and the cap covering sends and imports."""
+    @classmethod
+    def setUpClass(cls):
+        from PySide6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+        cls.client = FakeGuiClient()
+
+    def setUp(self):
+        from dual_chat import build_window
+        self.client.reset()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.pairs_file = os.path.join(self.tmp.name, "duo-pairs.json")
+        self._env = mock.patch.dict(
+            os.environ, {"DUAL_CHAT_PAIRS_FILE": self.pairs_file})
+        self._env.start()
+        self.window = build_window(self.client, logger=TEST_LOGGER)
+        self.window.show()
+        self.state = self.window._dual_chat
+        self._wait_for(lambda: self.state["widgets"]["A"]["picker"].count() == 2)
+        self._pick_models()
+
+    def tearDown(self):
+        self.window.close()
+        self._env.stop()
+        self.tmp.cleanup()
+
+    def _wait_for(self, cond, timeout=10.0):
+        from PySide6.QtTest import QTest
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            QTest.qWait(50)
+            if cond():
+                return True
+        return cond()
+
+    def _pick_models(self):
+        self.state["widgets"]["A"]["picker"].setCurrentIndex(0)
+        self.state["widgets"]["B"]["picker"].setCurrentIndex(1)
+        self.app.processEvents()
+
+    def _send_both_and_wait(self, text):
+        self.state["composer"].setPlainText(text)
+        self.state["send_both"].click()
+        return self._wait_for(lambda: (
+            len(self.state["convo"].sides["A"].messages) >= 2
+            and len(self.state["convo"].sides["B"].messages) >= 2
+            and not self.state["state"]["busy"]), timeout=15)
+
+    def _save_dialog(self, path):
+        from PySide6 import QtWidgets
+        return mock.patch.object(
+            QtWidgets.QFileDialog, "getSaveFileName",
+            return_value=(path, "Text files (*.txt)"))
+
+    def _open_dialog(self, path):
+        from PySide6 import QtWidgets
+        return mock.patch.object(
+            QtWidgets.QFileDialog, "getOpenFileName",
+            return_value=(path, "Text files (*.txt)"))
+
+    def _read(self, path):
+        with open(path, encoding="utf-8") as fh:
+            return fh.read()
+
+    def _trim_via_log_event(self):
+        # Drive the real append point past the real cap: no Qt work
+        # per call, just list appends, so the full loop is fast.
+        # Entries alternate sides, so a one-side clear still leaves
+        # the other side's entries behind.
+        log_event = self.state["log_event"]
+        total = FULL_LOG_MAX_ENTRIES + 5
+        for n in range(total):
+            log_event("A" if n % 2 == 0 else "B",
+                      "You", "message %d" % n)
+        return total
+
+    def test_log_event_trims_at_the_real_cap_and_sets_the_flag(self):
+        total = self._trim_via_log_event()
+        state = self.state["state"]
+        self.assertEqual(len(state["full_log"]), FULL_LOG_MAX_ENTRIES)
+        self.assertTrue(state["full_log_trimmed"])
+        # Oldest first: the first five entries are gone, the rest
+        # survive in order.
+        self.assertEqual(state["full_log"][0],
+                         ("B", "You", "message 5"))
+        self.assertEqual(state["full_log"][-1],
+                         ("A", "You", "message %d" % (total - 1)))
+        # Trimming never touches the per-pane histories.
+        self.assertEqual(self.state["convo"].sides["A"].messages, [])
+        self.assertEqual(self.state["convo"].sides["B"].messages, [])
+
+    def test_export_carries_the_note_after_a_trim(self):
+        self._trim_via_log_event()
+        path = os.path.join(self.tmp.name, "full.txt")
+        with self._save_dialog(path):
+            self.state["save_full"].click()
+        text = self._read(path)
+        blocks = text.split("\n\n")
+        self.assertEqual(blocks[1], FULL_LOG_TRIMMED_NOTE)
+        self.assertNotIn("message 0", text)
+        self.assertIn("message 5", text)
+
+    def test_export_has_no_note_without_a_trim(self):
+        self.assertTrue(self._send_both_and_wait("hello both"))
+        self.assertFalse(self.state["state"]["full_log_trimmed"])
+        path = os.path.join(self.tmp.name, "full.txt")
+        with self._save_dialog(path):
+            self.state["save_full"].click()
+        self.assertNotIn(FULL_LOG_TRIMMED_NOTE, self._read(path))
+
+    def test_sends_trim_when_the_cap_is_small(self):
+        cap = 3
+        with mock.patch("duo_transcript.FULL_LOG_MAX_ENTRIES", cap):
+            self.assertTrue(self._send_both_and_wait("hello both"))
+            state = self.state["state"]
+            self.assertTrue(state["full_log_trimmed"])
+            self.assertEqual(len(state["full_log"]), cap)
+            # Both "You" lines land before either reply, so the
+            # oldest entry -- A's "You" -- is the one that drops.
+            self.assertEqual(
+                state["full_log"],
+                [("B", "You", "hello both"),
+                 ("A", "fake-a:latest", "Reply from fake-a:latest."),
+                 ("B", "fake-b:latest", "Reply from fake-b:latest.")])
+            # Histories are whole: trimming only ever cuts the log.
+            self.assertEqual(
+                [m.content for m in
+                 self.state["convo"].sides["A"].messages],
+                ["hello both", "Reply from fake-a:latest."])
+            self.assertEqual(
+                [m.content for m in
+                 self.state["convo"].sides["B"].messages],
+                ["hello both", "Reply from fake-b:latest."])
+
+    def test_import_goes_through_the_cap(self):
+        cap = 3
+        count = 6
+        text = ("DUO transcript -- Model A (fake-a:latest) -- "
+                "saved 2026-11-13 13:30\n\n"
+                + "\n\n".join("You: imported %d" % n
+                              for n in range(count)) + "\n")
+        path = os.path.join(self.tmp.name, "side-a.txt")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        with mock.patch("duo_transcript.FULL_LOG_MAX_ENTRIES", cap):
+            with self._open_dialog(path):
+                self.state["widgets"]["A"]["import"].click()
+            self.app.processEvents()
+            state = self.state["state"]
+            self.assertTrue(state["full_log_trimmed"])
+            self.assertEqual(len(state["full_log"]), cap)
+            self.assertEqual(
+                state["full_log"],
+                [("A", "You", "imported %d" % n)
+                 for n in range(count - cap, count)])
+            # All six messages landed in the pane; only the log
+            # was capped.
+            self.assertEqual(
+                len(self.state["convo"].sides["A"].messages), count)
+
+    def test_load_resets_the_trimmed_flag(self):
+        self._trim_via_log_event()
+        self.assertTrue(self.state["state"]["full_log_trimmed"])
+        # A small conversation file, written through the real saver.
+        convo = self.state["convo"]
+        path = os.path.join(self.tmp.name, "convo.json")
+        save_conversation_file(path, convo, [("A", "You", "kept")])
+        with self._open_dialog(path):
+            self.state["open_convo"].click()
+        self.app.processEvents()
+        self.assertEqual(self.state["state"]["full_log"],
+                         [("A", "You", "kept")])
+        self.assertFalse(self.state["state"]["full_log_trimmed"])
+
+    def test_clear_keeps_the_flag_until_the_log_is_empty(self):
+        self._trim_via_log_event()
+        state = self.state["state"]
+        self.assertTrue(state["full_log_trimmed"])
+        # The trimmed log holds both sides; clearing one leaves the
+        # other side's entries and the flag.
+        self.state["widgets"]["A"]["clear"].click()
+        self.app.processEvents()
+        self.assertTrue(state["full_log"])
+        self.assertTrue(state["full_log_trimmed"])
+        self.state["widgets"]["B"]["clear"].click()
+        self.app.processEvents()
+        self.assertEqual(state["full_log"], [])
+        self.assertFalse(state["full_log_trimmed"])
 
 
 # ---------------------------------------------------------------------------
@@ -6116,7 +6379,7 @@ class FrontDoorTests(unittest.TestCase):
 
     def test_changelog_covers_every_version(self):
         log = self._read("CHANGELOG.md")
-        for version in ["0.%d" % n for n in range(1, 27)]:
+        for version in ["0.%d" % n for n in range(1, 28)]:
             self.assertIn(version, log)
 
     def test_gitignore_covers_runtime_files(self):

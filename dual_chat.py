@@ -195,8 +195,10 @@ from duo_tasks import (
     TASK_ROUNDS_MIN, TaskSession,)
 from duo_text import parse_stop_phrases, phrase_matches
 from duo_transcript import (
-    TranscriptError, default_both_filename, default_conversation_filename,
-    default_debug_filename, default_full_filename, default_side_filename,
+    FULL_LOG_MAX_ENTRIES, FULL_LOG_TRIMMED_NOTE, TranscriptError,
+    append_full_log_entry, default_both_filename,
+    default_conversation_filename, default_debug_filename,
+    default_full_filename, default_side_filename,
     format_both_transcript, format_full_transcript, format_side_transcript,
     load_side_transcript_file, parse_side_transcript, sanitize_filename_part,)
 
@@ -265,7 +267,7 @@ def make_debug_logger(log_dir=None):
         return _NullLogger()
 
 APP_NAME = "DUO"
-APP_VERSION = "0.26"
+APP_VERSION = "0.27"
 
 # Phone deck (v0.11): DUO serves a small local page for his phone.
 # Fixed port with a fallback chain if it is busy; DUAL_CHAT_DECK_PORT
@@ -1470,8 +1472,18 @@ def build_window(client=None, logger=None, deck_port=None):
              # side's history, in arrival order, as (side, label,
              # display text). Reorder/delete never touch it -- it is
              # what actually happened. Clearing a side removes that
-             # side's entries; summarize leaves it alone.
-             "full_log": []}
+             # side's entries; summarize leaves it alone. The log is
+             # bounded (FULL_LOG_MAX_ENTRIES): the oldest entries
+             # drop off once the cap is passed, oldest first.
+             "full_log": [],
+             # True once the log has been trimmed: the full-transcript
+             # export then says so, so a saved file never silently
+             # loses old messages. Set when a trim actually happens;
+             # cleared when the log is rebuilt (a conversation load --
+             # the loaded log is complete by definition) or emptied
+             # (clearing both sides). Clearing one side leaves it
+             # set: the remaining entries are still a trimmed log.
+             "full_log_trimmed": False}
 
     # --- helpers ----------------------------------------------------------
     # Transcript formats: sender labels are bold, everything else
@@ -1597,8 +1609,13 @@ def build_window(client=None, logger=None, deck_port=None):
     def log_event(side, label, text):
         """Record one message in the shared chronological log (the
         full transcript). Called for every message that lands in a
-        side's history, in arrival order."""
-        state["full_log"].append((side, label, text))
+        side's history, in arrival order. This is the SINGLE append
+        point for the log -- every path that adds an entry goes
+        through here, so the cap in append_full_log_entry covers
+        sends, relay hops, tasks, notes, and imports alike. No other
+        code appends to state["full_log"]."""
+        if append_full_log_entry(state["full_log"], (side, label, text)):
+            state["full_log_trimmed"] = True
 
     def render_transcript(side):
         """Rebuild a pane's transcript from its messages.
@@ -2473,8 +2490,9 @@ def build_window(client=None, logger=None, deck_port=None):
         for entry in entries:
             # Imported content IS the display text: exports carry
             # what the window showed, so content and display agree.
-            state["full_log"].append(
-                (side, entry["label"], entry["content"]))
+            # Through log_event, like every other append: the cap
+            # covers imports too.
+            log_event(side, entry["label"], entry["content"])
         render_transcript(side)
         refresh_history_list(side)
         # A replaced conversation ends any compare offer and strands
@@ -2502,7 +2520,9 @@ def build_window(client=None, logger=None, deck_port=None):
         if state["busy"] or state.get("relay") is not None:
             return
         save_text_to_file(
-            format_full_transcript(state["full_log"]),
+            format_full_transcript(
+                state["full_log"],
+                trimmed=state["full_log_trimmed"]),
             default_full_filename())
 
     # --- conversation save/load (v0.17) -----------------------------------
@@ -2560,6 +2580,9 @@ def build_window(client=None, logger=None, deck_port=None):
             refresh_stats_label(side)
             set_status(side, "Idle")
         state["full_log"] = list(new_log)
+        # The loaded log is complete by definition -- it came from
+        # the file -- so any earlier trimming no longer applies.
+        state["full_log_trimmed"] = False
         # A loaded conversation ends any compare offer: the replies
         # it refers to are gone.
         state["compare"] = {}
@@ -3249,6 +3272,9 @@ def build_window(client=None, logger=None, deck_port=None):
             # leave the full transcript too.
             state["full_log"] = [entry for entry in state["full_log"]
                                  if entry[0] != side]
+            # An emptied log has nothing trimmed left to report.
+            if not state["full_log"]:
+                state["full_log_trimmed"] = False
             refresh_history_list(side)
             # A cleared side ends any compare offer: the pair is broken.
             state["compare"] = {}
@@ -3401,7 +3427,8 @@ def build_window(client=None, logger=None, deck_port=None):
         return holder["error"]
 
     def _deck_get_transcript():
-        return format_full_transcript(list(state["full_log"]))
+        return format_full_transcript(
+            list(state["full_log"]), trimmed=state["full_log_trimmed"])
 
     def on_phone_send(text, target, holder):
         """Runs on the GUI thread: validate + send, then wake the
@@ -3529,6 +3556,7 @@ def build_window(client=None, logger=None, deck_port=None):
         "do_start_ollama": do_start_ollama,
         "show_start_ollama": show_start_ollama,
         "send_message": send_message,
+        "log_event": log_event,
         "phone_btn": phone_btn, "deck_server": deck_server,
         "show_phone_deck": show_phone_deck,
         "on_phone_send": on_phone_send,
