@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""DUO 0.28 - two Ollama models side by side in one desktop window.
+"""DUO 0.29 - two Ollama models side by side in one desktop window.
 
 Item 1: the shell, the model pickers, and send-to-A/B/both.
 Item 2: the auto-relay AI-to-AI loop. The user types a seed message, picks
@@ -145,6 +145,15 @@ v0.28: the update story (audit T17). DUO checks GitHub once at
   A "Check for updates" button runs the same check on demand and
   reports either way. DUO never downloads or installs anything;
   the user downloads from GitHub themselves.
+v0.29: activity lights and a system meter. Each pane has a small
+  colored light and small words saying what that side is doing
+  right now -- grey Idle, amber while it waits (queued, waiting
+  for Ollama to answer, or a relay hop waiting for review), green
+  while it thinks or summarizes, red for a few seconds when a
+  turn fails. And the status bar shows the whole machine's CPU %
+  and RAM, read from /proc once a second (stdlib only, no new
+  dependency); on a machine without /proc the meter stays empty
+  and silent.
 """
 
 import html
@@ -200,8 +209,10 @@ from duo_ollama import (
     parse_version,)
 from duo_runner import SerialRunner
 from duo_stats import (
-    STATS_EMPTY_LINE, compute_turn_stats, format_ram, format_session_line,
-    format_stats_line,)
+    STATS_EMPTY_LINE, compute_turn_stats, cpu_percent_between,
+    format_ram, format_session_line, format_stats_line,
+    format_system_meter, parse_cpu_times, parse_meminfo,
+    read_system_meter,)
 from duo_storage import (
     CONVERSATION_FORMAT_VERSION, ConversationError, conversation_to_data,
     data_to_conversation, delete_pair, delete_preset, is_valid_preset,
@@ -286,7 +297,7 @@ def make_debug_logger(log_dir=None):
         return _NullLogger()
 
 APP_NAME = "DUO"
-APP_VERSION = "0.28"
+APP_VERSION = "0.29"
 
 # Phone deck (v0.11): DUO serves a small local page for his phone.
 # Fixed port with a fallback chain if it is busy; DUAL_CHAT_DECK_PORT
@@ -321,6 +332,28 @@ MSG_PYSIDE6_MISSING = (
     "Then start DUO again with:\n"
     "\n"
     "    bash run.sh\n")
+
+# Per-side activity states (v0.29): state name -> (light color,
+# words). One setter (set_side_state, in build_window) sets the
+# light and the words together, so they can never disagree. Grey
+# is idle; amber is waiting -- queued behind the other side, a job
+# started but no reply yet, or a relay hop parked for review;
+# green is working -- a reply streaming, or a summarize turn; red
+# is a failed turn, held a few seconds so it is seen, then idle.
+SIDE_STATES = {
+    "idle": ("#8a8a8a", "Idle"),
+    "waiting": ("#e8a33d", "Waiting for Ollama…"),
+    "thinking": ("#2fbf5a", "Thinking…"),
+    "summarizing": ("#2fbf5a", "Summarizing…"),
+    "queued": ("#e8a33d", "Queued…"),
+    "review": ("#e8a33d", "Waiting for you to review…"),
+    "error": ("#d64545", "Something went wrong"),
+}
+# How long the red light holds after a failed turn (ms) before the
+# side goes back to idle. A new job starting first overrides it.
+ERROR_STATE_HOLD_MS = 5000
+# System meter (v0.29): how often the status bar re-reads /proc.
+METER_REFRESH_MS = 1000
 
 # Persisted preferences (QSettings): the "Enter to send" tickbox is
 # remembered between runs. Explicit org/app names so the setting
@@ -1201,6 +1234,25 @@ def build_window(client=None, logger=None, deck_port=None):
         stats.setStyleSheet("font-size: 11px;")
         layout.addWidget(stats)
 
+        # Activity row (v0.29): a small colored light and small words
+        # saying what this side is doing right now -- grey Idle,
+        # amber waiting, green thinking, red failed. Both are set
+        # together by set_side_state, the one setter, so the color
+        # and the words always agree. The bottom-row status label
+        # shows the same words (set by the same setter).
+        activity_row = QtWidgets.QHBoxLayout()
+        activity_dot = QtWidgets.QLabel()
+        activity_dot.setFixedSize(12, 12)
+        activity_dot.setStyleSheet(
+            "background-color: %s; border-radius: 6px;"
+            % SIDE_STATES["idle"][0])
+        activity_row.addWidget(activity_dot)
+        activity_label = QtWidgets.QLabel(SIDE_STATES["idle"][1])
+        activity_label.setStyleSheet("font-size: 11px;")
+        activity_row.addWidget(activity_label)
+        activity_row.addStretch(1)
+        layout.addLayout(activity_row)
+
         # Session token total: every token this side has generated
         # or been prompted with since the app started. Clear never
         # resets it -- only restarting the app does.
@@ -1277,6 +1329,7 @@ def build_window(client=None, logger=None, deck_port=None):
             "hist_up": hist_up, "hist_down": hist_down,
             "hist_delete": hist_delete,
             "stats": stats, "session_tokens": session_tokens,
+            "activity_dot": activity_dot, "activity": activity_label,
             "nudge": nudge, "summarize": summarize_btn,
             "reply_open": False,
             # Document position where the streaming reply's body
@@ -1505,6 +1558,30 @@ def build_window(client=None, logger=None, deck_port=None):
     start_ollama_btn = QtWidgets.QPushButton("Start Ollama")
     start_ollama_btn.setVisible(False)
     statusbar.addPermanentWidget(start_ollama_btn)
+
+    # System meter (v0.29): the whole machine's CPU % and RAM in the
+    # status bar, re-read from /proc once a second. Two small file
+    # reads a second -- cheap -- and the timer is parented to the
+    # window, so it stops when the window closes. When /proc is
+    # unreadable the label stays empty: fail silent, never a note.
+    meter_label = QtWidgets.QLabel("")
+    meter_label.setStyleSheet("font-size: 11px;")
+    statusbar.addPermanentWidget(meter_label)
+    meter_prev = {"cpu": None}
+
+    def refresh_meter():
+        cpu_pct, used, total, prev = read_system_meter(
+            meter_prev["cpu"])
+        meter_prev["cpu"] = prev
+        meter_label.setText(
+            format_system_meter(cpu_pct, used, total))
+
+    meter_timer = QtCore.QTimer(window)
+    meter_timer.setInterval(METER_REFRESH_MS)
+    meter_timer.timeout.connect(refresh_meter)
+    meter_timer.start()
+    refresh_meter()  # First read now: RAM shows at once, CPU needs
+    # the second read (a % is a delta between two samples).
 
     state = {"busy": False, "active": set(), "queued": set(), "relay": None,
              # Compare mode: the latest reply per side from a Send to
@@ -1932,8 +2009,50 @@ def build_window(client=None, logger=None, deck_port=None):
                 > HISTORY_BUDGET_CHARS)
             refresh_history_buttons(side)
 
-    def set_status(side, text):
+    # Current activity state per side ("idle" until something
+    # happens). The one source of truth for the light and the words.
+    side_state = {"A": "idle", "B": "idle"}
+
+    def set_side_state(side, new_state):
+        """Set a side's activity state -- light, activity words, and
+        the bottom-row status label, all together, from SIDE_STATES.
+        The single setter: every path that moves a side in or out of
+        a busy state goes through here, so the light can never get
+        stuck showing the wrong thing. A no-op when the state is
+        unchanged (on_chunk fires per word). An "error" state holds
+        for a few seconds so the failure is seen, then falls back to
+        idle -- unless a new job started first, which the state
+        check in the timer covers.
+        """
+        if side_state[side] == new_state:
+            return
+        side_state[side] = new_state
+        color, text = SIDE_STATES[new_state]
+        widgets[side]["activity_dot"].setStyleSheet(
+            "background-color: %s; border-radius: 6px;" % color)
+        widgets[side]["activity"].setText(text)
         widgets[side]["status"].setText(text)
+        if new_state == "error":
+            error_timers[side].start(ERROR_STATE_HOLD_MS)
+        else:
+            error_timers[side].stop()
+
+    def _make_error_clear(side):
+        def clear_error():
+            if side_state[side] == "error":
+                set_side_state(side, "idle")
+        return clear_error
+
+    # One single-shot timer per side, parented to the window (so
+    # they die with it): each fires once, ERROR_STATE_HOLD_MS after
+    # a failure, and clears the red light if it is still showing.
+    error_timers = {}
+    for _side in ("A", "B"):
+        _timer = QtCore.QTimer(window)
+        _timer.setSingleShot(True)
+        _timer.setInterval(ERROR_STATE_HOLD_MS)
+        _timer.timeout.connect(_make_error_clear(_side))
+        error_timers[_side] = _timer
 
     def refresh_stats_label(side):
         widgets[side]["stats"].setText(
@@ -2054,12 +2173,16 @@ def build_window(client=None, logger=None, deck_port=None):
             # deliberately NOT added to active/queued -- the per-side
             # Stop button cancels job id == side, which would poison
             # the next real turn for this side.
-            set_status(side, "Summarizing...")
+            set_side_state(side, "summarizing")
             refresh_buttons()
             return
         state["queued"].discard(side)
         state["active"].add(side)
-        set_status(side, "Thinking...")
+        # The job started but no reply has arrived yet: amber
+        # "Waiting for Ollama…" until the first chunk lands, when
+        # on_chunk flips it to green "Thinking…". A slow or
+        # retrying Ollama honestly stays amber.
+        set_side_state(side, "waiting")
         widgets[side]["reply_open"] = True
         begin_reply(side, convo.sides[side].model)
         refresh_buttons()
@@ -2070,6 +2193,10 @@ def build_window(client=None, logger=None, deck_port=None):
         side, is_summary = _job_side(job_id)
         if is_summary:
             return
+        # The first chunk is the moment Ollama starts answering:
+        # amber "Waiting for Ollama…" becomes green "Thinking…".
+        if side_state[side] == "waiting":
+            set_side_state(side, "thinking")
         append_text(side, text)
 
     def finish_reply(side):
@@ -2098,6 +2225,15 @@ def build_window(client=None, logger=None, deck_port=None):
         review_frame.setVisible(False)
         logger.action("relay ended after %d turn(s): %s"
                       % (session.turns_done, reason))
+        # A side left waiting on the relay -- a hop parked for
+        # review, or queued for a hop that will never run -- goes
+        # back to idle. A side still generating keeps its light
+        # (its own done/cancelled handler settles it), and a side
+        # showing red keeps it (its error timer settles it).
+        for side in ("A", "B"):
+            if (side not in state["active"]
+                    and side_state[side] != "error"):
+                set_side_state(side, "idle")
         # If nothing is still generating or queued (e.g. the relay ended
         # from a review pause, where no job runs), the window is idle
         # again -- no on_idle signal will come to say so.
@@ -2126,7 +2262,7 @@ def build_window(client=None, logger=None, deck_port=None):
         session.current_side = next_side
         session.hop_from = from_side
         state["queued"].add(next_side)
-        set_status(next_side, "Queued...")
+        set_side_state(next_side, "queued")
         relay_status.setText(session.status_running())
         runner.submit(next_side, make_job_fn(
             next_side, convo.sides[next_side].model,
@@ -2173,7 +2309,7 @@ def build_window(client=None, logger=None, deck_port=None):
         refresh_history_list(next_side)
         session.phase = "followup"
         state["queued"].add(next_side)
-        set_status(next_side, "Queued...")
+        set_side_state(next_side, "queued")
         show_task_progress(session)
         runner.submit(next_side, make_job_fn(
             next_side, convo.sides[next_side].model,
@@ -2198,6 +2334,10 @@ def build_window(client=None, logger=None, deck_port=None):
         review_frame.setVisible(True)
         relay_status.setText("Relay paused for review: turn %d/%d."
                              % (session.turns_done + 1, session.turn_cap))
+        # The receiving side waits on the user now: amber, "Waiting
+        # for you to review…". Forwarding flips it to queued;
+        # skipping or stopping ends the relay, which clears it.
+        set_side_state(next_side, "review")
         refresh_buttons()
 
     def do_forward(text):
@@ -2218,7 +2358,7 @@ def build_window(client=None, logger=None, deck_port=None):
         """Apply a summarize turn: fold the older history into the
         summary entry. An empty summary changes nothing."""
         state["summarizing"] = None
-        set_status(side, "Idle")
+        set_side_state(side, "idle")
         if not text.strip():
             statusbar.showMessage(
                 "Summarize came back empty — history unchanged.", 4000)
@@ -2248,7 +2388,7 @@ def build_window(client=None, logger=None, deck_port=None):
         log_event(side, label, text)
         refresh_history_list(side)
         state["active"].discard(side)
-        set_status(side, "Idle")
+        set_side_state(side, "idle")
         # Stats for this turn (every turn, relay turns included).
         stats = _take_job_stats(job_id, side)
         if stats is not None:
@@ -2297,7 +2437,7 @@ def build_window(client=None, logger=None, deck_port=None):
             # and the stats line is not a summarize turn's to touch.
             job_stats.pop(job_id, None)
             append_note(side, "(Summarize failed: %s)" % message)
-            set_status(side, "Idle")
+            set_side_state(side, "idle")
             logger.error("summarize failed: side %s: %s" % (side, message))
             refresh_buttons()
             return
@@ -2305,7 +2445,9 @@ def build_window(client=None, logger=None, deck_port=None):
         widgets[side]["reply_body_pos"] = None
         append_note(side, "(%s)" % message)
         state["active"].discard(side)
-        set_status(side, "Idle")
+        # Red for a few seconds, so the failure is seen, then idle
+        # (the error timer in set_side_state handles the fall-back).
+        set_side_state(side, "error")
         # The failed turn has no numbers: its stats show n/a, and
         # nothing is added to the session total.
         stats = _take_job_stats(job_id, side)
@@ -2336,7 +2478,7 @@ def build_window(client=None, logger=None, deck_port=None):
             # No button cancels a summarize turn, but stay safe if one
             # ever does: the history is simply left as it was.
             state["summarizing"] = None
-            set_status(side, "Idle")
+            set_side_state(side, "idle")
             refresh_buttons()
             return
         finish_reply(side)
@@ -2344,7 +2486,7 @@ def build_window(client=None, logger=None, deck_port=None):
         append_note(side, "(%s)" % MSG_STOPPED)
         state["active"].discard(side)
         state["queued"].discard(side)
-        set_status(side, "Idle")
+        set_side_state(side, "idle")
         if state.get("relay") is not None:
             end_relay(MSG_RELAY_STOPPED_BY_YOU)
         if state.get("task") is not None:
@@ -2558,7 +2700,7 @@ def build_window(client=None, logger=None, deck_port=None):
         state["compare_round"] = False
         state["stats"][side] = None
         refresh_stats_label(side)
-        set_status(side, "Idle")
+        set_side_state(side, "idle")
         refresh_buttons()
         statusbar.showMessage(
             "Transcript imported from %s" % path, 5000)
@@ -2635,7 +2777,7 @@ def build_window(client=None, logger=None, deck_port=None):
             # The loaded conversation has no turn stats yet.
             state["stats"][side] = None
             refresh_stats_label(side)
-            set_status(side, "Idle")
+            set_side_state(side, "idle")
         state["full_log"] = list(new_log)
         # The loaded log is complete by definition -- it came from
         # the file -- so any earlier trimming no longer applies.
@@ -2746,7 +2888,7 @@ def build_window(client=None, logger=None, deck_port=None):
             log_event(side, "You", shown)
             refresh_history_list(side)
             state["queued"].add(side)
-            set_status(side, "Queued...")
+            set_side_state(side, "queued")
             logger.action(
                 "send to %s: model %s, message %d chars, %d attachment(s)"
                 % (side, side_obj.model, len(text), len(attachments)))
@@ -2820,7 +2962,7 @@ def build_window(client=None, logger=None, deck_port=None):
         state["compare_round"] = False
         messages = side_obj.messages_for_model() + [
             {"role": "user", "content": SUMMARIZE_PROMPT}]
-        set_status(side, "Summarizing...")
+        set_side_state(side, "summarizing")
         # Summaries track stats so their tokens count toward the
         # session total (v0.20); on_done never lets them touch the
         # stats line itself.
@@ -2877,7 +3019,7 @@ def build_window(client=None, logger=None, deck_port=None):
         log_event(start_side, "You", shown)
         refresh_history_list(start_side)
         state["queued"].add(start_side)
-        set_status(start_side, "Queued...")
+        set_side_state(start_side, "queued")
         relay_status.setText(session.status_running())
         runner.submit(start_side, make_job_fn(
             start_side, side_obj.model, side_obj.messages_for_model()))
@@ -2955,7 +3097,7 @@ def build_window(client=None, logger=None, deck_port=None):
         log_event(worker, "You [task]", text)
         refresh_history_list(worker)
         state["queued"].add(worker)
-        set_status(worker, "Queued...")
+        set_side_state(worker, "queued")
         show_task_progress(state["task"])
         runner.submit(worker, make_job_fn(
             worker, worker_obj.model, worker_obj.messages_for_model()))
@@ -3015,7 +3157,7 @@ def build_window(client=None, logger=None, deck_port=None):
         refresh_history_list(other)
         append_note(side, "(Picked for Model %s.)" % other)
         state["queued"].add(other)
-        set_status(other, "Queued...")
+        set_side_state(other, "queued")
         runner.submit(other, make_job_fn(
             other, convo.sides[other].model,
             convo.sides[other].messages_for_model()))
@@ -3339,7 +3481,7 @@ def build_window(client=None, logger=None, deck_port=None):
             # ...and its last turn's stats no longer describe anything.
             state["stats"][side] = None
             refresh_stats_label(side)
-            set_status(side, "Idle")
+            set_side_state(side, "idle")
             refresh_buttons()
         return clear
 
@@ -3656,6 +3798,9 @@ def build_window(client=None, logger=None, deck_port=None):
         "show_start_ollama": show_start_ollama,
         "send_message": send_message,
         "log_event": log_event,
+        "set_side_state": set_side_state, "side_state": side_state,
+        "meter_label": meter_label, "refresh_meter": refresh_meter,
+        "meter_timer": meter_timer,
         "phone_btn": phone_btn, "deck_server": deck_server,
         "show_phone_deck": show_phone_deck,
         "on_phone_send": on_phone_send,
@@ -3700,6 +3845,13 @@ def build_window(client=None, logger=None, deck_port=None):
         if deck_server is not None:
             deck_server.stop()
         ollama_manager.stop()
+        # The meter timer and the error-light timers are parented to
+        # the window, but close() only hides a top-level window --
+        # the timers would keep firing into it. Stop them here so
+        # nothing keeps working after DUO is gone.
+        meter_timer.stop()
+        for _timer in error_timers.values():
+            _timer.stop()
         logger.action("DUO closed")
         _orig_close_event(event)
 

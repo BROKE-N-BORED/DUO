@@ -27,7 +27,8 @@ from dual_chat import (  # noqa: E402
     AGREEMENT_PHRASES, APP_VERSION, AWARE_TEMPLATE, CHAT_MAX_ATTEMPTS,
     CHAT_RETRY_DELAYS, CHAT_TIMEOUT, COMPARE_PREFIX,
     CONVERSATION_FORMAT_VERSION, DECK_PAGE_HTML,
-    DECK_PORT, FULL_LOG_MAX_ENTRIES, FULL_LOG_TRIMMED_NOTE,
+    DECK_PORT, ERROR_STATE_HOLD_MS, FULL_LOG_MAX_ENTRIES,
+    FULL_LOG_TRIMMED_NOTE,
     MAX_ATTACHMENTS,
     MAX_ATTACHMENT_BYTES, MSG_EMPTY, MSG_MODEL_FAILED, MSG_OLLAMA_DOWN,
     MSG_OLLAMA_NOT_INSTALLED, MSG_OLLAMA_SLOW, MSG_OLLAMA_START_FAILED,
@@ -36,6 +37,7 @@ from dual_chat import (  # noqa: E402
     SETTINGS_APP, SETTINGS_ORG, SETTING_ENTER_TO_SEND,
     SETTING_SPLITTER_STATE, SETTING_TEMPERATURE,
     SETTING_WINDOW_GEOMETRY,
+    SIDE_STATES,
     TASK_CONTINUE_TEMPLATE, TASK_FOLLOW_UPS, TASK_REVIEW_TEMPLATE,
     TASK_REVISE_TEMPLATE, TASK_ROUNDS_DEFAULT, TASK_ROUNDS_MAX,
     TASK_ROUNDS_MIN,
@@ -50,7 +52,7 @@ from dual_chat import (  # noqa: E402
     TaskSession, TranscriptError, append_full_log_entry, attachment_tag,
     build_attached_message,
     build_deck_state, check_for_update, compute_turn_stats,
-    conversation_to_data,
+    conversation_to_data, cpu_percent_between,
     data_to_conversation, default_both_filename,
     default_conversation_filename, default_debug_filename,
     default_full_filename, default_side_filename, delete_pair,
@@ -58,15 +60,18 @@ from dual_chat import (  # noqa: E402
     format_both_transcript,
     format_full_transcript, format_ram, format_session_line,
     format_side_transcript,
-    format_stats_line, get_lan_ip, is_valid_preset, load_attachment,
+    format_stats_line, format_system_meter, get_lan_ip,
+    is_valid_preset, load_attachment,
     load_conversation_file, load_pairs, load_presets,
     load_side_transcript_file,
     make_debug_logger,
     markdown_to_html,
-    pairs_path, parse_ollama_list_output, parse_ps_payload,
+    pairs_path, parse_cpu_times, parse_meminfo,
+    parse_ollama_list_output, parse_ps_payload,
     parse_side_transcript, parse_stop_phrases, parse_tags_payload,
     parse_version, phrase_matches,
     presets_file_corrupt, presets_path,
+    read_system_meter,
     render_qr_pixmap,
     sanitize_filename_part,
     save_conversation_file, save_pair, save_preset,
@@ -6383,7 +6388,7 @@ class FrontDoorTests(unittest.TestCase):
 
     def test_changelog_covers_every_version(self):
         log = self._read("CHANGELOG.md")
-        for version in ["0.%d" % n for n in range(1, 29)]:
+        for version in ["0.%d" % n for n in range(1, 30)]:
             self.assertIn(version, log)
 
     def test_gitignore_covers_runtime_files(self):
@@ -8440,6 +8445,9 @@ class ModuleSplitTests(unittest.TestCase):
             (dual_chat.SerialRunner, duo_runner.SerialRunner),
             (dual_chat.compute_turn_stats, duo_stats.compute_turn_stats),
             (dual_chat.format_stats_line, duo_stats.format_stats_line),
+            (dual_chat.read_system_meter, duo_stats.read_system_meter),
+            (dual_chat.format_system_meter,
+             duo_stats.format_system_meter),
             (dual_chat.write_text_atomic, duo_storage.write_text_atomic),
             (dual_chat.save_pair, duo_storage.save_pair),
             (dual_chat.ConversationError, duo_storage.ConversationError),
@@ -9027,6 +9035,492 @@ class UpdateCheckGuiTests(unittest.TestCase):
         self.assertTrue(self._wait_for(
             lambda: self._message()
             == MSG_UPDATE_AVAILABLE % "0.30"), self._message())
+
+
+# ---------------------------------------------------------------------------
+# Activity lights + system meter (v0.29)
+# ---------------------------------------------------------------------------
+
+class SystemMeterTests(unittest.TestCase):
+    """The /proc parsing behind the status-bar meter: CPU % from the
+    delta between two /proc/stat samples, RAM used/total from
+    /proc/meminfo. Pure functions, no Qt, no real /proc needed --
+    the tests feed fake file contents."""
+
+    STAT_ONE = ("cpu  100 0 50 800 50 0 0 0 0 0\n"
+                "cpu0 100 0 50 800 50 0 0 0 0 0\n")
+    STAT_TWO = ("cpu  200 0 50 900 50 0 0 0 0 0\n"
+                "cpu0 200 0 50 900 50 0 0 0 0 0\n")
+    MEMINFO = ("MemTotal:       8000000 kB\n"
+               "MemFree:        1000000 kB\n"
+               "MemAvailable:   2000000 kB\n")
+
+    def test_parse_cpu_times_reads_the_aggregate_line(self):
+        # idle is idle + iowait (800 + 50); total is every field.
+        self.assertEqual(parse_cpu_times(self.STAT_ONE), (850, 1000))
+        self.assertEqual(parse_cpu_times(self.STAT_TWO), (950, 1200))
+
+    def test_parse_cpu_times_rejects_bad_input(self):
+        self.assertIsNone(parse_cpu_times("cpu0 1 2 3 4 5\n"))
+        self.assertIsNone(parse_cpu_times("cpu  a b c d e\n"))
+        self.assertIsNone(parse_cpu_times("cpu  1 2 3\n"))
+        self.assertIsNone(parse_cpu_times(""))
+
+    def test_cpu_percent_between_is_the_delta(self):
+        # idle grew 100 of a 200-tick delta: half the time busy.
+        self.assertEqual(
+            cpu_percent_between((850, 1000), (950, 1200)), 50.0)
+        # All busy: idle flat while total grows.
+        self.assertEqual(
+            cpu_percent_between((850, 1000), (850, 1200)), 100.0)
+
+    def test_cpu_percent_between_rejects_degenerate_samples(self):
+        self.assertIsNone(cpu_percent_between(None, (950, 1200)))
+        self.assertIsNone(cpu_percent_between((850, 1000), None))
+        self.assertIsNone(cpu_percent_between((850, 1000), (850, 1000)))
+
+    def test_cpu_percent_between_clamps_a_counter_reset(self):
+        # Idle fell while total grew: the math says 150%, which is
+        # nonsense -- clamp to 100 rather than show a wild number.
+        self.assertEqual(
+            cpu_percent_between((900, 1000), (850, 1100)), 100.0)
+
+    def test_parse_meminfo(self):
+        total, available = parse_meminfo(self.MEMINFO)
+        self.assertEqual(total, 8000000 * 1024)
+        self.assertEqual(available, 2000000 * 1024)
+
+    def test_parse_meminfo_rejects_bad_input(self):
+        self.assertIsNone(parse_meminfo("MemTotal: 8000000 kB\n"))
+        self.assertIsNone(parse_meminfo("MemAvailable: 2000000 kB\n"))
+        self.assertIsNone(parse_meminfo("MemTotal: lots kB\n"
+                                        "MemAvailable: 2000000 kB\n"))
+
+    def test_format_system_meter(self):
+        self.assertEqual(
+            format_system_meter(42.4, 3100000000, 7700000000),
+            "CPU 42% · RAM 3.1 / 7.7 GB")
+        # First read: no CPU delta yet, RAM known.
+        self.assertEqual(
+            format_system_meter(None, 3100000000, 7700000000),
+            "CPU -- · RAM 3.1 / 7.7 GB")
+        # /proc/stat readable, /proc/meminfo not.
+        self.assertEqual(
+            format_system_meter(50.0, None, None), "CPU 50% · RAM --")
+        # Nothing known at all: empty, not a row of dashes.
+        self.assertEqual(format_system_meter(None, None, None), "")
+        # Small machines get MB.
+        self.assertEqual(
+            format_system_meter(10.0, 256000000, 512000000),
+            "CPU 10% · RAM 256 / 512 MB")
+
+    def _write(self, folder, name, text):
+        path = os.path.join(folder, name)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        return path
+
+    def test_read_system_meter_first_read_is_the_baseline(self):
+        folder = tempfile.mkdtemp(prefix="duo-meter-")
+        try:
+            stat = self._write(folder, "stat", self.STAT_ONE)
+            mem = self._write(folder, "meminfo", self.MEMINFO)
+            cpu, used, total, prev = read_system_meter(
+                None, stat_path=stat, meminfo_path=mem)
+            # No previous sample, so no % -- but RAM is known now.
+            self.assertIsNone(cpu)
+            self.assertEqual(total, 8000000 * 1024)
+            self.assertEqual(used, 6000000 * 1024)
+            self.assertEqual(prev, (850, 1000))
+            # Second read, against a busier stat file: a real %.
+            stat2 = self._write(folder, "stat2", self.STAT_TWO)
+            cpu, _, _, _ = read_system_meter(
+                prev, stat_path=stat2, meminfo_path=mem)
+            self.assertEqual(cpu, 50.0)
+        finally:
+            shutil.rmtree(folder, ignore_errors=True)
+
+    def test_read_system_meter_unreadable_proc_is_silent(self):
+        folder = tempfile.mkdtemp(prefix="duo-meter-")
+        try:
+            missing_stat = os.path.join(folder, "no-stat")
+            missing_mem = os.path.join(folder, "no-meminfo")
+            cpu, used, total, prev = read_system_meter(
+                (850, 1000), stat_path=missing_stat,
+                meminfo_path=missing_mem)
+            self.assertIsNone(cpu)
+            self.assertIsNone(used)
+            self.assertIsNone(total)
+            # The previous sample survives a failed read, so the
+            # next good read still has a baseline.
+            self.assertEqual(prev, (850, 1000))
+        finally:
+            shutil.rmtree(folder, ignore_errors=True)
+
+
+class ActivityStateTests(unittest.TestCase):
+    """The side-state table itself: every state has a color and
+    plain words, and the error light's hold is the value the UI
+    promises (5 seconds)."""
+
+    def test_side_states_table_covers_every_state(self):
+        self.assertEqual(
+            sorted(SIDE_STATES),
+            ["error", "idle", "queued", "review", "summarizing",
+             "thinking", "waiting"])
+        for name, (color, text) in SIDE_STATES.items():
+            self.assertTrue(color.startswith("#"), name)
+            self.assertTrue(text, name)
+        self.assertEqual(SIDE_STATES["idle"], ("#8a8a8a", "Idle"))
+        self.assertEqual(SIDE_STATES["thinking"],
+                         ("#2fbf5a", "Thinking…"))
+        self.assertEqual(SIDE_STATES["waiting"],
+                         ("#e8a33d", "Waiting for Ollama…"))
+        self.assertEqual(SIDE_STATES["review"],
+                         ("#e8a33d", "Waiting for you to review…"))
+        self.assertEqual(SIDE_STATES["error"],
+                         ("#d64545", "Something went wrong"))
+
+    def test_error_hold_is_five_seconds(self):
+        self.assertEqual(ERROR_STATE_HOLD_MS, 5000)
+
+
+@unittest.skipUnless(os.environ.get("DUAL_CHAT_GUI_TESTS") == "1",
+                     "GUI tests run with DUAL_CHAT_GUI_TESTS=1")
+class ActivityIndicatorGuiTests(unittest.TestCase):
+    """v0.29: the per-side light + activity words follow the job
+    lifecycle, and the status-bar meter shows real numbers. Light
+    colors are asserted through the stylesheet the code sets, not
+    pixels."""
+
+    @classmethod
+    def setUpClass(cls):
+        from PySide6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+        cls.client = FakeGuiClient()
+
+    def setUp(self):
+        from dual_chat import build_window
+        self.client.reset()
+        self.window = build_window(self.client, logger=TEST_LOGGER)
+        self.window.show()
+        self.state = self.window._dual_chat
+        self._wait_for(lambda: self.state["widgets"]["A"]["picker"].count() == 2)
+        self._pick_models()
+
+    def tearDown(self):
+        self.window.close()
+        self.app.processEvents()
+
+    def _wait_for(self, cond, timeout=10.0):
+        from PySide6.QtTest import QTest
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            QTest.qWait(50)
+            if cond():
+                return True
+        return cond()
+
+    def _pick_models(self):
+        self.state["widgets"]["A"]["picker"].setCurrentIndex(0)
+        self.state["widgets"]["B"]["picker"].setCurrentIndex(1)
+        self.app.processEvents()
+
+    def _side_state(self, side):
+        return self.state["side_state"][side]
+
+    def _dot_color(self, side):
+        # The stylesheet carries the color as a hex string.
+        sheet = self.state["widgets"][side]["activity_dot"].styleSheet()
+        return sheet.split("background-color:")[1].split(";")[0].strip()
+
+    def _activity_text(self, side):
+        return self.state["widgets"][side]["activity"].text()
+
+    def _assert_side(self, side, state):
+        color, text = SIDE_STATES[state]
+        self.assertEqual(self._side_state(side), state)
+        self.assertEqual(self._dot_color(side), color)
+        self.assertEqual(self._activity_text(side), text)
+        # The bottom-row status label shows the same words.
+        self.assertEqual(
+            self.state["widgets"][side]["status"].text(), text)
+
+    def _send_to_a_and_wait(self, text, timeout=15.0):
+        self.state["composer"].setPlainText(text)
+        self.state["send_a"].click()
+        return self._wait_for(
+            lambda: not self.state["state"]["busy"], timeout=timeout)
+
+    def test_both_sides_start_idle(self):
+        self._assert_side("A", "idle")
+        self._assert_side("B", "idle")
+
+    def test_send_shows_thinking_then_idle(self):
+        self.client.delay = 0.3
+        self.client.replies = {"fake-a:latest": [
+            "one two three four five six"]}
+        self.state["composer"].setPlainText("slow one")
+        self.state["send_a"].click()
+        self.assertTrue(self._wait_for(
+            lambda: self._side_state("A") == "thinking", timeout=5))
+        self._assert_side("A", "thinking")
+        # The other side never moved.
+        self._assert_side("B", "idle")
+        self.assertTrue(self._wait_for(
+            lambda: not self.state["state"]["busy"], timeout=15))
+        self._assert_side("A", "idle")
+
+    def test_waiting_before_first_chunk(self):
+        from dual_chat import build_window
+
+        gate = threading.Event()
+
+        class BlockingClient(FakeGuiClient):
+            def chat_stream(self, model, messages, on_chunk,
+                            cancel_event, timeout=1800, on_metrics=None,
+                            on_retry=None, options=None):
+                # Ollama has the job but hasn't answered yet.
+                gate.wait(timeout=10)
+                return super().chat_stream(
+                    model, messages, on_chunk, cancel_event,
+                    timeout=timeout, on_metrics=on_metrics,
+                    on_retry=on_retry, options=options)
+
+        window = build_window(BlockingClient(), logger=TEST_LOGGER)
+        try:
+            window.show()
+            state = window._dual_chat
+            self.assertTrue(self._wait_for(
+                lambda: state["widgets"]["A"]["picker"].count() == 2))
+            state["widgets"]["A"]["picker"].setCurrentIndex(0)
+            self.app.processEvents()
+            state["composer"].setPlainText("hello")
+            state["send_a"].click()
+            self.assertTrue(self._wait_for(
+                lambda: state["side_state"]["A"] == "waiting",
+                timeout=5))
+            color, text = SIDE_STATES["waiting"]
+            self.assertEqual(
+                state["widgets"]["A"]["activity"].text(), text)
+            self.assertIn(color, state["widgets"]["A"]
+                          ["activity_dot"].styleSheet())
+            gate.set()
+            self.assertTrue(self._wait_for(
+                lambda: state["side_state"]["A"] == "thinking",
+                timeout=5))
+            self.assertTrue(self._wait_for(
+                lambda: not state["state"]["busy"], timeout=15))
+            self.assertEqual(state["side_state"]["A"], "idle")
+        finally:
+            gate.set()
+            window.close()
+
+    def test_queued_side_shows_amber_while_other_thinks(self):
+        self.client.delay = 0.3
+        self.client.replies = {"fake-a:latest": [
+            "one two three four five six"],
+            "fake-b:latest": ["seven eight nine"]}
+        self.state["composer"].setPlainText("both, slow")
+        self.state["send_both"].click()
+        # A starts first; B waits behind it, amber.
+        self.assertTrue(self._wait_for(
+            lambda: self._side_state("A") == "thinking"
+            and self._side_state("B") == "queued", timeout=5))
+        self._assert_side("B", "queued")
+        self.assertTrue(self._wait_for(
+            lambda: not self.state["state"]["busy"], timeout=15))
+        self._assert_side("A", "idle")
+        self._assert_side("B", "idle")
+
+    def test_failed_turn_shows_error_then_idle(self):
+        from dual_chat import build_window
+
+        class FailingClient(FakeGuiClient):
+            def chat_stream(self, model, messages, on_chunk,
+                            cancel_event, timeout=1800, on_metrics=None,
+                            on_retry=None, options=None):
+                on_chunk("partial ")
+                raise OllamaError(MSG_MODEL_FAILED)
+
+        # The error hold is 5s in the product; the window under test
+        # uses a short hold so the suite doesn't wait it out. The
+        # real value is pinned by ActivityStateTests.
+        with mock.patch("dual_chat.ERROR_STATE_HOLD_MS", 200):
+            window = build_window(FailingClient(),
+                                  logger=TEST_LOGGER)
+            try:
+                window.show()
+                state = window._dual_chat
+                self.assertTrue(self._wait_for(
+                    lambda: state["widgets"]["A"]["picker"].count() == 2))
+                state["widgets"]["A"]["picker"].setCurrentIndex(0)
+                self.app.processEvents()
+                state["composer"].setPlainText("hello")
+                state["send_a"].click()
+                self.assertTrue(self._wait_for(
+                    lambda: state["side_state"]["A"] == "error",
+                    timeout=10))
+                color, text = SIDE_STATES["error"]
+                self.assertEqual(
+                    state["widgets"]["A"]["activity"].text(), text)
+                self.assertIn(color, state["widgets"]["A"]
+                              ["activity_dot"].styleSheet())
+                # The red light falls back to idle on its own.
+                self.assertTrue(self._wait_for(
+                    lambda: state["side_state"]["A"] == "idle",
+                    timeout=5))
+            finally:
+                window.close()
+
+    def test_new_job_overrides_error_light(self):
+        from dual_chat import build_window
+
+        class FailOnceClient(FakeGuiClient):
+            failed = False
+
+            def chat_stream(self, model, messages, on_chunk,
+                            cancel_event, timeout=1800, on_metrics=None,
+                            on_retry=None, options=None):
+                if not FailOnceClient.failed:
+                    FailOnceClient.failed = True
+                    raise OllamaError(MSG_MODEL_FAILED)
+                return super().chat_stream(
+                    model, messages, on_chunk, cancel_event,
+                    timeout=timeout, on_metrics=on_metrics,
+                    on_retry=on_retry, options=options)
+
+        with mock.patch("dual_chat.ERROR_STATE_HOLD_MS", 200):
+            window = build_window(FailOnceClient(),
+                                  logger=TEST_LOGGER)
+            try:
+                window.show()
+                state = window._dual_chat
+                self.assertTrue(self._wait_for(
+                    lambda: state["widgets"]["A"]["picker"].count() == 2))
+                state["widgets"]["A"]["picker"].setCurrentIndex(0)
+                self.app.processEvents()
+                state["composer"].setPlainText("first")
+                state["send_a"].click()
+                self.assertTrue(self._wait_for(
+                    lambda: state["side_state"]["A"] == "error",
+                    timeout=10))
+                # A new send right away: the error light gives way
+                # to the new turn, and the hold timer never drags
+                # the side back to anything wrong afterwards.
+                state["composer"].setPlainText("second")
+                state["send_a"].click()
+                self.assertTrue(self._wait_for(
+                    lambda: state["side_state"]["A"] == "thinking",
+                    timeout=5))
+                self.assertTrue(self._wait_for(
+                    lambda: not state["state"]["busy"], timeout=15))
+                self.assertEqual(state["side_state"]["A"], "idle")
+                self.assertTrue(self._wait_for(
+                    lambda: state["side_state"]["A"] == "idle",
+                    timeout=2))
+            finally:
+                window.close()
+
+    def test_relay_review_pause_shows_waiting(self):
+        self.client.replies = {"fake-a:latest": ["apple pie"],
+                               "fake-b:latest": ["banana split"]}
+        self.state["review_check"].setChecked(True)
+        self.state["start_picker"].setCurrentIndex(0)
+        self.state["cap_spin"].setValue(2)
+        self.state["mode_picker"].setCurrentIndex(0)  # Blind
+        self.state["composer"].setPlainText("Talk about fruit.")
+        self.app.processEvents()
+        self.state["relay_btn"].click()
+        self.assertTrue(self._wait_for(
+            lambda: self.state["review_frame"].isVisible()
+            and self.state["state"].get("pending_hop") is not None,
+            timeout=15))
+        # A's turn is done (idle); B waits on the user, amber.
+        self._assert_side("A", "idle")
+        self._assert_side("B", "review")
+        self.state["review_forward"].click()
+        self.assertTrue(self._wait_for(
+            lambda: self.state["relay_status"].text().startswith(
+                "Relay stopped"), timeout=15))
+        self._assert_side("A", "idle")
+        self._assert_side("B", "idle")
+
+    def test_review_skip_clears_the_waiting_light(self):
+        self.client.replies = {"fake-a:latest": ["apple pie"],
+                               "fake-b:latest": ["banana split"]}
+        self.state["review_check"].setChecked(True)
+        self.state["start_picker"].setCurrentIndex(0)
+        self.state["cap_spin"].setValue(2)
+        self.state["mode_picker"].setCurrentIndex(0)  # Blind
+        self.state["composer"].setPlainText("Talk about fruit.")
+        self.app.processEvents()
+        self.state["relay_btn"].click()
+        self.assertTrue(self._wait_for(
+            lambda: self.state["review_frame"].isVisible()
+            and self.state["state"].get("pending_hop") is not None,
+            timeout=15))
+        self._assert_side("B", "review")
+        self.state["review_skip"].click()
+        self.assertTrue(self._wait_for(
+            lambda: self.state["relay_status"].text().startswith(
+                "Relay stopped"), timeout=15))
+        # The relay ended from the pause: no stuck amber light.
+        self._assert_side("B", "idle")
+
+    def test_summarize_shows_summarizing(self):
+        self.client.replies = {"fake-a:latest": [
+            "alpha one", "alpha two", "alpha three",
+            " ".join(["word"] * 20)]}
+        self.assertTrue(self._send_to_a_and_wait("first"))
+        self.assertTrue(self._send_to_a_and_wait("second"))
+        self.assertTrue(self._send_to_a_and_wait("third"))
+        self.client.delay = 0.3
+        btn = self.state["widgets"]["A"]["summarize"]
+        self.assertTrue(btn.isEnabled())
+        btn.click()
+        self.assertTrue(self._wait_for(
+            lambda: self._side_state("A") == "summarizing", timeout=5))
+        self._assert_side("A", "summarizing")
+        self.assertTrue(self._wait_for(
+            lambda: not self.state["state"]["busy"], timeout=15))
+        self._assert_side("A", "idle")
+
+    def test_cancelled_job_returns_to_idle(self):
+        self.client.delay = 0.3
+        self.client.replies = {"fake-a:latest": [
+            "one two three four five six seven eight"]}
+        self.state["composer"].setPlainText("slow one")
+        self.state["send_a"].click()
+        self.assertTrue(self._wait_for(
+            lambda: self._side_state("A") == "thinking", timeout=5))
+        self.state["widgets"]["A"]["stop"].click()
+        self.assertTrue(self._wait_for(
+            lambda: not self.state["state"]["busy"], timeout=10))
+        # Stopped, not stuck: the light is back to grey idle.
+        self._assert_side("A", "idle")
+
+    def test_meter_label_shows_real_numbers(self):
+        import re
+        # The meter reads the real /proc here: after the second
+        # tick (1s apart) both numbers are live.
+        self.assertTrue(self._wait_for(
+            lambda: re.match(
+                r"CPU \d+% · RAM [\d.]+ / [\d.]+ (GB|MB)",
+                self.state["meter_label"].text()) is not None,
+            timeout=10), self.state["meter_label"].text())
+        self.assertTrue(self.state["meter_timer"].isActive())
+
+    def test_meter_timer_stops_when_the_window_closes(self):
+        from dual_chat import build_window
+        window = build_window(self.client, logger=TEST_LOGGER)
+        timer = window._dual_chat["meter_timer"]
+        self.assertTrue(timer.isActive())
+        window.close()
+        self.app.processEvents()
+        # The timer is parented to the window: closing the window
+        # destroys it, so it can never fire into a dead window.
+        self.assertFalse(timer.isActive())
 
 
 if __name__ == "__main__":

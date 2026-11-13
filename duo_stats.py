@@ -44,6 +44,131 @@ def format_ram(size_bytes):
     return "%d MB" % round(size_bytes / 1_000_000)
 
 
+# --- system meter (v0.29) --------------------------------------------------
+# CPU % and RAM for the whole machine, read from /proc with stdlib
+# only -- no psutil. CPU % needs two samples (it is the delta between
+# them), so the first read only establishes the baseline. Every parse
+# returns None on bad input instead of raising: a missing or strange
+# /proc means the meter shows nothing, never a crash.
+
+def parse_cpu_times(text):
+    """The aggregate "cpu" line of /proc/stat as (idle, total).
+
+    idle is idle + iowait ticks; total is every field summed. A
+    missing or malformed line returns None.
+    """
+    for line in text.splitlines():
+        if line.startswith("cpu "):
+            fields = line.split()[1:]
+            try:
+                values = [int(field) for field in fields]
+            except ValueError:
+                return None
+            if len(values) < 5:
+                return None
+            idle = values[3] + (values[4] if len(values) > 4 else 0)
+            return idle, sum(values)
+    return None
+
+
+def cpu_percent_between(prev, cur):
+    """CPU % between two parse_cpu_times samples, or None when the
+    delta is zero or the samples are missing. Clamped to 0-100: a
+    counter reset must never show a wild number."""
+    if prev is None or cur is None:
+        return None
+    idle_delta = cur[0] - prev[0]
+    total_delta = cur[1] - prev[1]
+    if total_delta <= 0:
+        return None
+    pct = 100.0 * (1.0 - idle_delta / total_delta)
+    return max(0.0, min(100.0, pct))
+
+
+def parse_meminfo(text):
+    """(total_bytes, available_bytes) from /proc/meminfo text, or
+    None when either line is missing or malformed. MemAvailable is
+    what the machine can still hand out, so used is total minus
+    available."""
+    total = None
+    available = None
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        try:
+            value = int(parts[1])
+        except ValueError:
+            continue
+        if parts[0] == "MemTotal:":
+            total = value * 1024
+        elif parts[0] == "MemAvailable:":
+            available = value * 1024
+    if total is None or available is None:
+        return None
+    return total, available
+
+
+def format_system_meter(cpu_pct, used_bytes, total_bytes):
+    """The meter's one line: "CPU 42% · RAM 3.1 / 7.7 GB".
+
+    A missing CPU % (first read, no delta yet) shows dashes; a
+    missing RAM reading shows dashes too. When nothing at all is
+    known -- /proc unreadable, a non-Linux machine -- the line is
+    empty: the meter shows nothing rather than a row of dashes.
+    """
+    if (cpu_pct is None and used_bytes is None
+            and total_bytes is None):
+        return ""
+    cpu_text = ("CPU %d%%" % round(cpu_pct)) if cpu_pct is not None \
+        else "CPU --"
+    if used_bytes is not None and total_bytes is not None:
+        if total_bytes >= 1_000_000_000:
+            ram_text = "RAM %.1f / %.1f GB" % (
+                used_bytes / 1_000_000_000,
+                total_bytes / 1_000_000_000)
+        else:
+            ram_text = "RAM %d / %d MB" % (
+                round(used_bytes / 1_000_000),
+                round(total_bytes / 1_000_000))
+    else:
+        ram_text = "RAM --"
+    return "%s · %s" % (cpu_text, ram_text)
+
+
+def read_system_meter(prev_cpu, stat_path="/proc/stat",
+                      meminfo_path="/proc/meminfo"):
+    """One meter sample: (cpu_pct, used_bytes, total_bytes, new_prev).
+
+    cpu_pct is None on the first read (no delta yet) or when
+    /proc/stat can't be read; used/total are None when /proc/meminfo
+    can't be read. new_prev is the fresh /proc/stat sample for the
+    next call, or the old prev when the read failed. Nothing here
+    raises -- an unreadable /proc just means Nones.
+    """
+    cpu_pct = None
+    new_prev = prev_cpu
+    try:
+        with open(stat_path, encoding="utf-8") as fh:
+            current = parse_cpu_times(fh.read())
+    except (OSError, ValueError):
+        current = None
+    if current is not None:
+        cpu_pct = cpu_percent_between(prev_cpu, current)
+        new_prev = current
+    used = None
+    total = None
+    try:
+        with open(meminfo_path, encoding="utf-8") as fh:
+            parsed = parse_meminfo(fh.read())
+    except (OSError, ValueError):
+        parsed = None
+    if parsed is not None:
+        total, available = parsed
+        used = max(0, total - available)
+    return cpu_pct, used, total, new_prev
+
+
 STATS_EMPTY_LINE = ("-- tok/s · -- out / -- in · first token -- · "
                     "turn -- · RAM --")
 

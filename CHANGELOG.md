@@ -1,7 +1,23 @@
 # DUO changelog
 
 Every version, newest first. v0.1–v0.17 were built on 2026-11-12;
-v0.18–v0.28 on 2026-11-13.
+v0.18–v0.29 on 2026-11-13.
+
+## v0.29 — 2026-11-13
+
+You can see what DUO is doing now. Each pane has a small colored
+light and small words under its stats line saying what that side
+is doing right now: grey "Idle" when it isn't doing anything,
+amber "Queued…" while it waits its turn, amber "Waiting for
+Ollama…" once its turn has started but no reply has come back
+yet, green "Thinking…" while its reply streams in, green
+"Summarizing…" during a summarize, amber "Waiting for you to
+review…" while a relay hop is parked for your review, and red
+"Something went wrong" for a few seconds when a turn fails. And
+the status bar shows the whole machine's CPU % and RAM, re-read
+once a second from /proc — plain numbers like "CPU 42% · RAM 3.1
+/ 7.7 GB", with no new dependency. On a machine without /proc
+the meter stays empty and silent instead of complaining.
 
 ## v0.28 — 2026-11-13
 

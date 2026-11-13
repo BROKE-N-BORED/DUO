@@ -209,6 +209,15 @@ bash run.sh
   each pane keeps a running session total ("Session: 42 out /
   128 in") across every generation since the app started; Clear
   never resets it.
+- Activity lights: each pane has a small colored light and small
+  words under its stats line saying what that side is doing right
+  now — grey Idle, amber while it waits (queued, waiting for
+  Ollama to answer, or a relay hop waiting for your review),
+  green while it thinks or summarizes, red for a few seconds when
+  a turn fails.
+- System meter: the status bar shows the whole machine's CPU %
+  and RAM ("CPU 42% · RAM 3.1 / 7.7 GB"), re-read once a second.
+  On a machine without /proc the meter stays empty and silent.
 
 ## Files
 
