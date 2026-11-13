@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""DUO 0.12 - two Ollama models side by side in one desktop window.
+"""DUO 0.13 - two Ollama models side by side in one desktop window.
 
 Item 1: the shell, the model pickers, and send-to-A/B/both.
 Item 2: the auto-relay AI-to-AI loop. The user types a seed message, picks
@@ -63,6 +63,11 @@ v0.11: the phone deck. DUO serves a small local web page on the PC
 v0.12: the agreement matcher fixed. Stop phrases and agreement
   phrases now match whole words only -- "I disagreed" no longer
   stops a relay that was waiting for "agreed".
+v0.13: keyboard send and the composer cap gone. Ctrl+Enter sends to
+  both models, and an "Enter to send" tickbox (remembered between
+  runs) makes plain Enter send too, with Shift+Enter still adding a
+  new line. The composer no longer drops pasted paragraphs -- the
+  5-block cap is removed entirely.
 """
 
 import datetime
@@ -161,7 +166,7 @@ def make_debug_logger(log_dir=None):
         return _NullLogger()
 
 APP_NAME = "DUO"
-APP_VERSION = "0.12"
+APP_VERSION = "0.13"
 DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434"
 OLLAMA_URL_ENV = "DUAL_CHAT_OLLAMA_URL"
 
@@ -189,6 +194,13 @@ MSG_PHONE_BUSY = "DUO is busy right now. Wait for the current turn to finish, th
 MSG_PHONE_RELAY = "A relay is running. Stop the relay before sending from your phone."
 MSG_PHONE_TASK = "A task is running. Wait for it to finish, then send again."
 MSG_PHONE_TARGET = "Pick who to send to: A, B, or Both."
+
+# Persisted preferences (QSettings): the "Enter to send" tickbox is
+# remembered between runs. Explicit org/app names so the setting
+# lands in the same place no matter how the app was launched.
+SETTINGS_ORG = "BrokeNBored"
+SETTINGS_APP = "DUO"
+SETTING_ENTER_TO_SEND = "composer/enter_to_send"
 
 # Agreement stop: simple case-insensitive substring matching on this
 # fixed list. No LLM judge -- the 2B models are slow enough already.
@@ -1871,7 +1883,9 @@ def build_window(client=None, logger=None, deck_port=None):
     d_layout.setSpacing(6)
     composer = QtWidgets.QPlainTextEdit()
     composer.setPlaceholderText("Type a message for the models...")
-    composer.setMaximumBlockCount(5)
+    # No block cap on purpose: a chat composer must never drop typed
+    # or pasted text. (v0.12 and earlier capped it at 5 blocks, which
+    # silently threw away the oldest paragraphs of a long paste.)
     composer.setFixedHeight(64)
     d_layout.addWidget(composer)
 
@@ -1887,6 +1901,24 @@ def build_window(client=None, logger=None, deck_port=None):
     attach_note.setStyleSheet("font-size: 11px;")
     attach_row.addWidget(attach_note)
     attach_row.addStretch(1)
+    # "Enter to send": when ticked, plain Enter sends to both models
+    # and Shift+Enter adds a new line. Off by default; the tick is
+    # remembered between runs (QSettings). Ctrl+Enter always sends,
+    # ticked or not -- see the key filter by the send buttons.
+    enter_send_check = QtWidgets.QCheckBox("Enter to send")
+    enter_send_check.setToolTip(
+        "When on, Enter sends to both models and Shift+Enter adds "
+        "a new line. Ctrl+Enter always sends to both.")
+    prefs = QtCore.QSettings(SETTINGS_ORG, SETTINGS_APP)
+    enter_send_check.setChecked(
+        prefs.value(SETTING_ENTER_TO_SEND, False, type=bool))
+
+    def _save_enter_to_send(checked):
+        prefs.setValue(SETTING_ENTER_TO_SEND, bool(checked))
+        prefs.sync()
+
+    enter_send_check.toggled.connect(_save_enter_to_send)
+    attach_row.addWidget(enter_send_check)
     d_layout.addLayout(attach_row)
 
     attach_frame = QtWidgets.QFrame()
@@ -2846,6 +2878,31 @@ def build_window(client=None, logger=None, deck_port=None):
     send_a.clicked.connect(lambda: do_send("A"))
     send_b.clicked.connect(lambda: do_send("B"))
     send_both.clicked.connect(lambda: do_send("Both"))
+
+    # --- keyboard send ----------------------------------------------------
+    # Ctrl+Enter sends to both models, from the keyboard. With the
+    # "Enter to send" box ticked, plain Enter sends too (Shift+Enter
+    # still adds a new line). A send key is always swallowed -- it
+    # never inserts a newline -- and it only fires while the Send to
+    # Both button is enabled (idle, both models picked), so the
+    # keyboard path has exactly the button's guards. Empty composer:
+    # do_send shows the same "Type a message first." note as a click.
+    class _ComposerKeys(QtCore.QObject):
+        def eventFilter(self, obj, event):
+            if event.type() == QtCore.QEvent.KeyPress:
+                key = event.key()
+                if key in (QtCore.Qt.Key_Return, QtCore.Qt.Key_Enter):
+                    mods = event.modifiers()
+                    send = bool(mods & QtCore.Qt.ControlModifier)
+                    if not send and enter_send_check.isChecked():
+                        send = not bool(mods & QtCore.Qt.ShiftModifier)
+                    if send:
+                        if send_both.isEnabled():
+                            do_send("Both")
+                        return True
+            return super().eventFilter(obj, event)
+
+    composer.installEventFilter(_ComposerKeys(composer))
     save_both.clicked.connect(do_save_both)
     save_full.clicked.connect(do_save_full)
 
@@ -3453,6 +3510,7 @@ def build_window(client=None, logger=None, deck_port=None):
     window._dual_chat = {  # test hooks (not part of the UI)
         "convo": convo, "runner": runner, "signals": signals,
         "widgets": widgets, "composer": composer,
+        "enter_send_check": enter_send_check,
         "send_a": send_a, "send_b": send_b, "send_both": send_both,
         "do_send": do_send, "load_models": load_models, "state": state,
         "relay_btn": relay_btn, "start_picker": start_picker,

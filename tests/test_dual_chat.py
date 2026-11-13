@@ -28,6 +28,7 @@ from dual_chat import (  # noqa: E402
     MAX_ATTACHMENT_BYTES, MSG_EMPTY, MSG_MODEL_FAILED, MSG_OLLAMA_DOWN,
     MSG_OLLAMA_NOT_INSTALLED, MSG_OLLAMA_SLOW, MSG_OLLAMA_START_FAILED,
     MSG_PHONE_BUSY, MSG_PHONE_RELAY, MSG_PHONE_TARGET,
+    SETTINGS_APP, SETTINGS_ORG, SETTING_ENTER_TO_SEND,
     TASK_CONTINUE_TEMPLATE, TASK_FOLLOW_UPS, TASK_REVIEW_TEMPLATE,
     AttachmentError, Cancelled,
     ChatSide, Conversation, DeckServer, HISTORY_BUDGET_CHARS,
@@ -4513,6 +4514,164 @@ class DeckGuiTests(unittest.TestCase):
         with self.assertRaises(urllib.error.URLError):
             urllib.request.urlopen(
                 "http://127.0.0.1:%d/" % port, timeout=5)
+
+
+# ---------------------------------------------------------------------------
+# v0.13: keyboard send + composer cap removed (audit T2)
+# ---------------------------------------------------------------------------
+
+@unittest.skipUnless(os.environ.get("DUAL_CHAT_GUI_TESTS") == "1",
+                     "GUI tests run with DUAL_CHAT_GUI_TESTS=1")
+class KeyboardSendGuiTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        from PySide6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+        cls.client = FakeGuiClient()
+
+    def setUp(self):
+        # The "Enter to send" tick is persisted, so clear it before
+        # every window: each test starts from the default (off).
+        self._clear_enter_to_send()
+        from dual_chat import build_window
+        self.window = build_window(self.client, logger=TEST_LOGGER)
+        self.window.show()
+        self.state = self.window._dual_chat
+        self._wait_for(lambda: self.state["widgets"]["A"]["picker"].count() == 2)
+
+    def tearDown(self):
+        self.window.close()
+        self._clear_enter_to_send()
+
+    def _clear_enter_to_send(self):
+        from PySide6.QtCore import QSettings
+        settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
+        settings.remove(SETTING_ENTER_TO_SEND)
+        settings.sync()
+
+    def _wait_for(self, cond, timeout=10.0):
+        from PySide6.QtTest import QTest
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            QTest.qWait(50)
+            if cond():
+                return True
+        return cond()
+
+    def _pick_models(self):
+        self.state["widgets"]["A"]["picker"].setCurrentIndex(0)
+        self.state["widgets"]["B"]["picker"].setCurrentIndex(1)
+        self.app.processEvents()
+
+    def _key_click(self, key, modifiers=None):
+        from PySide6.QtCore import Qt
+        from PySide6.QtTest import QTest
+        composer = self.state["composer"]
+        composer.setFocus()
+        self.app.processEvents()
+        if modifiers is None:
+            modifiers = Qt.KeyboardModifier.NoModifier
+        QTest.keyClick(composer, key, modifiers)
+        self.app.processEvents()
+
+    def test_ctrl_enter_sends_to_both(self):
+        from PySide6.QtCore import Qt
+        self._pick_models()
+        self.client.calls.clear()
+        self.state["composer"].setPlainText("Hello, both of you.")
+        self._key_click(Qt.Key_Return, Qt.ControlModifier)
+        ok = self._wait_for(lambda: (
+            "Reply from fake-a:latest." in
+            self.state["widgets"]["A"]["transcript"].toPlainText()
+            and "Reply from fake-b:latest." in
+            self.state["widgets"]["B"]["transcript"].toPlainText()
+            and len(self.state["convo"].sides["A"].history) == 2
+            and len(self.state["convo"].sides["B"].history) == 2),
+            timeout=15)
+        self.assertTrue(ok, "Ctrl+Enter should send to both panes")
+        self.assertEqual(self.client.calls,
+                         ["fake-a:latest", "fake-b:latest"])
+        # The composer clears after a send, same as the button.
+        self.assertEqual(self.state["composer"].toPlainText(), "")
+
+    def test_ctrl_enter_empty_shows_note_and_sends_nothing(self):
+        from PySide6.QtCore import Qt
+        self._pick_models()
+        self.client.calls.clear()
+        self._key_click(Qt.Key_Return, Qt.ControlModifier)
+        self.assertEqual(self.window.statusBar().currentMessage(),
+                         MSG_EMPTY)
+        self.assertEqual(self.client.calls, [])
+
+    def test_ctrl_enter_without_models_does_nothing(self):
+        # No models picked: Send to Both is disabled, so Ctrl+Enter
+        # must do nothing at all -- no send, and no newline either.
+        from PySide6.QtCore import Qt
+        self.client.calls.clear()
+        self.state["composer"].setPlainText("Hello?")
+        self._key_click(Qt.Key_Return, Qt.ControlModifier)
+        self.assertEqual(self.client.calls, [])
+        self.assertEqual(self.state["composer"].toPlainText(), "Hello?")
+
+    def test_enter_to_send_on_enter_sends_shift_enter_newline(self):
+        from PySide6.QtCore import Qt
+        self._pick_models()
+        self.client.calls.clear()
+        self.state["enter_send_check"].setChecked(True)
+        self.app.processEvents()
+        composer = self.state["composer"]
+        composer.setPlainText("first line")
+        # Shift+Enter adds a newline, sends nothing.
+        self._key_click(Qt.Key_Return, Qt.ShiftModifier)
+        self.assertEqual(self.client.calls, [])
+        self.assertIn("\n", composer.toPlainText())
+        self.assertIn("first line", composer.toPlainText())
+        # Plain Enter sends it all.
+        self._key_click(Qt.Key_Return)
+        ok = self._wait_for(lambda: (
+            "Reply from fake-a:latest." in
+            self.state["widgets"]["A"]["transcript"].toPlainText()
+            and "Reply from fake-b:latest." in
+            self.state["widgets"]["B"]["transcript"].toPlainText()),
+            timeout=15)
+        self.assertTrue(ok, "Enter should send with the box ticked")
+        self.assertEqual(composer.toPlainText(), "")
+
+    def test_enter_to_send_off_enter_is_newline(self):
+        from PySide6.QtCore import Qt
+        self.assertFalse(self.state["enter_send_check"].isChecked())
+        self._pick_models()
+        self.client.calls.clear()
+        composer = self.state["composer"]
+        composer.setPlainText("first line")
+        self._key_click(Qt.Key_Return)
+        self.assertEqual(self.client.calls, [])
+        self.assertIn("\n", composer.toPlainText())
+        self.assertIn("first line", composer.toPlainText())
+
+    def test_enter_to_send_persists_across_restart(self):
+        from dual_chat import build_window
+        self.state["enter_send_check"].setChecked(True)
+        self.app.processEvents()
+        self.window.close()
+        self.app.processEvents()
+        window2 = build_window(self.client, logger=TEST_LOGGER)
+        try:
+            window2.show()
+            state2 = window2._dual_chat
+            self.assertTrue(self._wait_for(
+                lambda: state2["widgets"]["A"]["picker"].count() == 2))
+            self.assertTrue(state2["enter_send_check"].isChecked())
+        finally:
+            window2.close()
+
+    def test_long_paste_keeps_every_paragraph(self):
+        composer = self.state["composer"]
+        paragraphs = ["paragraph %d" % i for i in range(12)]
+        composer.insertPlainText("\n".join(paragraphs))
+        self.app.processEvents()
+        self.assertEqual(composer.toPlainText(), "\n".join(paragraphs))
+        self.assertEqual(composer.blockCount(), 12)
 
 
 if __name__ == "__main__":
