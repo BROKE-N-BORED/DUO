@@ -99,9 +99,10 @@ bash run.sh
 - Blind (default): each model gets the bare reply text as a plain
   message, so it thinks it's talking to a person. Aware: the reply is
   framed so the models know they're talking to another AI.
-- Stop on ends the relay when a reply contains one of your words or
-  phrases (separated by commas). Stop on agreement ends it when a
-  reply says something like "sounds good" or "I agree".
+- Stop on ends the relay when a reply uses one of your words or
+  phrases (separated by commas) as a whole word -- "cap" won't stop
+  on "capital". Stop on agreement ends it when a reply says something
+  like "sounds good" or "I agree" -- "I disagreed" doesn't count.
 - Relayed messages carry a [relay] tag in the window so you can always
   tell what was relayed. The models never see the tag.
 

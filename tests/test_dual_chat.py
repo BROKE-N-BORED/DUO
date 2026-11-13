@@ -42,7 +42,8 @@ from dual_chat import (  # noqa: E402
     format_stats_line, get_lan_ip, load_attachment, load_pairs,
     make_debug_logger,
     pairs_path, parse_ollama_list_output, parse_ps_payload,
-    parse_stop_phrases, parse_tags_payload, render_qr_pixmap,
+    parse_stop_phrases, parse_tags_payload, phrase_matches,
+    render_qr_pixmap,
     sanitize_filename_part,
     save_pair,
 )
@@ -251,7 +252,7 @@ class RelaySessionTests(unittest.TestCase):
         self.assertEqual(parse_stop_phrases(""), [])
         self.assertEqual(parse_stop_phrases(None), [])
 
-    def test_stop_phrase_case_insensitive_substring(self):
+    def test_stop_phrase_case_insensitive_whole_word(self):
         session = RelaySession("A", stop_phrases=["PineApple"])
         self.assertEqual(session.find_stop_phrase(
             "I like pineapple pizza."), "PineApple")
@@ -270,6 +271,53 @@ class RelaySessionTests(unittest.TestCase):
     def test_agreement_phrase_list_is_fixed(self):
         self.assertEqual(tuple(sorted(AGREEMENT_PHRASES)),
                          ("agreed", "i agree", "sounds good", "that works"))
+
+    # v0.12: whole-word matching. Substring matching ended a relay the
+    # moment a model DISAGREED ("I disagreed" contains "agreed").
+
+    def test_phrase_matches_whole_words(self):
+        self.assertTrue(phrase_matches("agreed", "Agreed, moving on."))
+        self.assertTrue(phrase_matches("agreed", "agreed"))
+        self.assertTrue(phrase_matches("i agree", "I AGREE with you."))
+        self.assertTrue(phrase_matches("sounds good", "Sounds good!"))
+        self.assertFalse(phrase_matches("agreed", "I disagreed with that"))
+        self.assertFalse(phrase_matches("i agree", "disagreement"))
+        self.assertFalse(phrase_matches("cap", "the capital city"))
+        self.assertFalse(phrase_matches("", "anything at all"))
+
+    def test_agreement_ignores_disagreed(self):
+        session = RelaySession("A", stop_on_agreement=True)
+        self.assertIsNone(session.find_agreement("I disagreed with that"))
+        self.assertIsNone(session.find_agreement(
+            "There is disagreement here."))
+        self.assertIsNone(session.find_agreement(
+            "I disagree with that idea."))
+
+    def test_agreement_whole_words_still_match(self):
+        session = RelaySession("A", stop_on_agreement=True)
+        self.assertEqual(session.find_agreement("I agree with you."),
+                         "i agree")
+        self.assertEqual(session.find_agreement("agreed"), "agreed")
+        self.assertEqual(session.find_agreement("Agreed, moving on."),
+                         "agreed")
+        self.assertEqual(session.find_agreement("That works for me."),
+                         "that works")
+
+    def test_stop_phrase_whole_words(self):
+        session = RelaySession("A", stop_phrases=["cap"])
+        self.assertIsNone(session.find_stop_phrase("the capital city"))
+        self.assertIsNone(session.find_stop_phrase("recap the meeting"))
+        self.assertEqual(session.find_stop_phrase("hit the cap."),
+                         "cap")
+        self.assertEqual(session.find_stop_phrase("Cap off the day."),
+                         "cap")
+
+    def test_check_stop_agreement_ignores_disagreed(self):
+        session = RelaySession("A", turn_cap=10, stop_on_agreement=True)
+        session.turns_done = 1
+        self.assertIsNone(session.check_stop("I disagreed with that"))
+        self.assertEqual(session.check_stop("I agree with you."),
+                         "agreement reached ('i agree')")
 
     def test_check_stop_cap_reached(self):
         session = RelaySession("A", turn_cap=3)

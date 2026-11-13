@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""DUO 0.10 - two Ollama models side by side in one desktop window.
+"""DUO 0.12 - two Ollama models side by side in one desktop window.
 
 Item 1: the shell, the model pickers, and send-to-A/B/both.
 Item 2: the auto-relay AI-to-AI loop. The user types a seed message, picks
@@ -60,12 +60,16 @@ v0.11: the phone deck. DUO serves a small local web page on the PC
   whichever model is thinking, and he can send messages from the
   phone and export the full transcript with one button. LAN-only,
   no accounts, no internet.
+v0.12: the agreement matcher fixed. Stop phrases and agreement
+  phrases now match whole words only -- "I disagreed" no longer
+  stops a relay that was waiting for "agreed".
 """
 
 import datetime
 import json
 import os
 import queue
+import re
 import shutil
 import socket
 import subprocess
@@ -157,7 +161,7 @@ def make_debug_logger(log_dir=None):
         return _NullLogger()
 
 APP_NAME = "DUO"
-APP_VERSION = "0.11"
+APP_VERSION = "0.12"
 DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434"
 OLLAMA_URL_ENV = "DUAL_CHAT_OLLAMA_URL"
 
@@ -989,6 +993,22 @@ def format_full_transcript(log, when=None):
     return "\n\n".join([header] + blocks) + "\n"
 
 
+def phrase_matches(phrase, text):
+    """Whether phrase appears in text as whole words, not a fragment.
+
+    Case-insensitive. The phrase must not be glued to another word on
+    either side: "agreed" matches "Agreed, moving on." but not
+    "I disagreed with that" (v0.12: substring matching ended a relay
+    the moment a model disagreed). Punctuation is fine on either side,
+    so "Sounds good!" still matches, and so does a user stop phrase
+    that ends in punctuation.
+    """
+    if not phrase:
+        return False
+    pattern = r"(?<!\w)" + re.escape(phrase) + r"(?!\w)"
+    return re.search(pattern, text, re.IGNORECASE) is not None
+
+
 class RelaySession:
     """One relay run: config, turn counting, framing, stop checks.
 
@@ -1029,11 +1049,12 @@ class RelaySession:
     def find_stop_phrase(self, text):
         """The configured stop phrase found in text, or None.
 
-        Case-insensitive substring match.
+        Case-insensitive whole-word match: a phrase only counts when
+        it is not glued to another word, so "cap" does not stop on
+        "capital".
         """
-        lowered = text.lower()
         for phrase in self.stop_phrases:
-            if phrase.lower() in lowered:
+            if phrase_matches(phrase, text):
                 return phrase
         return None
 
@@ -1041,13 +1062,13 @@ class RelaySession:
         """The agreement phrase found in text, or None.
 
         Only when stop-on-agreement is enabled. Case-insensitive
-        substring match on the fixed AGREEMENT_PHRASES list.
+        whole-word match on the fixed AGREEMENT_PHRASES list, so
+        "disagreed" never counts as "agreed".
         """
         if not self.stop_on_agreement:
             return None
-        lowered = text.lower()
         for phrase in AGREEMENT_PHRASES:
-            if phrase in lowered:
+            if phrase_matches(phrase, text):
                 return phrase
         return None
 
