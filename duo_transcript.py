@@ -3,8 +3,8 @@ both sides, full log), name the files, and parse a saved
 single-pane transcript back into entries.
 
 Split out of dual_chat.py in v0.25 (audit T14). The formatters
-take a side object and read its labels/display text -- they
-never import the model, so this module stays decoupled from
+take a side object and read its messages (label + display text) --
+they never import the model, so this module stays decoupled from
 it; only the summary label is shared (from duo_model).
 """
 
@@ -75,8 +75,8 @@ def _side_blocks(side_obj):
     """One text block per message, exactly as the window shows it:
     "label: display text", with the short display text (attachment
     tag, handoff note) instead of the full contents."""
-    return ["%s: %s" % (label, side_obj.display_text(i))
-            for i, label in enumerate(side_obj.labels)]
+    return ["%s: %s" % (msg.label, msg.display_text())
+            for msg in side_obj.messages]
 
 
 def format_side_transcript(side_obj, when=None):
@@ -87,7 +87,7 @@ def format_side_transcript(side_obj, when=None):
     model = side_obj.model or "no model picked"
     header = ("DUO transcript -- Model %s (%s) -- saved %s"
               % (side_obj.name, model, _saved_stamp(when)))
-    if not side_obj.history:
+    if not side_obj.messages:
         return header + "\n\nNo messages yet.\n"
     return "\n\n".join([header] + _side_blocks(side_obj)) + "\n"
 
@@ -102,7 +102,7 @@ def format_both_transcript(convo, when=None):
         side_obj = convo.sides[side]
         model = side_obj.model or "no model picked"
         parts.append("Model %s (%s)" % (side, model))
-        if not side_obj.history:
+        if not side_obj.messages:
             parts.append("No messages yet.")
         else:
             parts.extend(_side_blocks(side_obj))

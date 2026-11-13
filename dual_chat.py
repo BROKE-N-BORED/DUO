@@ -171,8 +171,8 @@ except ImportError:  # pragma: no cover - the zip always ships it
 from duo_icon import make_app_icon
 from duo_markdown import markdown_to_html
 from duo_model import (
-    ChatSide, Conversation, MSG_NO_MODEL, NoModelSelected, SUMMARY_KEEP_LAST,
-    SUMMARY_LABEL,)
+    ChatMessage, ChatSide, Conversation, MSG_NO_MODEL, NoModelSelected,
+    SUMMARY_KEEP_LAST, SUMMARY_LABEL,)
 from duo_ollama import (
     CHAT_MAX_ATTEMPTS, CHAT_RETRY_DELAYS, CHAT_TIMEOUT, DEFAULT_OLLAMA_URL,
     MSG_MODEL_FAILED, MSG_OLLAMA_DOWN, MSG_OLLAMA_NOT_INSTALLED,
@@ -265,7 +265,7 @@ def make_debug_logger(log_dir=None):
         return _NullLogger()
 
 APP_NAME = "DUO"
-APP_VERSION = "0.25"
+APP_VERSION = "0.26"
 
 # Phone deck (v0.11): DUO serves a small local page for his phone.
 # Fixed port with a fallback chain if it is busy; DUAL_CHAT_DECK_PORT
@@ -521,15 +521,12 @@ def build_deck_state(convo, state):
     sides = {}
     for side in ("A", "B"):
         side_obj = convo.sides[side]
-        labels = list(side_obj.labels)
-        count = min(len(labels), len(side_obj.history))
-        messages = []
-        for i in range(count):
-            try:
-                text = side_obj.display_text(i)
-            except IndexError:
-                break  # display list shorter than history; stop here
-            messages.append({"label": labels[i], "text": text})
+        # Copy first: the deck thread reads while the GUI thread
+        # writes, so the snapshot must never see a half-appended
+        # message. One list of messages, so the three can never
+        # drift out of sync the way the old parallel arrays could.
+        messages = [{"label": msg.label, "text": msg.display_text()}
+                    for msg in list(side_obj.messages)]
         sides[side] = {"model": side_obj.model, "messages": messages}
     active = sorted(state.get("active") or [])
     queued = sorted(state.get("queued") or [])
@@ -1604,7 +1601,7 @@ def build_window(client=None, logger=None, deck_port=None):
         state["full_log"].append((side, label, text))
 
     def render_transcript(side):
-        """Rebuild a pane's transcript from its history and labels.
+        """Rebuild a pane's transcript from its messages.
 
         Used after a reorder or delete. Rebuilt through append_message,
         so the format matches the live transcript exactly -- blank
@@ -1617,10 +1614,10 @@ def build_window(client=None, logger=None, deck_port=None):
         side_obj = convo.sides[side]
         widgets[side]["transcript"].clear()
         widgets[side]["reply_body_pos"] = None
-        for i, label in enumerate(side_obj.labels):
-            markdown = (side_obj.history[i]["role"] == "assistant"
-                        or label == SUMMARY_LABEL)
-            append_message(side, label, side_obj.display_text(i),
+        for msg in side_obj.messages:
+            markdown = (msg.role == "assistant"
+                        or msg.label == SUMMARY_LABEL)
+            append_message(side, msg.label, msg.display_text(),
                            markdown=markdown)
         scroll_to_end(widgets[side]["transcript"])
         # A rebuild drops the highlights with the old document, so
@@ -1630,8 +1627,8 @@ def build_window(client=None, logger=None, deck_port=None):
 
     # --- transcript search ---------------------------------------------------
     # Search is display-only: it highlights matches in the pane's
-    # transcript and jumps between them, and never touches history,
-    # labels, or the saved file. Matching is a case-insensitive plain
+    # transcript and jumps between them, and never touches the
+    # messages or the saved file. Matching is a case-insensitive plain
     # substring search over the displayed text -- no regex. Matches
     # are found through the document itself (QTextDocument.find), so
     # positions are always document positions, whatever characters
@@ -1728,11 +1725,11 @@ def build_window(client=None, logger=None, deck_port=None):
         lst.blockSignals(True)
         lst.clear()
         side_obj = convo.sides[side]
-        for i, label in enumerate(side_obj.labels):
-            text = side_obj.display_text(i).replace("\n", " ")
+        for msg in side_obj.messages:
+            text = msg.display_text().replace("\n", " ")
             if len(text) > 70:
                 text = text[:67] + "..."
-            lst.addItem("%s: %s" % (label, text))
+            lst.addItem("%s: %s" % (msg.label, text))
         lst.blockSignals(False)
         refresh_history_buttons(side)
 
@@ -1745,7 +1742,7 @@ def build_window(client=None, logger=None, deck_port=None):
         w = widgets[side]
         lst = w["hist_list"]
         row = lst.currentRow()
-        count = len(convo.sides[side].history)
+        count = len(convo.sides[side].messages)
         idle = (not state["busy"] and state.get("relay") is None
                 and side not in state["active"]
                 and side not in state["queued"])
@@ -1851,12 +1848,12 @@ def build_window(client=None, logger=None, deck_port=None):
             w["summarize"].setEnabled(
                 not busy and not relay_active
                 and convo.sides[side].model is not None
-                and len(convo.sides[side].history) > SUMMARY_KEEP_LAST)
+                and len(convo.sides[side].messages) > SUMMARY_KEEP_LAST)
             # The nudge shows only when summarizing can actually help:
             # over budget AND something older to fold. It never calls
             # the model on its own -- it only shows or hides.
             w["nudge"].setVisible(
-                len(convo.sides[side].history) > SUMMARY_KEEP_LAST
+                len(convo.sides[side].messages) > SUMMARY_KEEP_LAST
                 and convo.sides[side].history_chars()
                 > HISTORY_BUDGET_CHARS)
             refresh_history_buttons(side)
@@ -2460,7 +2457,7 @@ def build_window(client=None, logger=None, deck_port=None):
                 "Couldn't import that file: %s" % exc, 5000)
             return
         side_obj = convo.sides[side]
-        if side_obj.history:
+        if side_obj.messages:
             answer = QtWidgets.QMessageBox.question(
                 window, "Import transcript?",
                 "Importing replaces the conversation in this pane.",
@@ -2468,11 +2465,9 @@ def build_window(client=None, logger=None, deck_port=None):
                 QtWidgets.QMessageBox.No)
             if answer != QtWidgets.QMessageBox.Yes:
                 return
-        side_obj.history = [{"role": entry["role"],
-                             "content": entry["content"]}
-                            for entry in entries]
-        side_obj.labels = [entry["label"] for entry in entries]
-        side_obj.display = [None] * len(entries)
+        side_obj.messages = [ChatMessage(entry["role"], entry["content"],
+                                         entry["label"])
+                             for entry in entries]
         state["full_log"] = [entry for entry in state["full_log"]
                              if entry[0] != side]
         for entry in entries:
@@ -2542,9 +2537,7 @@ def build_window(client=None, logger=None, deck_port=None):
         for side in ("A", "B"):
             new_side = new_convo.sides[side]
             side_obj = convo.sides[side]
-            side_obj.history = list(new_side.history)
-            side_obj.labels = list(new_side.labels)
-            side_obj.display = list(new_side.display)
+            side_obj.messages = list(new_side.messages)
             side_obj.instruction = new_side.instruction
             widgets[side]["instr_edit"].setPlainText(new_side.instruction)
             # The model is set explicitly, not through the picker's
@@ -2593,7 +2586,7 @@ def build_window(client=None, logger=None, deck_port=None):
             statusbar.showMessage(
                 "Couldn't open that file: %s" % exc, 5000)
             return
-        if convo.sides["A"].history or convo.sides["B"].history:
+        if convo.sides["A"].messages or convo.sides["B"].messages:
             answer = QtWidgets.QMessageBox.question(
                 window, "Open conversation?",
                 "Opening a conversation replaces the one on screen.",
@@ -2737,7 +2730,7 @@ def build_window(client=None, logger=None, deck_port=None):
             statusbar.showMessage(
                 MSG_NO_MODEL.format(side="Model " + side), 4000)
             return
-        if len(side_obj.history) <= SUMMARY_KEEP_LAST:
+        if len(side_obj.messages) <= SUMMARY_KEEP_LAST:
             statusbar.showMessage("Nothing to summarize yet.", 3000)
             return
         state["busy"] = True
@@ -2963,7 +2956,7 @@ def build_window(client=None, logger=None, deck_port=None):
                 new_row = max(0, row - 1)
             else:
                 side_obj.move_down(row)
-                new_row = min(len(side_obj.history) - 1, row + 1)
+                new_row = min(len(side_obj.messages) - 1, row + 1)
             render_transcript(side)
             refresh_history_list(side)
             lst.setCurrentRow(new_row)
@@ -2981,9 +2974,9 @@ def build_window(client=None, logger=None, deck_port=None):
             convo.sides[side].delete_at(row)
             render_transcript(side)
             refresh_history_list(side)
-            if convo.sides[side].history:
+            if convo.sides[side].messages:
                 lst.setCurrentRow(
-                    min(row, len(convo.sides[side].history) - 1))
+                    min(row, len(convo.sides[side].messages) - 1))
             refresh_buttons()
         return delete
 

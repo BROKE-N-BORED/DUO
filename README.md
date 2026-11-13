@@ -8,8 +8,7 @@ Or start a relay: type a seed message, press Start Relay, and the two
 models talk to each other — each reply is handed to the other model,
 one turn at a time, until the turn cap or a stop condition.
 
-License: not decided yet — the project owner will pick one. Version
-history lives in CHANGELOG.md.
+License: MIT (see LICENSE). Version history lives in CHANGELOG.md.
 
 Everything in one app:
 

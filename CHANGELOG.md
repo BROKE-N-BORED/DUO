@@ -1,7 +1,20 @@
 # DUO changelog
 
 Every version, newest first. v0.1–v0.17 were built on 2026-11-12;
-v0.18–v0.25 on 2026-11-13.
+v0.18–v0.26 on 2026-11-13.
+
+## v0.26 — 2026-11-13
+
+Messages are one structure now. Each side used to keep three
+separate lists — the message contents, the sender labels, and the
+short display texts — and the three had to stay in step by hand.
+Each message is now one object holding its role, content, label,
+and display text together, so a label or display text can never
+end up on the wrong message when a conversation is reordered,
+summarized, saved, or loaded. Nothing you can see changed: same
+window, same features, same files — conversations saved by older
+versions still open exactly as before. DUO is now MIT-licensed
+(see LICENSE).
 
 ## v0.25 — 2026-11-13
 

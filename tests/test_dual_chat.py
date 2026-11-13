@@ -38,7 +38,7 @@ from dual_chat import (  # noqa: E402
     TASK_ROUNDS_MIN,
     TEMPERATURE_DEFAULT, TEMPERATURE_MAX, TEMPERATURE_MIN,
     AttachmentError, Cancelled,
-    ChatSide, Conversation, ConversationError, DeckServer,
+    ChatMessage, ChatSide, Conversation, ConversationError, DeckServer,
     HISTORY_BUDGET_CHARS,
     NoModelSelected,
     OllamaClient, OllamaError, OllamaServerManager, RelaySession,
@@ -201,15 +201,15 @@ class ConversationTests(unittest.TestCase):
     def test_histories_are_independent(self):
         self.convo.sides["A"].add_user("hello A")
         self.convo.sides["A"].add_assistant("hi")
-        self.assertEqual(len(self.convo.sides["A"].history), 2)
-        self.assertEqual(self.convo.sides["B"].history, [])
+        self.assertEqual(len(self.convo.sides["A"].messages), 2)
+        self.assertEqual(self.convo.sides["B"].messages, [])
 
     def test_clear_only_clears_one_side(self):
         self.convo.sides["A"].add_user("x")
         self.convo.sides["B"].add_user("y")
         self.convo.sides["A"].clear()
-        self.assertEqual(self.convo.sides["A"].history, [])
-        self.assertEqual(len(self.convo.sides["B"].history), 1)
+        self.assertEqual(self.convo.sides["A"].messages, [])
+        self.assertEqual(len(self.convo.sides["B"].messages), 1)
 
     def test_targets_a_only(self):
         self.assertEqual([s.name for s in self.convo.targets_for("A")], ["A"])
@@ -232,7 +232,7 @@ class ConversationTests(unittest.TestCase):
     def test_chat_side_defaults(self):
         side = ChatSide("A")
         self.assertIsNone(side.model)
-        self.assertEqual(side.history, [])
+        self.assertEqual(side.messages, [])
 
 
 # ---------------------------------------------------------------------------
@@ -907,8 +907,8 @@ class GuiTests(unittest.TestCase):
             self.state["widgets"]["A"]["transcript"].toPlainText()
             and "Reply from fake-b:latest." in
             self.state["widgets"]["B"]["transcript"].toPlainText()
-            and len(self.state["convo"].sides["A"].history) == 2
-            and len(self.state["convo"].sides["B"].history) == 2),
+            and len(self.state["convo"].sides["A"].messages) == 2
+            and len(self.state["convo"].sides["B"].messages) == 2),
             timeout=15)
         self.assertTrue(ok, "both panes should show their replies")
         # One at a time, A first.
@@ -917,10 +917,10 @@ class GuiTests(unittest.TestCase):
         # Each side's history holds its own exchange only.
         convo = self.state["convo"]
         self.assertEqual(
-            [m["content"] for m in convo.sides["A"].history],
+            [m.content for m in convo.sides["A"].messages],
             ["Hello, both of you.", "Reply from fake-a:latest."])
         self.assertEqual(
-            [m["content"] for m in convo.sides["B"].history],
+            [m.content for m in convo.sides["B"].messages],
             ["Hello, both of you.", "Reply from fake-b:latest."])
 
     def test_send_to_a_only(self):
@@ -930,7 +930,7 @@ class GuiTests(unittest.TestCase):
         ok = self._wait_for(lambda: (
             "Reply from fake-a:latest." in
             self.state["widgets"]["A"]["transcript"].toPlainText()
-            and len(self.state["convo"].sides["A"].history) == 2),
+            and len(self.state["convo"].sides["A"].messages) == 2),
             timeout=15)
         self.assertNotIn("Just for A.", self.state["widgets"]["B"]
                          ["transcript"].toPlainText())
@@ -942,10 +942,10 @@ class GuiTests(unittest.TestCase):
         self.assertTrue(self._wait_for(lambda: (
             "Reply from fake-a:latest." in
             self.state["widgets"]["A"]["transcript"].toPlainText()
-            and len(self.state["convo"].sides["A"].history) == 2),
+            and len(self.state["convo"].sides["A"].messages) == 2),
             timeout=15))
         self.state["widgets"]["A"]["clear"].click()
-        self.assertEqual(self.state["convo"].sides["A"].history, [])
+        self.assertEqual(self.state["convo"].sides["A"].messages, [])
         self.assertEqual(self.state["widgets"]["A"]["transcript"]
                          .toPlainText(), "")
 
@@ -1163,8 +1163,8 @@ class RelayGuiTests(unittest.TestCase):
         # ...but the tag never reaches either model's history.
         convo = self.state["convo"]
         for side in ("A", "B"):
-            for message in convo.sides[side].history:
-                self.assertNotIn("[relay", message["content"])
+            for message in convo.sides[side].messages:
+                self.assertNotIn("[relay", message.content)
         # And the seed itself carries no tag.
         self.assertNotIn("[relay", self._transcript("A"))
 
@@ -1247,24 +1247,24 @@ class ChatSideEditTests(unittest.TestCase):
         return side
 
     def _contents(self, side):
-        return [m["content"] for m in side.history]
+        return [m.content for m in side.messages]
 
     def test_labels_default(self):
         side = ChatSide("A")
         side.model = "fake-a:latest"
         side.add_user("hi")
         side.add_assistant("hello")
-        self.assertEqual(side.labels, ["You", "fake-a:latest"])
+        self.assertEqual([m.label for m in side.messages], ["You", "fake-a:latest"])
         side2 = ChatSide("B")
         side2.add_assistant("hello")
-        self.assertEqual(side2.labels, ["Assistant"])
+        self.assertEqual([m.label for m in side2.messages], ["Assistant"])
 
     def test_labels_move_with_entries(self):
         side = self._side_with_four()
         side.move_up(2)
         self.assertEqual(self._contents(side),
                          ["first", "second", "alpha one", "alpha two"])
-        self.assertEqual(side.labels,
+        self.assertEqual([m.label for m in side.messages],
                          ["You", "You", "fake-a:latest", "fake-a:latest"])
 
     def test_move_up_and_down(self):
@@ -1296,33 +1296,41 @@ class ChatSideEditTests(unittest.TestCase):
         side.delete_at(1)
         self.assertEqual(self._contents(side),
                          ["first", "second", "alpha two"])
-        self.assertEqual(side.labels, ["You", "You", "fake-a:latest"])
+        self.assertEqual([m.label for m in side.messages], ["You", "You", "fake-a:latest"])
         side.delete_at(99)  # out of range: no-op
         side.delete_at(-1)
-        self.assertEqual(len(side.history), 3)
+        self.assertEqual(len(side.messages), 3)
 
     def test_clear_clears_labels_too(self):
         side = self._side_with_four()
         side.clear()
-        self.assertEqual(side.history, [])
-        self.assertEqual(side.labels, [])
+        self.assertEqual(side.messages, [])
+        self.assertEqual([m.label for m in side.messages], [])
 
     def test_messages_for_model_without_instruction(self):
         side = self._side_with_four()
-        self.assertEqual(side.messages_for_model(), side.history)
-        self.assertIsNot(side.messages_for_model(), side.history)
+        expected = [m.for_model() for m in side.messages]
+        self.assertEqual(side.messages_for_model(), expected)
+        # A fresh list of fresh dicts each call: mutating what comes
+        # back must never touch the side's messages.
+        sent = side.messages_for_model()
+        sent.append({"role": "user", "content": "injected"})
+        sent[0]["content"] = "tampered"
+        self.assertEqual(len(side.messages), 4)
+        self.assertEqual(side.messages[0].content, "first")
 
     def test_messages_for_model_with_instruction(self):
         side = self._side_with_four()
         side.instruction = "Be brief."
         self.assertEqual(side.messages_for_model(), [
             {"role": "system", "content": "Be brief."},
-        ] + side.history)
+        ] + [m.for_model() for m in side.messages])
 
     def test_messages_for_model_whitespace_instruction_is_none(self):
         side = self._side_with_four()
         side.instruction = "   \n  "
-        self.assertEqual(side.messages_for_model(), side.history)
+        self.assertEqual(side.messages_for_model(),
+                         [m.for_model() for m in side.messages])
 
 
 # ---------------------------------------------------------------------------
@@ -1345,12 +1353,12 @@ class SummarizeTests(unittest.TestCase):
         side = self._side_with_six()
         self.assertTrue(side.summarize("They talked about fruit."))
         self.assertEqual(
-            [m["content"] for m in side.history],
+            [m.content for m in side.messages],
             ["Earlier in this conversation: They talked about fruit.",
              "second", "alpha two", "third", "alpha three"])
-        self.assertEqual(side.labels, [
+        self.assertEqual([m.label for m in side.messages], [
             SUMMARY_LABEL, "You", "fake-a:latest", "You", "fake-a:latest"])
-        self.assertEqual(side.history[0]["role"], "user")
+        self.assertEqual(side.messages[0].role, "user")
         self.assertEqual(SUMMARY_KEEP_LAST, 4)
 
     def test_summarize_short_history_is_noop(self):
@@ -1358,41 +1366,41 @@ class SummarizeTests(unittest.TestCase):
         side.add_user("hi")
         side.add_assistant("hello")
         self.assertFalse(side.summarize("whatever"))
-        self.assertEqual(len(side.history), 2)
+        self.assertEqual(len(side.messages), 2)
         # Exactly 4 entries: nothing older to fold.
         side.add_user("again")
         side.add_assistant("yep")
         self.assertFalse(side.summarize("whatever"))
-        self.assertEqual(len(side.history), 4)
+        self.assertEqual(len(side.messages), 4)
 
     def test_summarize_five_entries_folds_one(self):
         side = self._side_with_six()
         side.delete_at(0)
-        self.assertEqual(len(side.history), 5)
+        self.assertEqual(len(side.messages), 5)
         self.assertTrue(side.summarize("Summary."))
         self.assertEqual(
-            [m["content"] for m in side.history],
+            [m.content for m in side.messages],
             ["Earlier in this conversation: Summary.",
              "second", "alpha two", "third", "alpha three"])
 
     def test_summarize_empty_summary_is_noop(self):
         side = self._side_with_six()
         self.assertFalse(side.summarize("   "))
-        self.assertEqual(len(side.history), 6)
+        self.assertEqual(len(side.messages), 6)
 
     def test_second_summarize_folds_the_first(self):
         side = self._side_with_six()
         side.summarize("First summary.")
         side.add_user("fourth")
         side.add_assistant("alpha four")
-        self.assertEqual(len(side.history), 7)
+        self.assertEqual(len(side.messages), 7)
         self.assertTrue(side.summarize("Second summary."))
         self.assertEqual(
-            [m["content"] for m in side.history],
+            [m.content for m in side.messages],
             ["Earlier in this conversation: Second summary.",
              "third", "alpha three", "fourth", "alpha four"])
         # One summary entry, not two: the old one was folded in.
-        self.assertEqual(side.labels.count(SUMMARY_LABEL), 1)
+        self.assertEqual([m.label for m in side.messages].count(SUMMARY_LABEL), 1)
 
     def test_history_chars_sums_contents(self):
         side = ChatSide("A")
@@ -1825,7 +1833,7 @@ class DirectorGuiTests(unittest.TestCase):
         self.state["composer"].setPlainText(text)
         self.state["send_a"].click()
         return self._wait_for(lambda: (
-            len(self.state["convo"].sides["A"].history) >= 2
+            len(self.state["convo"].sides["A"].messages) >= 2
             and not self.state["state"]["busy"]), timeout=15)
 
     def _last_messages_for(self, model):
@@ -1847,7 +1855,7 @@ class DirectorGuiTests(unittest.TestCase):
         self.assertTrue(self._send_to_a_and_wait("second message"))
         convo = self.state["convo"]
         self.assertEqual(
-            [m["content"] for m in convo.sides["A"].history],
+            [m.content for m in convo.sides["A"].messages],
             ["first message", "alpha one", "second message", "alpha two"])
         self._open_history("A")
         lst = self.state["widgets"]["A"]["hist_list"]
@@ -1859,7 +1867,7 @@ class DirectorGuiTests(unittest.TestCase):
         self.app.processEvents()
         # History and transcript both show the new order.
         self.assertEqual(
-            [m["content"] for m in convo.sides["A"].history],
+            [m.content for m in convo.sides["A"].messages],
             ["first message", "second message", "alpha one", "alpha two"])
         text = self._transcript("A")
         self.assertLess(text.find("first message"),
@@ -1889,7 +1897,7 @@ class DirectorGuiTests(unittest.TestCase):
         self.app.processEvents()
         convo = self.state["convo"]
         self.assertEqual(
-            [m["content"] for m in convo.sides["A"].history],
+            [m.content for m in convo.sides["A"].messages],
             ["alpha one", "second message", "alpha two"])
         self.assertNotIn("first message", self._transcript("A"))
         self.assertTrue(self._send_to_a_and_wait("third message"))
@@ -2249,7 +2257,7 @@ class Item4GuiTests(unittest.TestCase):
         self.state["composer"].setPlainText(text)
         self.state["send_a"].click()
         return self._wait_for(lambda: (
-            len(self.state["convo"].sides["A"].history) >= 2
+            len(self.state["convo"].sides["A"].messages) >= 2
             and not self.state["state"]["busy"]), timeout=15)
 
     def _last_messages_for(self, model):
@@ -2276,7 +2284,7 @@ class Item4GuiTests(unittest.TestCase):
         self.assertTrue(self._send_to_a_and_wait("first message"))
         self.assertTrue(self._send_to_a_and_wait("second message"))
         self.assertTrue(self._send_to_a_and_wait("third message"))
-        self.assertEqual(len(self.state["convo"].sides["A"].history), 6)
+        self.assertEqual(len(self.state["convo"].sides["A"].messages), 6)
 
     def test_stats_show_dashes_before_any_turn(self):
         dashes = ("-- tok/s · -- out / -- in · first token -- · "
@@ -2360,17 +2368,17 @@ class Item4GuiTests(unittest.TestCase):
         self.assertTrue(self._send_to_a_and_wait("second message"))
         self.assertTrue(self._send_to_a_and_wait("third message"))
         convo = self.state["convo"]
-        self.assertEqual(len(convo.sides["A"].history), 6)
+        self.assertEqual(len(convo.sides["A"].messages), 6)
         summarize_btn = self.state["widgets"]["A"]["summarize"]
         self.assertTrue(summarize_btn.isEnabled())
         summarize_btn.click()
         ok = self._wait_for(lambda: (
-            len(convo.sides["A"].history) == 5
-            and convo.sides["A"].labels[0] == SUMMARY_LABEL
+            len(convo.sides["A"].messages) == 5
+            and convo.sides["A"].messages[0].label == SUMMARY_LABEL
             and not self.state["state"]["busy"]), timeout=15)
         self.assertTrue(ok, "history should fold into summary + last 4")
         self.assertEqual(
-            [m["content"] for m in convo.sides["A"].history],
+            [m.content for m in convo.sides["A"].messages],
             ["Earlier in this conversation: "
              "They discussed fruit and picked apple pie.",
              "second message", "alpha two",
@@ -2435,7 +2443,7 @@ class Item4GuiTests(unittest.TestCase):
         self.client.replies = {"fake-a:latest": ["A long ramble."]}
         self.state["widgets"]["A"]["summarize"].click()
         ok = self._wait_for(lambda: (
-            len(side.history) == 5
+            len(side.messages) == 5
             and not self.state["state"]["busy"]), timeout=15)
         self.assertTrue(ok, "summarize should fold the long history")
         self.assertLess(side.history_chars(), HISTORY_BUDGET_CHARS)
@@ -2589,7 +2597,7 @@ class ChatSideDisplayTests(unittest.TestCase):
         self.assertEqual(side.display_text(0),
                          "read this\n(Attached: a.txt)")
         # The model still sees the full content.
-        self.assertEqual(side.history[0]["content"],
+        self.assertEqual(side.messages[0].content,
                          "File: a.txt\nAAA\n\nread this")
 
     def test_display_moves_and_deletes_with_entries(self):
@@ -2601,16 +2609,16 @@ class ChatSideDisplayTests(unittest.TestCase):
                          ["TWO", "ONE"])
         side.delete_at(0)
         self.assertEqual(side.display_text(0), "ONE")
-        self.assertEqual(side.history[0]["content"], "one")
+        self.assertEqual(side.messages[0].content, "one")
 
     def test_display_survives_summarize_for_kept_entries(self):
         side = ChatSide("A")
         for i in range(6):
             side.add_user("msg %d" % i, display="D%d" % i)
         self.assertTrue(side.summarize("a summary"))
-        self.assertEqual(len(side.history), 5)
+        self.assertEqual(len(side.messages), 5)
         # The summary entry itself has no override; the kept four do.
-        self.assertEqual(side.display_text(0), side.history[0]["content"])
+        self.assertEqual(side.display_text(0), side.messages[0].content)
         self.assertEqual([side.display_text(i) for i in range(1, 5)],
                          ["D2", "D3", "D4", "D5"])
 
@@ -2618,7 +2626,7 @@ class ChatSideDisplayTests(unittest.TestCase):
         side = ChatSide("A")
         side.add_user("x", display="X")
         side.clear()
-        self.assertEqual(side.display, [])
+        self.assertEqual([m.display for m in side.messages], [])
 
     def test_add_user_and_add_assistant_return_their_labels(self):
         side = ChatSide("A")
@@ -2697,8 +2705,8 @@ class Item5GuiTests(unittest.TestCase):
         self.state["composer"].setPlainText(text)
         self.state["send_both"].click()
         return self._wait_for(lambda: (
-            len(self.state["convo"].sides["A"].history) >= 2
-            and len(self.state["convo"].sides["B"].history) >= 2
+            len(self.state["convo"].sides["A"].messages) >= 2
+            and len(self.state["convo"].sides["B"].messages) >= 2
             and not self.state["state"]["busy"]), timeout=15)
 
     def test_attach_list_shows_names_and_attaching_calls_nothing(self):
@@ -2783,7 +2791,7 @@ class Item5GuiTests(unittest.TestCase):
                          self.window.statusBar().currentMessage())
         # Let the turn finish so the window closes cleanly.
         self.assertTrue(self._wait_for(lambda: (
-            len(self.state["convo"].sides["A"].history) >= 2
+            len(self.state["convo"].sides["A"].messages) >= 2
             and not self.state["state"]["busy"]), timeout=15))
 
     def test_remove_button_drops_one_file(self):
@@ -3001,9 +3009,9 @@ class Item6GuiTests(unittest.TestCase):
         self.assertNotIn("[task handoff]",
                          json.dumps(self.client.messages_seen))
         # The labels live on the history entries (window-only by design).
-        self.assertEqual(self.state["convo"].sides["A"].labels[0],
+        self.assertEqual(self.state["convo"].sides["A"].messages[0].label,
                          "You [task]")
-        self.assertEqual(self.state["convo"].sides["B"].labels[0],
+        self.assertEqual(self.state["convo"].sides["B"].messages[0].label,
                          "You [task handoff]")
 
     def test_run_disabled_mid_generation(self):
@@ -3957,15 +3965,15 @@ class Item7GuiTests(unittest.TestCase):
         self.state["composer"].setPlainText(text)
         self.state["send_a"].click()
         return self._wait_for(lambda: (
-            len(self.state["convo"].sides["A"].history) >= 2
+            len(self.state["convo"].sides["A"].messages) >= 2
             and not self.state["state"]["busy"]), timeout=15)
 
     def _send_both_and_wait(self, text):
         self.state["composer"].setPlainText(text)
         self.state["send_both"].click()
         return self._wait_for(lambda: (
-            len(self.state["convo"].sides["A"].history) >= 2
-            and len(self.state["convo"].sides["B"].history) >= 2
+            len(self.state["convo"].sides["A"].messages) >= 2
+            and len(self.state["convo"].sides["B"].messages) >= 2
             and not self.state["state"]["busy"]), timeout=15)
 
     def _start_relay(self, seed, cap=10):
@@ -4056,8 +4064,7 @@ class Item7GuiTests(unittest.TestCase):
         self.assertIn("No such file or directory", message)
         # No crash: the window is still alive and the transcript intact.
         self.assertTrue(self.window.isVisible())
-        self.assertIn("hello", self.state["convo"].sides["A"].history[0]
-                      ["content"])
+        self.assertIn("hello", self.state["convo"].sides["A"].messages[0].content)
 
     def test_failed_overwrite_leaves_old_file_intact(self):
         # v0.18 (audit T7): the save is atomic, so a failure at the
@@ -4195,15 +4202,15 @@ class Item9GuiTests(unittest.TestCase):
         self.state["composer"].setPlainText(text)
         self.state["send_a"].click()
         return self._wait_for(lambda: (
-            len(self.state["convo"].sides["A"].history) >= 2
+            len(self.state["convo"].sides["A"].messages) >= 2
             and not self.state["state"]["busy"]), timeout=15)
 
     def _send_both_and_wait(self, text):
         self.state["composer"].setPlainText(text)
         self.state["send_both"].click()
         return self._wait_for(lambda: (
-            len(self.state["convo"].sides["A"].history) >= 2
-            and len(self.state["convo"].sides["B"].history) >= 2
+            len(self.state["convo"].sides["A"].messages) >= 2
+            and len(self.state["convo"].sides["B"].messages) >= 2
             and not self.state["state"]["busy"]), timeout=15)
 
     def _start_relay(self, seed, cap=10):
@@ -4384,7 +4391,7 @@ class Item9GuiTests(unittest.TestCase):
         self.app.processEvents()
         # The history changed, but the log is what actually happened.
         self.assertEqual(
-            [m["content"] for m in self.state["convo"].sides["A"].history],
+            [m.content for m in self.state["convo"].sides["A"].messages],
             ["second message", "alpha one", "alpha two"])
         self.assertEqual(self.state["state"]["full_log"], before)
 
@@ -4400,8 +4407,8 @@ class Item9GuiTests(unittest.TestCase):
         self.state["widgets"]["A"]["summarize"].click()
         convo = self.state["convo"]
         ok = self._wait_for(lambda: (
-            len(convo.sides["A"].history) == 5
-            and convo.sides["A"].labels[0] == SUMMARY_LABEL
+            len(convo.sides["A"].messages) == 5
+            and convo.sides["A"].messages[0].label == SUMMARY_LABEL
             and not self.state["state"]["busy"]), timeout=15)
         self.assertTrue(ok, "history should fold into summary + last 4")
         # The folded history changed; the log keeps the originals.
@@ -5027,7 +5034,7 @@ class DebugLogGuiTests(unittest.TestCase):
         self.state["composer"].setPlainText(text)
         self.state["send_a"].click()
         return self._wait_for(lambda: (
-            len(self.state["convo"].sides["A"].history) >= 2
+            len(self.state["convo"].sides["A"].messages) >= 2
             and not self.state["state"]["busy"]), timeout=15)
 
     def test_debug_report_button_writes_report(self):
@@ -5455,12 +5462,12 @@ class DeckGuiTests(unittest.TestCase):
         self.assertTrue(self._wait_for(lambda: (
             "Reply from fake-a:latest." in
             self.state["widgets"]["A"]["transcript"].toPlainText()
-            and len(self.state["convo"].sides["A"].history) == 2),
+            and len(self.state["convo"].sides["A"].messages) == 2),
             timeout=15))
         self.assertEqual(self.client.calls, ["fake-a:latest"])
-        self.assertEqual(self.state["convo"].sides["B"].history, [])
+        self.assertEqual(self.state["convo"].sides["B"].messages, [])
         self.assertEqual(
-            [m["content"] for m in self.state["convo"].sides["A"].history],
+            [m.content for m in self.state["convo"].sides["A"].messages],
             ["Just for A.", "Reply from fake-a:latest."])
 
     def test_phone_send_to_both(self):
@@ -5468,8 +5475,8 @@ class DeckGuiTests(unittest.TestCase):
         res = self._post_send({"text": "Both, please.", "target": "Both"})
         self.assertTrue(res["ok"])
         self.assertTrue(self._wait_for(lambda: (
-            len(self.state["convo"].sides["A"].history) == 2
-            and len(self.state["convo"].sides["B"].history) == 2),
+            len(self.state["convo"].sides["A"].messages) == 2
+            and len(self.state["convo"].sides["B"].messages) == 2),
             timeout=15))
         self.assertEqual(self.client.calls,
                          ["fake-a:latest", "fake-b:latest"])
@@ -5526,7 +5533,7 @@ class DeckGuiTests(unittest.TestCase):
             res = self._post_send({"text": "Phone hello", "target": "A"})
             self.assertTrue(res["ok"])
             self.assertTrue(self._wait_for(lambda: (
-                len(self.state["convo"].sides["A"].history) == 2),
+                len(self.state["convo"].sides["A"].messages) == 2),
                 timeout=15))
             sent = self.client.messages_seen[-1]
             self.assertNotIn("DESKTOP-SECRET-CONTENT", json.dumps(sent))
@@ -5540,8 +5547,8 @@ class DeckGuiTests(unittest.TestCase):
         self.assertTrue(
             self._post_send({"text": "One", "target": "Both"})["ok"])
         self.assertTrue(self._wait_for(lambda: (
-            len(self.state["convo"].sides["A"].history) == 2
-            and len(self.state["convo"].sides["B"].history) == 2),
+            len(self.state["convo"].sides["A"].messages) == 2
+            and len(self.state["convo"].sides["B"].messages) == 2),
             timeout=15))
         body = self._request("GET", "/transcript")["body"].decode("utf-8")
         expected = format_full_transcript(
@@ -5663,8 +5670,8 @@ class KeyboardSendGuiTests(unittest.TestCase):
             self.state["widgets"]["A"]["transcript"].toPlainText()
             and "Reply from fake-b:latest." in
             self.state["widgets"]["B"]["transcript"].toPlainText()
-            and len(self.state["convo"].sides["A"].history) == 2
-            and len(self.state["convo"].sides["B"].history) == 2),
+            and len(self.state["convo"].sides["A"].messages) == 2
+            and len(self.state["convo"].sides["B"].messages) == 2),
             timeout=15)
         self.assertTrue(ok, "Ctrl+Enter should send to both panes")
         self.assertEqual(self.client.calls,
@@ -6109,7 +6116,7 @@ class FrontDoorTests(unittest.TestCase):
 
     def test_changelog_covers_every_version(self):
         log = self._read("CHANGELOG.md")
-        for version in ["0.%d" % n for n in range(1, 26)]:
+        for version in ["0.%d" % n for n in range(1, 27)]:
             self.assertIn(version, log)
 
     def test_gitignore_covers_runtime_files(self):
@@ -6228,9 +6235,10 @@ class FrontDoorTests(unittest.TestCase):
         self.assertIn("make_app_icon", script)
         self.assertIn("could not add the menu entry", script)
 
-    def test_readme_notes_license_pending_and_clone_modes(self):
+    def test_readme_notes_mit_license_and_clone_modes(self):
         readme = self._read("README.md")
-        self.assertIn("License: not decided yet", readme)
+        self.assertIn("License: MIT", readme)
+        self.assertNotIn("not decided yet", readme)
         self.assertIn("carries the executable bits", readme)
         self.assertIn("uninstall.sh", readme)
 
@@ -6428,12 +6436,12 @@ class ConversationFileTests(unittest.TestCase):
             save_conversation_file(path, convo, log)
             restored, restored_log = load_conversation_file(path)
         for side in ("A", "B"):
-            self.assertEqual(restored.sides[side].history,
-                             convo.sides[side].history)
-            self.assertEqual(restored.sides[side].labels,
-                             convo.sides[side].labels)
-            self.assertEqual(restored.sides[side].display,
-                             convo.sides[side].display)
+            self.assertEqual(restored.sides[side].messages,
+                             convo.sides[side].messages)
+            self.assertEqual([m.label for m in restored.sides[side].messages],
+                             [m.label for m in convo.sides[side].messages])
+            self.assertEqual([m.display for m in restored.sides[side].messages],
+                             [m.display for m in convo.sides[side].messages])
             self.assertEqual(restored.sides[side].instruction,
                              convo.sides[side].instruction)
             self.assertEqual(restored.sides[side].model,
@@ -6502,7 +6510,7 @@ class ConversationFileTests(unittest.TestCase):
             save_conversation_file(path, convo, log)
             restored, _ = load_conversation_file(path)
             self.assertEqual(
-                restored.sides["A"].history[-1]["content"],
+                restored.sides["A"].messages[-1].content,
                 "second save")
 
 
@@ -6556,15 +6564,15 @@ class ConversationGuiTests(unittest.TestCase):
         self.state["composer"].setPlainText(text)
         self.state["send_both"].click()
         return self._wait_for(lambda: (
-            len(self.state["convo"].sides["A"].history) >= 2
-            and len(self.state["convo"].sides["B"].history) >= 2
+            len(self.state["convo"].sides["A"].messages) >= 2
+            and len(self.state["convo"].sides["B"].messages) >= 2
             and not self.state["state"]["busy"]), timeout=15)
 
     def _send_to_a_and_wait(self, text):
         self.state["composer"].setPlainText(text)
         self.state["send_a"].click()
         return self._wait_for(lambda: (
-            len(self.state["convo"].sides["A"].history) >= 2
+            len(self.state["convo"].sides["A"].messages) >= 2
             and not self.state["state"]["busy"]), timeout=15)
 
     def _save_dialog(self, path):
@@ -6593,9 +6601,9 @@ class ConversationGuiTests(unittest.TestCase):
     def _snapshot(self):
         convo = self.state["convo"]
         return {
-            side: (copy.deepcopy(convo.sides[side].history),
-                   list(convo.sides[side].labels),
-                   list(convo.sides[side].display),
+            side: (copy.deepcopy(convo.sides[side].messages),
+                   [m.label for m in convo.sides[side].messages],
+                   [m.display for m in convo.sides[side].messages],
                    convo.sides[side].instruction,
                    convo.sides[side].model)
             for side in ("A", "B")}
@@ -6604,9 +6612,9 @@ class ConversationGuiTests(unittest.TestCase):
         convo = self.state["convo"]
         for side in ("A", "B"):
             history, labels, display, instruction, model = snap[side]
-            self.assertEqual(convo.sides[side].history, history)
-            self.assertEqual(convo.sides[side].labels, labels)
-            self.assertEqual(convo.sides[side].display, display)
+            self.assertEqual(convo.sides[side].messages, history)
+            self.assertEqual([m.label for m in convo.sides[side].messages], labels)
+            self.assertEqual([m.display for m in convo.sides[side].messages], display)
             self.assertEqual(convo.sides[side].instruction, instruction)
             self.assertEqual(convo.sides[side].model, model)
 
@@ -6638,8 +6646,8 @@ class ConversationGuiTests(unittest.TestCase):
         self.state["widgets"]["A"]["clear"].click()
         self.state["widgets"]["B"]["clear"].click()
         self.app.processEvents()
-        self.assertEqual(self.state["convo"].sides["A"].history, [])
-        self.assertEqual(self.state["convo"].sides["B"].history, [])
+        self.assertEqual(self.state["convo"].sides["A"].messages, [])
+        self.assertEqual(self.state["convo"].sides["B"].messages, [])
         self.assertEqual(self.state["state"]["full_log"], [])
         with self._open_dialog(path), self._answer(
                 QMessageBox.StandardButton.Yes):
@@ -6677,8 +6685,8 @@ class ConversationGuiTests(unittest.TestCase):
         self.assertIsNone(self.state["convo"].sides["A"].model)
         self.assertEqual(self.state["convo"].sides["B"].model,
                          "fake-b:latest")
-        self.assertEqual(self.state["convo"].sides["A"].history,
-                         [{"role": "user", "content": "hello"}])
+        self.assertEqual(self.state["convo"].sides["A"].messages,
+                         [ChatMessage("user", "hello", "You")])
         message = self.window.statusBar().currentMessage()
         self.assertIn("not installed", message)
         self.assertIn("gone-model:latest", message)
@@ -6724,8 +6732,8 @@ class ConversationGuiTests(unittest.TestCase):
             self.state["open_convo"].click()
         self.app.processEvents()
         self.assertEqual(
-            self.state["convo"].sides["A"].history,
-            [{"role": "user", "content": "fresh load"}])
+            self.state["convo"].sides["A"].messages,
+            [ChatMessage("user", "fresh load", "You")])
 
     def test_save_cancel_writes_nothing(self):
         self.assertTrue(self._send_to_a_and_wait("hello"))
@@ -6833,8 +6841,8 @@ class TemperatureGuiTests(unittest.TestCase):
         self.state["composer"].setPlainText("Hello, both of you.")
         self.state["send_both"].click()
         ok = self._wait_for(lambda: (
-            len(self.state["convo"].sides["A"].history) == 2
-            and len(self.state["convo"].sides["B"].history) == 2),
+            len(self.state["convo"].sides["A"].messages) == 2
+            and len(self.state["convo"].sides["B"].messages) == 2),
             timeout=15)
         self.assertTrue(ok, "send to both should land in both panes")
         self.assertEqual(
@@ -6908,21 +6916,21 @@ class TokenCountGuiTests(unittest.TestCase):
         return self.state["widgets"][side]["session_tokens"].text()
 
     def _send_to_a_and_wait(self, text):
-        before = len(self.state["convo"].sides["A"].history)
+        before = len(self.state["convo"].sides["A"].messages)
         self.state["composer"].setPlainText(text)
         self.state["send_a"].click()
         return self._wait_for(lambda: (
-            len(self.state["convo"].sides["A"].history) > before
+            len(self.state["convo"].sides["A"].messages) > before
             and not self.state["state"]["busy"]), timeout=15)
 
     def _send_to_both_and_wait(self, text):
-        before_a = len(self.state["convo"].sides["A"].history)
-        before_b = len(self.state["convo"].sides["B"].history)
+        before_a = len(self.state["convo"].sides["A"].messages)
+        before_b = len(self.state["convo"].sides["B"].messages)
         self.state["composer"].setPlainText(text)
         self.state["send_both"].click()
         return self._wait_for(lambda: (
-            len(self.state["convo"].sides["A"].history) > before_a
-            and len(self.state["convo"].sides["B"].history) > before_b
+            len(self.state["convo"].sides["A"].messages) > before_a
+            and len(self.state["convo"].sides["B"].messages) > before_b
             and not self.state["state"]["busy"]), timeout=15)
 
     def test_session_labels_start_at_zero(self):
@@ -7065,8 +7073,8 @@ class TokenCountGuiTests(unittest.TestCase):
         self.assertTrue(summarize_btn.isEnabled())
         summarize_btn.click()
         ok = self._wait_for(lambda: (
-            len(convo.sides["A"].history) == 5
-            and convo.sides["A"].labels[0] == SUMMARY_LABEL
+            len(convo.sides["A"].messages) == 5
+            and convo.sides["A"].messages[0].label == SUMMARY_LABEL
             and not self.state["state"]["busy"]), timeout=15)
         self.assertTrue(ok, "history should fold into summary + last 4")
         # The summarize turn's tokens count toward the session total...
@@ -7531,9 +7539,9 @@ class TranscriptSearchGuiTests(unittest.TestCase):
     def test_search_is_display_only(self):
         self._seed_a()
         side = self.state["convo"].sides["A"]
-        history_before = copy.deepcopy(side.history)
-        labels_before = list(side.labels)
-        display_before = list(side.display)
+        history_before = copy.deepcopy(side.messages)
+        labels_before = [m.label for m in side.messages]
+        display_before = [m.display for m in side.messages]
         export_before = format_side_transcript(side)
         w = self._widgets_a()
         w["search_edit"].setText("rain")
@@ -7542,9 +7550,9 @@ class TranscriptSearchGuiTests(unittest.TestCase):
         w["search_prev"].click()
         w["search_edit"].setText("")
         self.app.processEvents()
-        self.assertEqual(side.history, history_before)
-        self.assertEqual(side.labels, labels_before)
-        self.assertEqual(side.display, display_before)
+        self.assertEqual(side.messages, history_before)
+        self.assertEqual([m.label for m in side.messages], labels_before)
+        self.assertEqual([m.display for m in side.messages], display_before)
         self.assertEqual(format_side_transcript(side), export_before)
 
 
@@ -7598,15 +7606,15 @@ class TranscriptImportGuiTests(unittest.TestCase):
         self.state["composer"].setPlainText(text)
         self.state["send_a"].click()
         return self._wait_for(lambda: (
-            len(self.state["convo"].sides["A"].history) >= 2
+            len(self.state["convo"].sides["A"].messages) >= 2
             and not self.state["state"]["busy"]), timeout=15)
 
     def _send_both_and_wait(self, text):
         self.state["composer"].setPlainText(text)
         self.state["send_both"].click()
         return self._wait_for(lambda: (
-            len(self.state["convo"].sides["A"].history) >= 2
-            and len(self.state["convo"].sides["B"].history) >= 2
+            len(self.state["convo"].sides["A"].messages) >= 2
+            and len(self.state["convo"].sides["B"].messages) >= 2
             and not self.state["state"]["busy"]), timeout=15)
 
     def _open_dialog(self, path):
@@ -7658,15 +7666,15 @@ class TranscriptImportGuiTests(unittest.TestCase):
         self.app.processEvents()
         side = self.state["convo"].sides["A"]
         self.assertEqual(
-            [(entry["role"], entry["content"]) for entry in side.history],
+            [(entry.role, entry.content) for entry in side.messages],
             [("user", "what is the capital of France?"),
              ("assistant", "Paris."),
              ("user", "and of Spain?\nasking for a friend"),
              ("assistant", "Madrid.")])
         self.assertEqual(
-            side.labels,
+            [m.label for m in side.messages],
             ["You", "other-model:9b", "You", "other-model:9b"])
-        self.assertEqual(side.display, [None, None, None, None])
+        self.assertEqual([m.display for m in side.messages], [None, None, None, None])
         self.assertEqual(self._status(),
                          "Transcript imported from %s" % path)
 
@@ -7679,32 +7687,32 @@ class TranscriptImportGuiTests(unittest.TestCase):
             self.state["widgets"]["A"]["import"].click()
         self.app.processEvents()
         side = self.state["convo"].sides["A"]
-        self.assertEqual(len(side.history), 4)
-        self.assertEqual(side.history[0]["content"],
+        self.assertEqual(len(side.messages), 4)
+        self.assertEqual(side.messages[0].content,
                          "what is the capital of France?")
 
     def test_import_over_live_pane_no_keeps(self):
         from PySide6.QtWidgets import QMessageBox
         self.assertTrue(self._send_to_a_and_wait("live message"))
-        before = copy.deepcopy(self.state["convo"].sides["A"].history)
+        before = copy.deepcopy(self.state["convo"].sides["A"].messages)
         path = self._export_file()
         with self._open_dialog(path), self._answer(
                 QMessageBox.StandardButton.No):
             self.state["widgets"]["A"]["import"].click()
         self.app.processEvents()
-        self.assertEqual(self.state["convo"].sides["A"].history, before)
+        self.assertEqual(self.state["convo"].sides["A"].messages, before)
 
     def test_import_dialog_cancel_changes_nothing(self):
         self.assertTrue(self._send_to_a_and_wait("live message"))
-        before = copy.deepcopy(self.state["convo"].sides["A"].history)
+        before = copy.deepcopy(self.state["convo"].sides["A"].messages)
         with self._open_dialog(""):
             self.state["widgets"]["A"]["import"].click()
         self.app.processEvents()
-        self.assertEqual(self.state["convo"].sides["A"].history, before)
+        self.assertEqual(self.state["convo"].sides["A"].messages, before)
 
     def test_rejected_file_changes_nothing(self):
         self.assertTrue(self._send_to_a_and_wait("live message"))
-        before = copy.deepcopy(self.state["convo"].sides["A"].history)
+        before = copy.deepcopy(self.state["convo"].sides["A"].messages)
         convo = Conversation()
         convo.sides["A"].model = "fake-a:latest"
         convo.sides["B"].model = "fake-b:latest"
@@ -7715,13 +7723,13 @@ class TranscriptImportGuiTests(unittest.TestCase):
         with self._open_dialog(path):
             self.state["widgets"]["A"]["import"].click()
         self.app.processEvents()
-        self.assertEqual(self.state["convo"].sides["A"].history, before)
+        self.assertEqual(self.state["convo"].sides["A"].messages, before)
         self.assertIn("holds both sides", self._status())
         garbage = self._write_file("garbage.txt", "hello world\n")
         with self._open_dialog(garbage):
             self.state["widgets"]["A"]["import"].click()
         self.app.processEvents()
-        self.assertEqual(self.state["convo"].sides["A"].history, before)
+        self.assertEqual(self.state["convo"].sides["A"].messages, before)
         self.assertIn("doesn't look like a DUO transcript",
                       self._status())
 
@@ -7828,7 +7836,7 @@ class MarkdownGuiTests(unittest.TestCase):
         self.state["composer"].setPlainText(text)
         self.state["send_a"].click()
         return self._wait_for(lambda: (
-            len(self.state["convo"].sides["A"].history) >= 2
+            len(self.state["convo"].sides["A"].messages) >= 2
             and not self.state["state"]["busy"]), timeout=15)
 
     def _transcript(self, side):
@@ -7914,7 +7922,7 @@ class MarkdownGuiTests(unittest.TestCase):
         self.assertIn("<li", html)
         # The history still holds the raw Markdown, untouched.
         self.assertEqual(
-            self.state["convo"].sides["A"].history[1]["content"], reply)
+            self.state["convo"].sides["A"].messages[1].content, reply)
 
     def test_link_click_opens_browser(self):
         # Clicking a link in a pane opens it in the default browser:
@@ -8014,11 +8022,11 @@ class MarkdownGuiTests(unittest.TestCase):
         self.assertTrue(self._send_to_a_and_wait("second message"))
         self.assertTrue(self._send_to_a_and_wait("third message"))
         convo = self.state["convo"]
-        self.assertEqual(len(convo.sides["A"].history), 6)
+        self.assertEqual(len(convo.sides["A"].messages), 6)
         self.state["widgets"]["A"]["summarize"].click()
         ok = self._wait_for(lambda: (
-            len(convo.sides["A"].history) == 5
-            and convo.sides["A"].labels[0] == SUMMARY_LABEL
+            len(convo.sides["A"].messages) == 5
+            and convo.sides["A"].messages[0].label == SUMMARY_LABEL
             and not self.state["state"]["busy"]), timeout=15)
         self.assertTrue(ok, "history should fold into summary + last 4")
         # The summary entry is model output: it renders.
@@ -8153,6 +8161,7 @@ class ModuleSplitTests(unittest.TestCase):
             (dual_chat.make_app_icon, duo_icon.make_app_icon),
             (dual_chat.markdown_to_html, duo_markdown.markdown_to_html),
             (dual_chat.ChatSide, duo_model.ChatSide),
+            (dual_chat.ChatMessage, duo_model.ChatMessage),
             (dual_chat.Conversation, duo_model.Conversation),
             (dual_chat.NoModelSelected, duo_model.NoModelSelected),
             (dual_chat.OllamaClient, duo_ollama.OllamaClient),
@@ -8211,7 +8220,8 @@ class ModuleSplitTests(unittest.TestCase):
                       duo_markdown.markdown_to_html("**hi**"))
         self.assertIn("&lt;b&gt;",
                       duo_markdown.markdown_to_html("<b>hi</b>"))
-        # Model: a side holds its history, labels, and display text.
+        # Model: a side holds one list of messages, each with its
+        # role, content, label, and display text together.
         side = duo_model.ChatSide("A")
         side.add_user("hello", display="(short)")
         self.assertEqual(side.display_text(0), "(short)")
@@ -8255,6 +8265,197 @@ class ModuleSplitTests(unittest.TestCase):
         runner.submit("second", lambda emit, ev: "two")
         self.assertTrue(finished.wait(timeout=10))
         self.assertEqual(done, [("first", "one"), ("second", "two")])
+
+
+# ---------------------------------------------------------------------------
+# One message structure + MIT license (v0.26, audit T15)
+# ---------------------------------------------------------------------------
+
+class MessageStructureTests(unittest.TestCase):
+    """ChatSide keeps one list of ChatMessage objects -- role,
+    content, label, and display text together per message -- instead
+    of the three parallel arrays (history, labels, display) the
+    refactor replaced. The on-disk conversation format is unchanged:
+    a file saved by an older version still loads, field for field."""
+
+    def _tree(self):
+        return os.path.dirname(
+            os.path.dirname(os.path.abspath(__file__)))
+
+    def test_one_message_holds_all_four_fields(self):
+        side = ChatSide("A")
+        side.model = "fake-a:latest"
+        side.add_user("File: notes.txt\nsecret contents",
+                      label="You", display="(Attached: notes.txt)")
+        side.add_assistant("noted")
+        self.assertEqual(len(side.messages), 2)
+        first, second = side.messages
+        self.assertEqual((first.role, first.content, first.label,
+                          first.display),
+                         ("user", "File: notes.txt\nsecret contents",
+                          "You", "(Attached: notes.txt)"))
+        self.assertEqual((second.role, second.content, second.label,
+                          second.display),
+                         ("assistant", "noted", "fake-a:latest", None))
+        # The parallel arrays are gone: one list is the whole state.
+        self.assertFalse(hasattr(side, "history"))
+        self.assertFalse(hasattr(side, "labels"))
+        self.assertFalse(hasattr(side, "display"))
+
+    def test_add_assistant_label_defaults(self):
+        side = ChatSide("B")
+        side.add_assistant("hello")
+        self.assertEqual(side.messages[0].label, "Assistant")
+        side.model = "fake-b:latest"
+        side.add_assistant("again")
+        self.assertEqual(side.messages[1].label, "fake-b:latest")
+        side.add_assistant("named", label="Custom")
+        self.assertEqual(side.messages[2].label, "Custom")
+
+    def test_display_text_comes_from_the_message(self):
+        msg = ChatMessage("user", "full text", "You", "(short)")
+        self.assertEqual(msg.display_text(), "(short)")
+        msg2 = ChatMessage("assistant", "full text", "model")
+        self.assertIsNone(msg2.display)
+        self.assertEqual(msg2.display_text(), "full text")
+
+    def test_move_keeps_all_fields_together(self):
+        # The point of the refactor: reordering moves the whole
+        # message, so a label or display text can never be left
+        # behind on the wrong entry the way parallel arrays could.
+        side = ChatSide("A")
+        side.add_user("one", display="(1)")
+        side.add_user("two", label="You [task]", display="(2)")
+        side.add_assistant("three")
+        side.move_up(1)
+        self.assertEqual(
+            [(m.content, m.label, m.display) for m in side.messages],
+            [("two", "You [task]", "(2)"),
+             ("one", "You", "(1)"),
+             ("three", "Assistant", None)])
+        side.delete_at(0)
+        self.assertEqual(
+            [(m.content, m.label, m.display) for m in side.messages],
+            [("one", "You", "(1)"),
+             ("three", "Assistant", None)])
+
+    def test_summarize_keeps_fields_together(self):
+        side = ChatSide("A")
+        side.model = "fake-a:latest"
+        for i in range(6):
+            side.add_user("q%d" % i, display="(q%d)" % i)
+            side.add_assistant("a%d" % i)
+        self.assertTrue(side.summarize("they talked"))
+        kept = side.messages[1:]
+        self.assertEqual(len(kept), 4)
+        self.assertEqual(kept[0].content, "q4")
+        self.assertEqual(kept[0].display, "(q4)")
+        self.assertEqual(kept[0].label, "You")
+        self.assertEqual(side.messages[0].label, SUMMARY_LABEL)
+
+    def test_conversation_file_format_unchanged(self):
+        # What hits the disk is still the v0.17 shape: entries are
+        # plain dicts with role, content, label, display.
+        convo = Conversation()
+        convo.sides["A"].model = "fake-a:latest"
+        convo.sides["A"].add_user("hello", display="(short)")
+        convo.sides["A"].add_assistant("hi")
+        data = conversation_to_data(convo, [])
+        self.assertEqual(data["version"], CONVERSATION_FORMAT_VERSION)
+        self.assertEqual(data["sides"]["A"]["entries"], [
+            {"role": "user", "content": "hello", "label": "You",
+             "display": "(short)"},
+            {"role": "assistant", "content": "hi",
+             "label": "fake-a:latest", "display": None}])
+
+    def test_old_format_file_loads_into_the_new_structure(self):
+        # A file written by hand in the v0.17 shape (the way older
+        # versions saved it) loads with every field exact.
+        data = {
+            "version": 1,
+            "sides": {
+                "A": {
+                    "model": "fake-a:latest",
+                    "instruction": "Be brief.",
+                    "entries": [
+                        {"role": "user", "content": "File: n.txt\nbody",
+                         "label": "You", "display": "(Attached: n.txt)"},
+                        {"role": "assistant", "content": "read it",
+                         "label": "fake-a:latest", "display": None},
+                        {"role": "user",
+                         "content": "Earlier in this conversation: x",
+                         "label": SUMMARY_LABEL, "display": None},
+                    ],
+                },
+                "B": {
+                    "model": None,
+                    "instruction": "",
+                    "entries": [],
+                },
+            },
+            "log": [["A", "You", "(Attached: n.txt)"]],
+        }
+        convo, log = data_to_conversation(data)
+        side = convo.sides["A"]
+        self.assertEqual(side.model, "fake-a:latest")
+        self.assertEqual(side.instruction, "Be brief.")
+        self.assertEqual(side.messages, [
+            ChatMessage("user", "File: n.txt\nbody", "You",
+                        "(Attached: n.txt)"),
+            ChatMessage("assistant", "read it", "fake-a:latest"),
+            ChatMessage("user", "Earlier in this conversation: x",
+                        SUMMARY_LABEL),
+        ])
+        self.assertEqual(side.messages[0].display_text(),
+                         "(Attached: n.txt)")
+        self.assertEqual(log, [("A", "You", "(Attached: n.txt)")])
+        self.assertEqual(convo.sides["B"].messages, [])
+
+    def test_old_format_file_loads_from_disk(self):
+        folder = tempfile.mkdtemp(prefix="duo-t15-")
+        try:
+            path = os.path.join(folder, "old.json")
+            data = {
+                "version": 1,
+                "sides": {
+                    "A": {"model": "fake-a:latest", "instruction": "",
+                          "entries": [{"role": "user", "content": "hi",
+                                       "label": "You", "display": None}]},
+                    "B": {"model": None, "instruction": "",
+                          "entries": []},
+                },
+                "log": [],
+            }
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(data, fh)
+            convo, _log = load_conversation_file(path)
+            self.assertEqual(convo.sides["A"].messages,
+                             [ChatMessage("user", "hi", "You")])
+        finally:
+            shutil.rmtree(folder, ignore_errors=True)
+
+    def test_license_file_is_mit(self):
+        path = os.path.join(self._tree(), "LICENSE")
+        self.assertTrue(os.path.isfile(path), path)
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+        self.assertIn("MIT License", text)
+        self.assertIn("Copyright (c) 2026 Joshua Lofland", text)
+        self.assertIn("Permission is hereby granted, free of charge",
+                      text)
+
+    def test_readme_says_mit(self):
+        with open(os.path.join(self._tree(), "README.md"),
+                  encoding="utf-8") as fh:
+            readme = fh.read()
+        self.assertIn("License: MIT", readme)
+        self.assertNotIn("not decided yet", readme)
+
+    def test_zip_includes_the_license(self):
+        with open(os.path.join(self._tree(), "build_zip.py"),
+                  encoding="utf-8") as fh:
+            script = fh.read()
+        self.assertIn('"LICENSE": 0o100644', script)
 
 
 if __name__ == "__main__":

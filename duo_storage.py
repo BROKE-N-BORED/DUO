@@ -11,7 +11,7 @@ import json
 import os
 import tempfile
 
-from duo_model import Conversation
+from duo_model import ChatMessage, Conversation
 
 
 # Saved model pairs live in a plain JSON file next to the app.
@@ -225,10 +225,9 @@ def conversation_to_data(convo, log):
             "model": side_obj.model,
             "instruction": side_obj.instruction,
             "entries": [
-                {"role": entry["role"], "content": entry["content"],
-                 "label": side_obj.labels[i],
-                 "display": side_obj.display[i]}
-                for i, entry in enumerate(side_obj.history)],
+                {"role": msg.role, "content": msg.content,
+                 "label": msg.label, "display": msg.display}
+                for msg in side_obj.messages],
         }
     data["log"] = [[side, label, text] for side, label, text in log]
     return data
@@ -284,9 +283,8 @@ def data_to_conversation(data):
                     or (display is not None
                         and not isinstance(display, str))):
                 _bad()
-            side_obj.history.append({"role": role, "content": content})
-            side_obj.labels.append(label)
-            side_obj.display.append(display)
+            side_obj.messages.append(
+                ChatMessage(role, content, label, display))
     raw_log = data.get("log")
     if not isinstance(raw_log, list):
         _bad()
