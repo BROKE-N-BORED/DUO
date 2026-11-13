@@ -1,7 +1,22 @@
 # DUO changelog
 
 Every version, newest first. v0.1–v0.17 were built on 2026-11-12;
-v0.18–v0.21 on 2026-11-13.
+v0.18–v0.22 on 2026-11-13.
+
+## v0.22 — 2026-11-13
+
+Multi-round tasks. A task no longer stops after one follow-up: the
+Rounds box (1–10, default 1) says how many rounds it runs, and each
+round passes the work to the other side. "Continue it" keeps
+continuing; a review chain alternates review turns with revise
+turns, handing each review back to the worker to revise from.
+"Nothing" is always one round, and its Rounds box stays off. With
+Review it or Continue it the task always runs at least 2 rounds,
+so Rounds 1 is the same task as before: the worker, then one
+follow-up round. The
+status bar shows which round a chain is on, Stop still ends it
+mid-chain, and a failed round ends the chain with a plain note
+while the earlier results stay put.
 
 ## v0.21 — 2026-11-13
 

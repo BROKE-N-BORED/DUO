@@ -34,7 +34,7 @@ Everything in one app:
 - **Files** — attach text files to a message and the model reads
   them with it.
 - **Tasks** — give one model a job and have the other review it or
-  continue it.
+  continue it, for as many rounds as you pick.
 - **Transcripts** — save either side, or both, to a plain text file,
   or save the full transcript: the whole conversation as it happened,
   both sides interleaved in time order.
@@ -221,18 +221,29 @@ bash run.sh
   and pick what the other model does with the result — Review it,
   Continue it, or Nothing — then press Run Task. Nothing is
   pre-selected; Run Task stays off until all three are set.
-- One round only: the worker answers, then the other side reviews
-  or continues the result. The relay covers loops.
+- Rounds says how many rounds the task runs (1–10, default 1).
+  Each round passes the latest result to the other side: Continue
+  it keeps continuing, and a review chain alternates review turns
+  with revise turns, handing each review back to the worker to
+  revise from. With Review it or Continue it the task always runs
+  at least 2 rounds, so Rounds 1 is the same task as before: the
+  worker, then one follow-up round. Nothing is always one round,
+  so its Rounds box stays off. The status bar shows which round a
+  chain is on.
 - Review it sends the worker's full reply to the other model framed
   as "Here is the result of a task. Review it and say what is good,
   what is wrong, and what you would change: ...". Continue it frames
-  it as "Continue this work from where it left off: ...". Nothing
+  it as "Continue this work from where it left off: ...". A revise
+  turn frames the review as "Here is a review of your work. Revise
+  your work based on it: ...". Nothing
   makes no second call — the task ends after the worker's reply.
 - In your window the task shows as "You [task]: ..." in the
   worker's pane and the handoff as "You [task handoff]: ..." in the
   other pane. The tags never reach the models — the worker gets the
   bare task text.
-- The per-side Stop button cancels a running task. Attachments never
+- The per-side Stop button cancels a running task, ending the chain
+  after the current round. A round that fails ends the chain with a
+  plain note; the earlier results stay in the panes. Attachments never
   ride on tasks — tasks are text-only; attached files stay put for
   the next normal send.
 

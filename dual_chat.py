@@ -32,10 +32,13 @@ Item 5: file upload. Attach up to 5 text files (100 KB each) to a
   skipped with a plain note. Attachments are one-shot -- they clear
   after a send, and a relay only carries them on the seed message.
 Item 6: tasks. Hand a job to one model: it answers, and then the
-  other model reviews the result, continues it, or nothing happens
-  -- one round, no loop. The task shows as "You [task]" in the
-  worker's pane and the handoff as "You [task handoff]" in the
-  other pane; the tags never reach the models.
+  work passes back and forth for as many rounds as you pick -- the
+  other model reviews the result or continues it, and a review
+  round hands a review back to the worker to revise from. Or
+  nothing happens after the first round. The task shows as
+  "You [task]" in the worker's pane and each handoff as
+  "You [task handoff]" in the receiving pane; the tags never
+  reach the models.
 Item 7: transcripts. Save one side's conversation, or both sides in
   one file, as plain text that reads like the window: a header line
   naming DUO, the model, and when the file was saved, then each
@@ -111,6 +114,12 @@ v0.21: relay presets. The whole relay row -- start side, mode, turn
   saved under a name and loaded back from a dropdown, the same way
   saved model pairs work. Presets live in duo-relay-presets.json
   next to the app, written atomically; nothing loads by itself.
+v0.22: multi-round tasks. A task runs for as many rounds as the
+  Rounds box says (1-10, default 1): each round passes the work to
+  the other side, alternating. "Continue it" keeps continuing; a
+  review round hands the review back to the worker to revise from.
+  "Nothing" is always one round. The status bar shows which round
+  a chain is on, and Stop still ends it.
 """
 
 import datetime
@@ -210,7 +219,7 @@ def make_debug_logger(log_dir=None):
         return _NullLogger()
 
 APP_NAME = "DUO"
-APP_VERSION = "0.21"
+APP_VERSION = "0.22"
 DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434"
 OLLAMA_URL_ENV = "DUAL_CHAT_OLLAMA_URL"
 
@@ -301,14 +310,21 @@ SUMMARIZE_PROMPT = (
 # message with this prefix, so the conversation continues from it.
 COMPARE_PREFIX = "You picked this answer: %s"
 
-# Tasks (Item 6): one round of delegation. The worker gets the bare
-# task text; the other side gets the worker's full reply framed for
-# review or continuation. "Nothing" means no second call.
+# Tasks (Item 6): rounds of delegation. The worker gets the bare
+# task text; each later round hands the latest result to the other
+# side, framed for review or continuation -- and in a review chain
+# the worker gets the review back to revise from. "Nothing" means
+# no second call: the task is one round.
 TASK_REVIEW_TEMPLATE = (
     "Here is the result of a task. Review it and say what is good, "
     "what is wrong, and what you would change:\n\n%s")
 TASK_CONTINUE_TEMPLATE = "Continue this work from where it left off:\n\n%s"
+TASK_REVISE_TEMPLATE = (
+    "Here is a review of your work. Revise your work based on it:\n\n%s")
 TASK_FOLLOW_UPS = ("review", "continue", "nothing")
+TASK_ROUNDS_MIN = 1
+TASK_ROUNDS_MAX = 10
+TASK_ROUNDS_DEFAULT = 1
 MSG_TASK_EMPTY = "Describe the task first."
 MSG_TASK_NEEDS_WORKER = "Pick which model does the task."
 MSG_TASK_NEEDS_FOLLOW_UP = "Pick what the other model does with the result."
@@ -1501,23 +1517,45 @@ class RelaySession:
 
 
 class TaskSession:
-    """One task run: the worker side, the follow-up, and the phase.
+    """One task run: the worker side, the follow-up, and the rounds.
 
     Pure logic, no Qt -- the GUI drives it from the runner callbacks.
-    A task is exactly one round: the worker answers, then (unless the
-    follow-up is "nothing") the other side reviews or continues the
-    result. No loop -- the relay covers loops.
+    A task is a chain of rounds: round 1 is the worker answering the
+    task as typed, and each later round hands the latest result to
+    the other side, alternating. A "continue" chain keeps continuing;
+    a "review" chain alternates review turns (the other side) with
+    revise turns (the worker revising from the review). "Nothing"
+    is always one round. With a follow-up the chain is at least two
+    rounds (worker + one follow-up), so Rounds 1 behaves exactly as
+    v0.21 did: the worker, then one follow-up round.
     """
 
-    def __init__(self, worker, follow_up):
+    def __init__(self, worker, follow_up, rounds=TASK_ROUNDS_DEFAULT):
         self.worker = worker  # "A" or "B"
         self.follow_up = follow_up  # "review", "continue", "nothing"
+        self.rounds = max(TASK_ROUNDS_MIN,
+                          min(TASK_ROUNDS_MAX, int(rounds)))
+        if self.follow_up == "nothing":
+            # No follow-up, no chain: one round whatever was asked.
+            self.rounds = 1
+        elif self.rounds < 2:
+            # A follow-up always adds at least one round after the
+            # worker, so Rounds 1 with Review/Continue is exactly the
+            # v0.21 task: worker, then one follow-up round.
+            self.rounds = 2
+        self.rounds_done = 0  # turns completed so far
         self.phase = "worker"  # "worker" -> "followup" -> done
         self.active = True
 
     @property
     def other(self):
         return "B" if self.worker == "A" else "A"
+
+    @property
+    def next_side(self):
+        """The side that takes the next round (round rounds_done + 1):
+        the worker takes odd rounds, the other side even rounds."""
+        return self.worker if (self.rounds_done + 1) % 2 == 1 else self.other
 
     def frame(self, result):
         """The message the other model receives for the worker's reply,
@@ -1526,6 +1564,19 @@ class TaskSession:
             return TASK_REVIEW_TEMPLATE % result
         if self.follow_up == "continue":
             return TASK_CONTINUE_TEMPLATE % result
+        return None
+
+    def frame_next(self, result):
+        """The message the next side receives for the latest result,
+        or None when the follow-up is "nothing" (no further rounds).
+        A review chain frames by whose turn it is: the other side
+        reviews, the worker revises from the review."""
+        if self.follow_up == "continue":
+            return TASK_CONTINUE_TEMPLATE % result
+        if self.follow_up == "review":
+            if self.next_side == self.other:
+                return TASK_REVIEW_TEMPLATE % result
+            return TASK_REVISE_TEMPLATE % result
         return None
 
     def handoff_note(self):
@@ -1537,6 +1588,17 @@ class TaskSession:
         if self.follow_up == "continue":
             return "Task result from Model %s, to continue." % self.worker
         return "Task result from Model %s." % self.worker
+
+    def handoff_note_next(self, from_side):
+        """The short note for the next handoff entry: the result (or
+        the review) passing from ``from_side`` to the next side."""
+        if self.follow_up == "continue":
+            return "Task result from Model %s, to continue." % from_side
+        if self.follow_up == "review":
+            if self.next_side == self.other:
+                return "Task result from Model %s, for review." % from_side
+            return "Review from Model %s, to revise." % from_side
+        return "Task result from Model %s." % from_side
 
 
 class SerialRunner:
@@ -2488,6 +2550,15 @@ def build_window(client=None, logger=None, deck_port=None):
     task_follow_up.setPlaceholderText("What next")
     task_follow_up.setCurrentIndex(-1)
     task_row.addWidget(task_follow_up)
+    task_row.addWidget(QtWidgets.QLabel("Rounds:"))
+    task_rounds = QtWidgets.QSpinBox()
+    task_rounds.setRange(TASK_ROUNDS_MIN, TASK_ROUNDS_MAX)
+    task_rounds.setValue(TASK_ROUNDS_DEFAULT)
+    task_rounds.setToolTip(
+        "How many rounds the task runs: each round passes the work "
+        "to the other side. With Review it or Continue it the task "
+        "always runs at least 2 rounds.")
+    task_row.addWidget(task_rounds)
     task_run = QtWidgets.QPushButton("Run Task")
     task_run.setEnabled(False)
     task_row.addWidget(task_run)
@@ -2741,6 +2812,15 @@ def build_window(client=None, logger=None, deck_port=None):
         task_run.setEnabled(task_ready)
         for widget in (task_edit, task_worker, task_follow_up):
             widget.setEnabled(not task_active)
+        # Rounds means nothing without a follow-up: "Nothing" is
+        # always one round, so the box is off until a follow-up that
+        # passes work on is picked. It is also locked mid-task, like
+        # the rest of the setup.
+        follow_up_nothing = (
+            task_follow_up.currentIndex() >= 0
+            and TASK_FOLLOW_UPS[task_follow_up.currentIndex()]
+            == "nothing")
+        task_rounds.setEnabled(not task_active and not follow_up_nothing)
         compare_ready = (not busy and not relay_active
                          and len(state.get("compare", {})) == 2)
         for side in ("A", "B"):
@@ -2986,31 +3066,41 @@ def build_window(client=None, logger=None, deck_port=None):
             statusbar.showMessage(status_message, 4000)
         refresh_buttons()
 
-    def forward_task_result(session, result):
-        """Hand the worker's reply to the other side and start its turn.
+    def show_task_progress(session):
+        """The status bar names the round a task chain is on. A
+        one-round task shows nothing -- it is over before a progress
+        line would mean anything."""
+        if session.rounds > 1:
+            statusbar.showMessage(
+                "Task: round %d of %d..."
+                % (session.rounds_done + 1, session.rounds))
 
-        ``result`` is framed for review or continuation; the window
-        shows a short handoff note, and the framed text is what the
-        other model receives. Returns False when the follow-up is
-        "nothing" (no second call).
+    def forward_task_result(session, result, from_side):
+        """Hand the latest result to the next side and start its turn.
+
+        ``result`` is framed for the next round (review, revise, or
+        continuation); the window shows a short handoff note, and the
+        framed text is what the next model receives. Returns False
+        when the follow-up is "nothing" (no further rounds).
         """
-        framed = session.frame(result)
+        framed = session.frame_next(result)
         if framed is None:
             return False
-        other = session.other
-        convo.sides[other].add_user(
+        next_side = session.next_side
+        note = session.handoff_note_next(from_side)
+        convo.sides[next_side].add_user(
             framed, label="You [task handoff]",
-            display=session.handoff_note())
-        append_message(other, "You [task handoff]",
-                       session.handoff_note())
-        log_event(other, "You [task handoff]", session.handoff_note())
-        refresh_history_list(other)
+            display=note)
+        append_message(next_side, "You [task handoff]", note)
+        log_event(next_side, "You [task handoff]", note)
+        refresh_history_list(next_side)
         session.phase = "followup"
-        state["queued"].add(other)
-        set_status(other, "Queued...")
-        runner.submit(other, make_job_fn(
-            other, convo.sides[other].model,
-            convo.sides[other].messages_for_model()))
+        state["queued"].add(next_side)
+        set_status(next_side, "Queued...")
+        show_task_progress(session)
+        runner.submit(next_side, make_job_fn(
+            next_side, convo.sides[next_side].model,
+            convo.sides[next_side].messages_for_model()))
         return True
 
     def pause_for_review(session, from_side, reply_text):
@@ -3102,13 +3192,14 @@ def build_window(client=None, logger=None, deck_port=None):
             else:
                 forward_hop(session, side, session.frame(text, side))
         elif task is not None and task.active:
-            if task.phase == "worker":
-                # Hand the result to the other side -- unless the
-                # follow-up is "nothing", which ends the task here.
-                if not forward_task_result(task, text):
-                    end_task("Task done.")
-            else:
-                # The follow-up turn is done: the task is over.
+            task.rounds_done += 1
+            task.phase = "followup"
+            if task.rounds_done >= task.rounds:
+                # The chain ran its rounds: the task is over.
+                end_task("Task done.")
+            elif not forward_task_result(task, text, side):
+                # No further round (a "nothing" follow-up, which is
+                # always one round anyway): the task is over.
                 end_task("Task done.")
         elif state.get("compare_round"):
             # A Send to Both round: remember this side's reply so the
@@ -3669,9 +3760,10 @@ def build_window(client=None, logger=None, deck_port=None):
 
     # --- tasks ------------------------------------------------------------
     def do_run_task():
-        """Run one task: the worker answers, then the other side
-        reviews or continues the result (or nothing, if picked). One
-        round only -- the relay covers loops."""
+        """Run one task: the worker answers, then the work passes
+        back and forth for the rounds picked -- the other side
+        reviews or continues, and a review round hands the review
+        back to the worker to revise from. "Nothing" is one round."""
         if (state["busy"] or state.get("relay") is not None
                 or state.get("task") is not None):
             return
@@ -3687,6 +3779,7 @@ def build_window(client=None, logger=None, deck_port=None):
             return
         worker = "A" if task_worker.currentIndex() == 0 else "B"
         follow_up = TASK_FOLLOW_UPS[task_follow_up.currentIndex()]
+        rounds = task_rounds.value()
         worker_obj = convo.sides[worker]
         if worker_obj.model is None:
             statusbar.showMessage(
@@ -3701,10 +3794,11 @@ def build_window(client=None, logger=None, deck_port=None):
         # A task is not a compare round: the offer is spent.
         state["compare"] = {}
         state["compare_round"] = False
-        state["task"] = TaskSession(worker, follow_up)
+        state["task"] = TaskSession(worker, follow_up, rounds)
         logger.action(
-            "task started: worker %s, follow-up %s, task %d chars"
-            % (worker, follow_up, len(text)))
+            "task started: worker %s, follow-up %s, %d rounds, "
+            "task %d chars"
+            % (worker, follow_up, state["task"].rounds, len(text)))
         # Attachments never ride on tasks -- tasks are text-only, and
         # the attached files stay put for the next normal send.
         task_edit.clear()
@@ -3714,6 +3808,7 @@ def build_window(client=None, logger=None, deck_port=None):
         refresh_history_list(worker)
         state["queued"].add(worker)
         set_status(worker, "Queued...")
+        show_task_progress(state["task"])
         runner.submit(worker, make_job_fn(
             worker, worker_obj.model, worker_obj.messages_for_model()))
         refresh_buttons()
@@ -4332,7 +4427,8 @@ def build_window(client=None, logger=None, deck_port=None):
         "remove_attachment": remove_attachment,
         "clear_attachments": clear_attachments,
         "task_edit": task_edit, "task_worker": task_worker,
-        "task_follow_up": task_follow_up, "task_run": task_run,
+        "task_follow_up": task_follow_up, "task_rounds": task_rounds,
+        "task_run": task_run,
         "do_run_task": do_run_task,
         "save_both": save_both, "do_save": do_save,
         "do_save_both": do_save_both,

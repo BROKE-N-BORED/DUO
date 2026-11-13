@@ -34,6 +34,8 @@ from dual_chat import (  # noqa: E402
     SETTING_SPLITTER_STATE, SETTING_TEMPERATURE,
     SETTING_WINDOW_GEOMETRY,
     TASK_CONTINUE_TEMPLATE, TASK_FOLLOW_UPS, TASK_REVIEW_TEMPLATE,
+    TASK_REVISE_TEMPLATE, TASK_ROUNDS_DEFAULT, TASK_ROUNDS_MAX,
+    TASK_ROUNDS_MIN,
     TEMPERATURE_DEFAULT, TEMPERATURE_MAX, TEMPERATURE_MIN,
     AttachmentError, Cancelled,
     ChatSide, Conversation, ConversationError, DeckServer,
@@ -412,6 +414,99 @@ class TaskSessionTests(unittest.TestCase):
         self.assertEqual(
             TaskSession("B", "continue").handoff_note(),
             "Task result from Model B, to continue.")
+
+    def test_rounds_default_one(self):
+        # The spinbox default is 1. With no follow-up that is one
+        # round; with a follow-up the chain floors at two rounds
+        # (worker + one follow-up) -- the v0.21 behaviour.
+        session = TaskSession("A", "nothing")
+        self.assertEqual(session.rounds, 1)
+        self.assertEqual(session.rounds, TASK_ROUNDS_DEFAULT)
+        self.assertEqual(session.rounds_done, 0)
+        self.assertEqual(TaskSession("A", "review").rounds, 2)
+        self.assertEqual(TaskSession("A", "continue").rounds, 2)
+
+    def test_rounds_clamped(self):
+        self.assertEqual(TaskSession("A", "continue", 99).rounds,
+                         TASK_ROUNDS_MAX)
+        # Below the floor with a follow-up lands on 2, not 1: the
+        # follow-up round always happens.
+        self.assertEqual(TaskSession("A", "continue", 0).rounds, 2)
+        self.assertEqual(TaskSession("A", "continue", -3).rounds, 2)
+        self.assertEqual(TaskSession("A", "continue", 4).rounds, 4)
+        # Without a follow-up the clamp still lands on 1.
+        self.assertEqual(TaskSession("A", "nothing", 0).rounds, 1)
+
+    def test_nothing_forces_one_round(self):
+        # No follow-up, no chain -- whatever was asked.
+        self.assertEqual(TaskSession("A", "nothing", 5).rounds, 1)
+
+    def test_follow_up_floors_rounds_at_two(self):
+        # Rounds 1 with Review/Continue is the v0.21 task: the worker
+        # plus one follow-up round, never the worker alone.
+        self.assertEqual(TaskSession("A", "review", 1).rounds, 2)
+        self.assertEqual(TaskSession("A", "continue", 1).rounds, 2)
+        self.assertEqual(TaskSession("A", "review", 2).rounds, 2)
+
+    def test_next_side_alternates(self):
+        session = TaskSession("A", "continue", 4)
+        self.assertEqual(session.next_side, "A")  # round 1: worker
+        session.rounds_done = 1
+        self.assertEqual(session.next_side, "B")  # round 2: other
+        session.rounds_done = 2
+        self.assertEqual(session.next_side, "A")  # round 3: worker
+        session.rounds_done = 3
+        self.assertEqual(session.next_side, "B")  # round 4: other
+        # Worker B mirrors it.
+        other = TaskSession("B", "continue", 3)
+        self.assertEqual(other.next_side, "B")
+        other.rounds_done = 1
+        self.assertEqual(other.next_side, "A")
+
+    def test_frame_next_continue_always_continues(self):
+        session = TaskSession("A", "continue", 4)
+        for done in (1, 2, 3):
+            session.rounds_done = done
+            self.assertEqual(session.frame_next("Work so far."),
+                             TASK_CONTINUE_TEMPLATE % "Work so far.")
+
+    def test_frame_next_review_then_revise(self):
+        session = TaskSession("A", "review", 4)
+        # Round 2: the other side reviews.
+        session.rounds_done = 1
+        self.assertEqual(session.frame_next("The draft is done."),
+                         TASK_REVIEW_TEMPLATE % "The draft is done.")
+        # Round 3: the worker revises from the review.
+        session.rounds_done = 2
+        self.assertEqual(session.frame_next("Needs work."),
+                         TASK_REVISE_TEMPLATE % "Needs work.")
+        # Round 4: a review turn again -- the alternation holds.
+        session.rounds_done = 3
+        self.assertEqual(session.frame_next("Revised draft."),
+                         TASK_REVIEW_TEMPLATE % "Revised draft.")
+
+    def test_revise_template_exact(self):
+        self.assertEqual(
+            TASK_REVISE_TEMPLATE % "Needs work.",
+            "Here is a review of your work. Revise your work based "
+            "on it:\n\nNeeds work.")
+
+    def test_frame_next_nothing_is_none(self):
+        self.assertIsNone(
+            TaskSession("A", "nothing", 1).frame_next("anything"))
+
+    def test_handoff_note_next(self):
+        session = TaskSession("A", "continue", 3)
+        session.rounds_done = 1  # handing B's result back to A
+        self.assertEqual(session.handoff_note_next("B"),
+                         "Task result from Model B, to continue.")
+        review = TaskSession("A", "review", 4)
+        review.rounds_done = 1  # handing A's result to B to review
+        self.assertEqual(review.handoff_note_next("A"),
+                         "Task result from Model A, for review.")
+        review.rounds_done = 2  # handing B's review to A to revise
+        self.assertEqual(review.handoff_note_next("B"),
+                         "Review from Model B, to revise.")
 
 
 # ---------------------------------------------------------------------------
@@ -3014,6 +3109,314 @@ class Item6GuiTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Multi-round tasks (v0.22, audit T11): GUI, fake Ollama
+# ---------------------------------------------------------------------------
+
+@unittest.skipUnless(os.environ.get("DUAL_CHAT_GUI_TESTS") == "1",
+                     "GUI tests run with DUAL_CHAT_GUI_TESTS=1")
+class TaskRoundsGuiTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        from PySide6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+        cls.client = FakeGuiClient()
+
+    def setUp(self):
+        from dual_chat import build_window
+        self.client.reset()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.pairs_file = os.path.join(self.tmp.name, "duo-pairs.json")
+        self._env = mock.patch.dict(
+            os.environ, {"DUAL_CHAT_PAIRS_FILE": self.pairs_file})
+        self._env.start()
+        self.window = build_window(self.client, logger=TEST_LOGGER)
+        self.window.show()
+        self.state = self.window._dual_chat
+        self._wait_for(lambda: self.state["widgets"]["A"]["picker"].count() == 2)
+        self._pick_models()
+
+    def tearDown(self):
+        self.window.close()
+        self._env.stop()
+        self.tmp.cleanup()
+
+    def _wait_for(self, cond, timeout=10.0):
+        from PySide6.QtTest import QTest
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            QTest.qWait(50)
+            if cond():
+                return True
+        return cond()
+
+    def _pick_models(self):
+        self.state["widgets"]["A"]["picker"].setCurrentIndex(0)
+        self.state["widgets"]["B"]["picker"].setCurrentIndex(1)
+        self.app.processEvents()
+
+    def _wait_idle(self, timeout=15):
+        return self._wait_for(
+            lambda: not self.state["state"]["busy"]
+            and self.state["state"]["task"] is None, timeout=timeout)
+
+    def _run_task(self, worker_index, follow_up_index, text, rounds=1):
+        self.state["task_edit"].setPlainText(text)
+        self.state["task_worker"].setCurrentIndex(worker_index)
+        self.state["task_follow_up"].setCurrentIndex(follow_up_index)
+        self.state["task_rounds"].setValue(rounds)
+        self.app.processEvents()
+        self.state["task_run"].click()
+
+    def _last_messages_for(self, model):
+        for seen_model, messages in reversed(self.client.messages_seen):
+            if seen_model == model:
+                return messages
+        return None
+
+    def test_rounds_control_defaults(self):
+        rounds = self.state["task_rounds"]
+        self.assertEqual(rounds.value(), 1)
+        self.assertEqual(rounds.minimum(), TASK_ROUNDS_MIN)
+        self.assertEqual(rounds.maximum(), TASK_ROUNDS_MAX)
+        # Enabled with nothing picked: it only locks for "Nothing"
+        # or mid-task.
+        self.assertTrue(rounds.isEnabled())
+
+    def test_rounds_clamps(self):
+        rounds = self.state["task_rounds"]
+        rounds.setValue(0)
+        self.assertEqual(rounds.value(), TASK_ROUNDS_MIN)
+        rounds.setValue(99)
+        self.assertEqual(rounds.value(), TASK_ROUNDS_MAX)
+
+    def test_rounds_disabled_with_nothing_follow_up(self):
+        rounds = self.state["task_rounds"]
+        self.state["task_follow_up"].setCurrentIndex(2)  # Nothing
+        self.app.processEvents()
+        self.assertFalse(rounds.isEnabled())
+        self.state["task_follow_up"].setCurrentIndex(0)  # Review it
+        self.app.processEvents()
+        self.assertTrue(rounds.isEnabled())
+        self.state["task_follow_up"].setCurrentIndex(1)  # Continue it
+        self.app.processEvents()
+        self.assertTrue(rounds.isEnabled())
+
+    def test_one_round_review_is_v021_behavior(self):
+        # Rounds 1 with Review it is the v0.21 task: the worker,
+        # then one review round -- never the worker alone.
+        self.client.replies = {
+            "fake-a:latest": ["Draft one."],
+            "fake-b:latest": ["Looks good."]}
+        self._run_task(0, 0, "Write a draft.", rounds=1)
+        self.assertTrue(self._wait_idle())
+        self.assertEqual(self.client.calls,
+                         ["fake-a:latest", "fake-b:latest"])
+        self.assertEqual(self._last_messages_for("fake-b:latest"),
+                         [{"role": "user", "content":
+                           TASK_REVIEW_TEMPLATE % "Draft one."}])
+        b_text = self.state["widgets"]["B"]["transcript"].toPlainText()
+        self.assertIn("You [task handoff]: "
+                      "Task result from Model A, for review.", b_text)
+
+    def test_three_round_continue(self):
+        self.client.replies = {
+            "fake-a:latest": ["Draft one.", "Draft three."],
+            "fake-b:latest": ["Part two."]}
+        self._run_task(0, 1, "Write the story.", rounds=3)
+        self.assertTrue(self._wait_idle())
+        # Three generations, sides alternating worker -> other ->
+        # worker, one at a time throughout.
+        self.assertEqual(self.client.calls,
+                         ["fake-a:latest", "fake-b:latest",
+                          "fake-a:latest"])
+        self.assertEqual(self.client.max_active, 1)
+        # Round 2: B continues A's draft.
+        self.assertEqual(self._last_messages_for("fake-b:latest"),
+                         [{"role": "user", "content":
+                           TASK_CONTINUE_TEMPLATE % "Draft one."}])
+        # Round 3: A continues B's part, on top of its own history.
+        a_messages = self._last_messages_for("fake-a:latest")
+        self.assertEqual(len(a_messages), 3)
+        self.assertEqual(a_messages[0],
+                         {"role": "user",
+                          "content": "Write the story."})
+        self.assertEqual(a_messages[-1],
+                         {"role": "user", "content":
+                          TASK_CONTINUE_TEMPLATE % "Part two."})
+        # The panes hold all three results with the right tags.
+        a_text = self.state["widgets"]["A"]["transcript"].toPlainText()
+        b_text = self.state["widgets"]["B"]["transcript"].toPlainText()
+        self.assertIn("You [task]: Write the story.", a_text)
+        self.assertIn("You [task handoff]: "
+                      "Task result from Model B, to continue.", a_text)
+        self.assertIn("You [task handoff]: "
+                      "Task result from Model A, to continue.", b_text)
+        self.assertIn("Draft one.", a_text)
+        self.assertIn("Draft three.", a_text)
+        self.assertIn("Part two.", b_text)
+        self.assertIn("Task done.",
+                      self.window.statusBar().currentMessage())
+
+    def test_three_round_review_revises(self):
+        self.client.replies = {
+            "fake-a:latest": ["Draft one.", "Revised draft."],
+            "fake-b:latest": ["Needs work."]}
+        self._run_task(0, 0, "Write a draft.", rounds=3)
+        self.assertTrue(self._wait_idle())
+        self.assertEqual(self.client.calls,
+                         ["fake-a:latest", "fake-b:latest",
+                          "fake-a:latest"])
+        # Round 2: B reviews A's draft.
+        self.assertEqual(self._last_messages_for("fake-b:latest"),
+                         [{"role": "user", "content":
+                           TASK_REVIEW_TEMPLATE % "Draft one."}])
+        # Round 3: A revises from B's review.
+        a_messages = self._last_messages_for("fake-a:latest")
+        self.assertEqual(len(a_messages), 3)
+        self.assertEqual(a_messages[-1],
+                         {"role": "user", "content":
+                          TASK_REVISE_TEMPLATE % "Needs work."})
+        # The handoff notes name what is passing each way.
+        a_text = self.state["widgets"]["A"]["transcript"].toPlainText()
+        b_text = self.state["widgets"]["B"]["transcript"].toPlainText()
+        self.assertIn("You [task handoff]: "
+                      "Task result from Model A, for review.", b_text)
+        self.assertIn("You [task handoff]: "
+                      "Review from Model B, to revise.", a_text)
+        self.assertIn("Revised draft.", a_text)
+
+    def test_four_round_review_alternates(self):
+        self.client.replies = {
+            "fake-a:latest": ["Draft one.", "Revised draft."],
+            "fake-b:latest": ["Needs work.", "Better now."]}
+        self._run_task(0, 0, "Write a draft.", rounds=4)
+        self.assertTrue(self._wait_idle())
+        self.assertEqual(self.client.calls,
+                         ["fake-a:latest", "fake-b:latest",
+                          "fake-a:latest", "fake-b:latest"])
+        # Round 4 is a review turn again: B reviews A's revision.
+        b_messages = self._last_messages_for("fake-b:latest")
+        self.assertEqual(len(b_messages), 3)
+        self.assertEqual(b_messages[-1],
+                         {"role": "user", "content":
+                          TASK_REVIEW_TEMPLATE % "Revised draft."})
+
+    def test_nothing_follow_up_is_one_round(self):
+        # "Nothing" locks the Rounds box and forces one round even
+        # when the box somehow holds a bigger number.
+        self.state["task_follow_up"].setCurrentIndex(2)
+        self.app.processEvents()
+        self.assertFalse(self.state["task_rounds"].isEnabled())
+        self.state["task_rounds"].setValue(5)
+        self.state["task_edit"].setPlainText("Write a draft.")
+        self.state["task_worker"].setCurrentIndex(0)
+        self.app.processEvents()
+        self.state["task_run"].click()
+        self.assertTrue(self._wait_idle())
+        self.assertEqual(self.client.calls, ["fake-a:latest"])
+        self.assertIn("Task done.",
+                      self.window.statusBar().currentMessage())
+
+    def test_rounds_setup_locked_mid_task(self):
+        self.client.delay = 0.5
+        self.client.replies = {"fake-a:latest":
+                               ["one two three four five"]}
+        self._run_task(0, 1, "Write the story.", rounds=3)
+        self.assertTrue(self._wait_for(
+            lambda: self.state["state"]["busy"], timeout=5))
+        self.assertFalse(self.state["task_rounds"].isEnabled())
+        self.assertFalse(self.state["task_edit"].isEnabled())
+        self.assertTrue(self._wait_idle())
+        self.assertTrue(self.state["task_rounds"].isEnabled())
+
+    def test_stop_mid_chain_ends_chain(self):
+        self.client.delay = 0.5
+        self.client.replies = {"fake-a:latest":
+                               ["one two three four five"]}
+        self._run_task(0, 1, "Write the story.", rounds=3)
+        self.assertTrue(self._wait_for(
+            lambda: self.state["state"]["busy"], timeout=5))
+        self.state["widgets"]["A"]["stop"].click()
+        self.assertTrue(self._wait_for(
+            lambda: "Task stopped." in
+            self.window.statusBar().currentMessage(), timeout=10))
+        self.assertTrue(self._wait_idle())
+        self.assertIsNone(self.state["state"]["task"])
+        # No further rounds: the chain ended with the stop.
+        self.assertEqual(self.client.calls, ["fake-a:latest"])
+
+    def test_failure_mid_chain_ends_chain(self):
+        from dual_chat import build_window
+
+        class FailOnSecondClient(FakeGuiClient):
+            def chat_stream(self, model, messages, on_chunk,
+                            cancel_event, timeout=1800, on_metrics=None,
+                            on_retry=None, options=None):
+                if model == "fake-b:latest":
+                    # Round 2 fails after partial text.
+                    with self.lock:
+                        self.calls.append(model)
+                        self.messages_seen.append(
+                            (model, copy.deepcopy(messages)))
+                    on_chunk("partial ")
+                    raise OllamaError(MSG_OLLAMA_SLOW)
+                return super().chat_stream(
+                    model, messages, on_chunk, cancel_event, timeout,
+                    on_metrics, on_retry, options)
+
+        client = FailOnSecondClient()
+        client.replies = {"fake-a:latest": ["Draft one."]}
+        window = build_window(client, logger=TEST_LOGGER)
+        try:
+            window.show()
+            state = window._dual_chat
+            self.assertTrue(self._wait_for(
+                lambda: state["widgets"]["A"]["picker"].count() == 2))
+            state["widgets"]["A"]["picker"].setCurrentIndex(0)
+            state["widgets"]["B"]["picker"].setCurrentIndex(1)
+            self.app.processEvents()
+            state["task_edit"].setPlainText("Write the story.")
+            state["task_worker"].setCurrentIndex(0)
+            state["task_follow_up"].setCurrentIndex(1)  # Continue it
+            state["task_rounds"].setValue(3)
+            self.app.processEvents()
+            state["task_run"].click()
+            self.assertTrue(self._wait_for(
+                lambda: "Task failed:" in
+                window.statusBar().currentMessage(), timeout=15))
+            self.assertTrue(self._wait_for(
+                lambda: state["state"]["task"] is None, timeout=10))
+            # Two calls and no more: round 3 never ran.
+            self.assertEqual(client.calls,
+                             ["fake-a:latest", "fake-b:latest"])
+            # The round-1 result stays in A's pane; B keeps the
+            # partial text plus the failure note.
+            a_text = state["widgets"]["A"]["transcript"].toPlainText()
+            b_text = state["widgets"]["B"]["transcript"].toPlainText()
+            self.assertIn("Draft one.", a_text)
+            self.assertIn("partial", b_text)
+        finally:
+            window.close()
+
+    def test_status_shows_round_progress(self):
+        self.client.delay = 0.3
+        self.client.replies = {
+            "fake-a:latest": ["one two three four five",
+                              "six seven eight nine ten"],
+            "fake-b:latest": ["alpha beta gamma delta epsilon"]}
+        self._run_task(0, 1, "Write the story.", rounds=3)
+        self.assertTrue(self._wait_for(
+            lambda: "Task: round 1 of 3..." in
+            self.window.statusBar().currentMessage(), timeout=10))
+        self.assertTrue(self._wait_for(
+            lambda: "Task: round 2 of 3..." in
+            self.window.statusBar().currentMessage(), timeout=15))
+        self.assertTrue(self._wait_idle())
+        self.assertIn("Task done.",
+                      self.window.statusBar().currentMessage())
+
+
+# ---------------------------------------------------------------------------
 # Transcripts (Item 7): pure logic, no Qt
 # ---------------------------------------------------------------------------
 
@@ -5396,7 +5799,7 @@ class FrontDoorTests(unittest.TestCase):
 
     def test_changelog_covers_every_version(self):
         log = self._read("CHANGELOG.md")
-        for version in ["0.%d" % n for n in range(1, 22)]:
+        for version in ["0.%d" % n for n in range(1, 23)]:
             self.assertIn(version, log)
 
     def test_gitignore_covers_runtime_files(self):
