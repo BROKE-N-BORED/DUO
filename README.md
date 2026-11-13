@@ -129,6 +129,13 @@ bash run.sh
   (under the message box) and plain Enter sends to both too, with
   Shift+Enter still adding a new line. The tick is remembered between
   runs. Long pastes stay whole — the message box never drops text.
+- Menu bar: File, Relay, and Help sit across the top of the window.
+  File holds the saves, Debug report, and Quit; Relay holds Start
+  and Stop relay; Help holds Check for updates, How to use, and
+  About. Shortcuts: Ctrl+S saves the conversation, Ctrl+O opens
+  one, Ctrl+Shift+S saves the full transcript, Ctrl+Q quits. How
+  to use is a built-in index explaining everything DUO does, in
+  plain language and with no web.
 - Stop ends the turn in progress on that side. Clear wipes that side's
   conversation. Conversations are not saved automatically — Save
   conversation (next to the save buttons) keeps the whole

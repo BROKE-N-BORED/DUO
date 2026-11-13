@@ -196,6 +196,7 @@ except ImportError:  # pragma: no cover - the zip always ships it
 # bigger redesign and not this task.
 from duo_icon import make_app_icon
 from duo_markdown import markdown_to_html
+from duo_menu import build_menu_bar
 from duo_model import (
     ChatMessage, ChatSide, Conversation, MSG_NO_MODEL, NoModelSelected,
     SUMMARY_KEEP_LAST, SUMMARY_LABEL,)
@@ -297,7 +298,7 @@ def make_debug_logger(log_dir=None):
         return _NullLogger()
 
 APP_NAME = "DUO"
-APP_VERSION = "0.29"
+APP_VERSION = "0.30"
 
 # Phone deck (v0.11): DUO serves a small local page for his phone.
 # Fixed port with a fallback chain if it is busy; DUAL_CHAT_DECK_PORT
@@ -320,9 +321,9 @@ MSG_PHONE_TARGET = "Pick who to send to: A, B, or Both."
 # is current, and what it says when the check itself failed. The
 # automatic startup check only ever shows the first one -- when
 # this copy is current or the check fails, it stays silent.
-MSG_UPDATE_AVAILABLE = "DUO %s is out — see the Releases page on GitHub."
+MSG_UPDATE_AVAILABLE = "DUO %s is out. See the Releases page on GitHub."
 MSG_UPDATE_LATEST = "You're on the latest version."
-MSG_UPDATE_FAILED = "Couldn't check for updates — are you online?"
+MSG_UPDATE_FAILED = "Couldn't check for updates. Are you online?"
 MSG_PYSIDE6_MISSING = (
     "DUO needs PySide6 to open its window, and it isn't installed.\n"
     "Run the installer first:\n"
@@ -1174,7 +1175,7 @@ def build_window(client=None, logger=None, deck_port=None):
         temp_spin.setSingleStep(0.1)
         temp_spin.setDecimals(1)
         temp_spin.setToolTip(
-            "0.7 is Ollama's default — lower is more focused, "
+            "0.7 is Ollama's default. Lower is more focused, "
             "higher is more random.")
         temp_spin.setValue(prefs.value(
             SETTING_TEMPERATURE % side, TEMPERATURE_DEFAULT,
@@ -1264,7 +1265,7 @@ def build_window(client=None, logger=None, deck_port=None):
         # Summarize row: the nudge label appears when this side's
         # history passes the budget; the button is always here.
         summarize_row = QtWidgets.QHBoxLayout()
-        nudge = QtWidgets.QLabel("History is long — Summarize?")
+        nudge = QtWidgets.QLabel("History is long. Summarize?")
         nudge.setVisible(False)
         summarize_row.addWidget(nudge)
         summarize_btn = QtWidgets.QPushButton("Summarize")
@@ -1901,6 +1902,12 @@ def build_window(client=None, logger=None, deck_port=None):
         w["hist_down"].setEnabled(idle and 0 <= row < count - 1)
         w["hist_delete"].setEnabled(idle and row >= 0)
 
+    # The menu bar's actions, filled in when the menu is built near
+    # the end of this function. refresh_buttons mirrors the buttons'
+    # enabled states onto them; the mirror guards on the dict being
+    # filled, so it is safe before the menu exists.
+    menu_actions = {}
+
     def refresh_buttons():
         busy = state["busy"]
         relay = state.get("relay")
@@ -1952,6 +1959,18 @@ def build_window(client=None, logger=None, deck_port=None):
         save_full.setEnabled(save_idle)
         save_convo.setEnabled(save_idle)
         open_convo.setEnabled(save_idle)
+        # The menu bar mirrors the buttons: same actions, same
+        # enabled states (v0.30). The relay button is one toggle;
+        # the menu splits it into Start (only when a relay can
+        # start) and Stop (only while one runs).
+        if menu_actions:
+            menu_actions["save_conversation"].setEnabled(save_idle)
+            menu_actions["open_conversation"].setEnabled(save_idle)
+            menu_actions["save_full"].setEnabled(save_idle)
+            menu_actions["save_both"].setEnabled(save_idle)
+            menu_actions["start_relay"].setEnabled(
+                not relay_active and not busy and a_ready and b_ready)
+            menu_actions["stop_relay"].setEnabled(relay_active)
         # Run Task: idle only, and only once the task text and both
         # pickers are set. Nothing is pre-selected, ever. The task
         # setup itself can't change mid-task.
@@ -2361,7 +2380,7 @@ def build_window(client=None, logger=None, deck_port=None):
         set_side_state(side, "idle")
         if not text.strip():
             statusbar.showMessage(
-                "Summarize came back empty — history unchanged.", 4000)
+                "Summarize came back empty. History unchanged.", 4000)
             refresh_buttons()
             return
         if convo.sides[side].summarize(text):
@@ -3744,6 +3763,24 @@ def build_window(client=None, logger=None, deck_port=None):
 
     phone_btn.clicked.connect(show_phone_deck)
 
+    # --- menu bar (v0.30) -------------------------------------------------
+    # File / Relay / Help, plus shortcuts for the main actions. Every
+    # item calls the same handler as its button -- access, not
+    # capability. The menu itself lives in duo_menu.py, so this file
+    # stays under the 4,000-line bound; its enabled states are
+    # mirrored in refresh_buttons, above.
+    menu_bar, menu_actions = build_menu_bar(window, {
+        "save_conversation": do_save_conversation,
+        "open_conversation": do_open_conversation,
+        "save_full": do_save_full,
+        "save_both": do_save_both,
+        "debug_report": do_debug_report,
+        "quit": window.close,
+        "start_relay": do_start_relay,
+        "stop_relay": stop_relay,
+        "check_updates": lambda: run_update_check(manual=True),
+    }, APP_VERSION)
+
     window._dual_chat = {  # test hooks (not part of the UI)
         "convo": convo, "runner": runner, "signals": signals,
         "widgets": widgets, "composer": composer, "panes": panes,
@@ -3806,6 +3843,7 @@ def build_window(client=None, logger=None, deck_port=None):
         "on_phone_send": on_phone_send,
         "update_btn": update_btn, "run_update_check": run_update_check,
         "on_update_checked": on_update_checked,
+        "menu_bar": menu_bar, "menu_actions": menu_actions,
     }
 
     # Closing the window stops a server DUO itself started -- no orphan

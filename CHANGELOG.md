@@ -1,7 +1,26 @@
 # DUO changelog
 
 Every version, newest first. v0.1–v0.17 were built on 2026-11-12;
-v0.18–v0.29 on 2026-11-13.
+v0.18–v0.30 on 2026-11-13.
+
+## v0.30 — 2026-11-13
+
+DUO has a menu bar now, across the top of the window. File holds
+Save conversation (Ctrl+S), Open conversation (Ctrl+O), Save full
+transcript (Ctrl+Shift+S), Save both, Debug report, and Quit
+(Ctrl+Q); Relay holds Start relay and Stop relay; Help holds Check
+for updates, How to use, and About. Nothing new is behind the menu
+except the How to use index itself — every other item calls the
+same thing its button already calls, and the menu items grey out
+exactly when their buttons do. How to use is a built-in index that
+explains the panes, sending, the relay, tasks, files, transcripts,
+saved pairs and presets, the phone deck, and the update check, in
+plain language and with no web. The shortcuts work from anywhere in
+the window and don't touch the composer keys: Ctrl+Enter still
+sends to both, and Enter still starts a new line unless "Enter to
+send" is ticked. Also in this version, the visible text drops the
+em-dash: the update notes, the temperature tooltip, the long-history
+nudge, and the empty-summary note all use plain punctuation now.
 
 ## v0.29 — 2026-11-13
 

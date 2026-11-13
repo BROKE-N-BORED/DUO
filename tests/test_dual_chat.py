@@ -6388,7 +6388,7 @@ class FrontDoorTests(unittest.TestCase):
 
     def test_changelog_covers_every_version(self):
         log = self._read("CHANGELOG.md")
-        for version in ["0.%d" % n for n in range(1, 30)]:
+        for version in ["0.%d" % n for n in range(1, 31)]:
             self.assertIn(version, log)
 
     def test_gitignore_covers_runtime_files(self):
@@ -8391,7 +8391,7 @@ class ModuleSplitTests(unittest.TestCase):
 
     MODULES = ("duo_ollama", "duo_stats", "duo_text", "duo_tasks",
                "duo_markdown", "duo_model", "duo_transcript",
-               "duo_storage", "duo_runner", "duo_icon")
+               "duo_storage", "duo_runner", "duo_icon", "duo_menu")
 
     def _tree(self):
         return os.path.dirname(
@@ -8421,6 +8421,7 @@ class ModuleSplitTests(unittest.TestCase):
         import dual_chat
         import duo_icon
         import duo_markdown
+        import duo_menu
         import duo_model
         import duo_ollama
         import duo_runner
@@ -8431,6 +8432,7 @@ class ModuleSplitTests(unittest.TestCase):
         import duo_transcript
         pairs = [
             (dual_chat.make_app_icon, duo_icon.make_app_icon),
+            (dual_chat.build_menu_bar, duo_menu.build_menu_bar),
             (dual_chat.markdown_to_html, duo_markdown.markdown_to_html),
             (dual_chat.ChatSide, duo_model.ChatSide),
             (dual_chat.ChatMessage, duo_model.ChatMessage),
@@ -8733,6 +8735,12 @@ class MessageStructureTests(unittest.TestCase):
                   encoding="utf-8") as fh:
             script = fh.read()
         self.assertIn('"LICENSE": 0o100644', script)
+
+    def test_zip_includes_the_menu_module(self):
+        with open(os.path.join(self._tree(), "build_zip.py"),
+                  encoding="utf-8") as fh:
+            script = fh.read()
+        self.assertIn('"duo_menu.py": 0o100644', script)
 
 class UpdateCheckTests(unittest.TestCase):
     """v0.28 (audit T17): the update check's pure core -- version
@@ -9521,6 +9529,344 @@ class ActivityIndicatorGuiTests(unittest.TestCase):
         # The timer is parented to the window: closing the window
         # destroys it, so it can never fire into a dead window.
         self.assertFalse(timer.isActive())
+
+
+# ---------------------------------------------------------------------------
+# Menu bar + keyboard shortcuts + How to Use index (v0.30, audit T18;
+# U22 How to Use index, U33 no em-dashes in visible UI text)
+
+class MenuBarTextTests(unittest.TestCase):
+    """v0.30: the menu's plain-text pins -- the update notes use
+    plain punctuation now, and no em-dash (literal or escaped) may
+    appear in DUO's own code except the debug-report header, which
+    mirrors the vendored debug_log layer's header word for word."""
+
+    def _tree(self):
+        return os.path.dirname(
+            os.path.dirname(os.path.abspath(__file__)))
+
+    def test_update_notes_use_plain_punctuation(self):
+        self.assertEqual(
+            MSG_UPDATE_AVAILABLE,
+            "DUO %s is out. See the Releases page on GitHub.")
+        self.assertEqual(
+            MSG_UPDATE_FAILED,
+            "Couldn't check for updates. Are you online?")
+
+    def test_about_and_how_to_use_text_have_no_em_dash(self):
+        import duo_menu
+        self.assertNotIn("\u2014",
+                         duo_menu.about_text(APP_VERSION))
+        self.assertNotIn("\u2014", duo_menu.how_to_use_text())
+
+    def test_how_to_use_index_has_the_nine_sections(self):
+        import duo_menu
+        headings = [heading for heading, _ in
+                    duo_menu.HOW_TO_USE_SECTIONS]
+        self.assertEqual(headings, [
+            "The two panes", "Sending a message", "The relay",
+            "Tasks", "Attaching files",
+            "Transcripts and conversations",
+            "Saved pairs and relay presets", "The phone deck",
+            "The update check"])
+        for _heading, body in duo_menu.HOW_TO_USE_SECTIONS:
+            self.assertTrue(body.strip())
+
+    def test_no_em_dash_in_product_code_except_report_header(self):
+        import glob
+        files = [os.path.join(self._tree(), "dual_chat.py"),
+                 os.path.join(self._tree(), "duo_menu.py")]
+        files += sorted(glob.glob(
+            os.path.join(self._tree(), "duo_*.py")))
+        # debug_log.py is vendored verbatim from the shared T21
+        # layer (byte-identical by audit); its header stays.
+        files = [path for path in files
+                 if not path.endswith("debug_log.py")]
+        for path in files:
+            with open(path, encoding="utf-8") as fh:
+                lines = fh.readlines()
+            for number, line in enumerate(lines, start=1):
+                if "\u2014" in line or "\\u2014" in line:
+                    self.assertIn(
+                        "DEBUG REPORT", line,
+                        "%s:%d: %s" % (path, number, line))
+
+
+@unittest.skipUnless(os.environ.get("DUAL_CHAT_GUI_TESTS") == "1",
+                     "GUI tests run with DUAL_CHAT_GUI_TESTS=1")
+class MenuBarGuiTests(unittest.TestCase):
+    """v0.30 (audit T18): the menu bar in the window -- File, Relay,
+    and Help with the items and shortcuts pinned, every item calling
+    the same handler as its button, and enabled states mirroring the
+    buttons. The update check is stubbed, as in
+    UpdateCheckGuiTests, so no test touches the network."""
+
+    @classmethod
+    def setUpClass(cls):
+        from PySide6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+        cls.client = FakeGuiClient()
+
+    def setUp(self):
+        from dual_chat import build_window
+        self._patcher = mock.patch(
+            "dual_chat.check_for_update",
+            return_value=("latest", None))
+        self._patcher.start()
+        self.client.reset()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.window = build_window(self.client, logger=TEST_LOGGER)
+        self.window.show()
+        self.state = self.window._dual_chat
+        self._wait_for(lambda: self.state["widgets"]["A"]["picker"].count() == 2)
+        self._pick_models()
+
+    def tearDown(self):
+        self.window.close()
+        self.app.processEvents()
+        self._patcher.stop()
+        self.tmp.cleanup()
+
+    def _wait_for(self, cond, timeout=10.0):
+        from PySide6.QtTest import QTest
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            QTest.qWait(50)
+            if cond():
+                return True
+        return cond()
+
+    def _pick_models(self):
+        self.state["widgets"]["A"]["picker"].setCurrentIndex(0)
+        self.state["widgets"]["B"]["picker"].setCurrentIndex(1)
+        self.app.processEvents()
+
+    def _transcript(self, side):
+        return self.state["widgets"][side]["transcript"].toPlainText()
+
+    def _send_both_and_wait(self, text):
+        self.state["composer"].setPlainText(text)
+        self.state["send_both"].click()
+        return self._wait_for(lambda: (
+            len(self.state["convo"].sides["A"].messages) >= 2
+            and len(self.state["convo"].sides["B"].messages) >= 2
+            and not self.state["state"]["busy"]), timeout=15)
+
+    def _save_dialog(self, path):
+        from PySide6 import QtWidgets
+        return mock.patch.object(
+            QtWidgets.QFileDialog, "getSaveFileName",
+            return_value=(path, "Text files (*.txt)"))
+
+    def _open_dialog(self, path):
+        from PySide6 import QtWidgets
+        return mock.patch.object(
+            QtWidgets.QFileDialog, "getOpenFileName",
+            return_value=(path, "Text files (*.txt)"))
+
+    def _read(self, path):
+        with open(path, encoding="utf-8") as fh:
+            return fh.read()
+
+    def _menus(self):
+        menus = {}
+        for action in self.window.menuBar().actions():
+            menus[action.text()] = action.menu()
+        return menus
+
+    def _item_texts(self, menu):
+        return [action.text() for action in menu.actions()
+                if not action.isSeparator()]
+
+    def test_menu_bar_has_file_relay_and_help(self):
+        menus = self._menus()
+        self.assertEqual(sorted(menus), ["File", "Help", "Relay"])
+        self.assertEqual(self._item_texts(menus["File"]), [
+            "Save conversation", "Open conversation",
+            "Save full transcript", "Save both", "Debug report",
+            "Quit"])
+        self.assertEqual(self._item_texts(menus["Relay"]), [
+            "Start relay", "Stop relay"])
+        self.assertEqual(self._item_texts(menus["Help"]), [
+            "Check for updates", "How to use", "About"])
+
+    def test_shortcuts_are_set(self):
+        actions = self.state["menu_actions"]
+        self.assertEqual(
+            actions["save_conversation"].shortcut().toString(), "Ctrl+S")
+        self.assertEqual(
+            actions["open_conversation"].shortcut().toString(), "Ctrl+O")
+        self.assertEqual(
+            actions["save_full"].shortcut().toString(), "Ctrl+Shift+S")
+        self.assertEqual(actions["quit"].shortcut().toString(), "Ctrl+Q")
+
+    def test_save_conversation_from_menu_writes_the_file(self):
+        self.assertTrue(self._send_both_and_wait("hello both"))
+        path = os.path.join(self.tmp.name, "convo.json")
+        with self._save_dialog(path):
+            self.state["menu_actions"]["save_conversation"].trigger()
+        self.app.processEvents()
+        new_convo, _new_log = load_conversation_file(path)
+        self.assertEqual(len(new_convo.sides["A"].messages), 2)
+        self.assertEqual(len(new_convo.sides["B"].messages), 2)
+
+    def test_open_conversation_from_menu_restores_the_panes(self):
+        self.assertTrue(self._send_both_and_wait("hello both"))
+        path = os.path.join(self.tmp.name, "convo.json")
+        with self._save_dialog(path):
+            self.state["menu_actions"]["save_conversation"].trigger()
+        self.state["widgets"]["A"]["clear"].click()
+        self.state["widgets"]["B"]["clear"].click()
+        self.app.processEvents()
+        self.assertEqual(self.state["convo"].sides["A"].messages, [])
+        with self._open_dialog(path):
+            self.state["menu_actions"]["open_conversation"].trigger()
+        self.app.processEvents()
+        self.assertEqual(len(self.state["convo"].sides["A"].messages), 2)
+        self.assertIn("hello both", self._transcript("A"))
+
+    def test_save_full_transcript_from_menu(self):
+        self.assertTrue(self._send_both_and_wait("hello both"))
+        path = os.path.join(self.tmp.name, "full.txt")
+        with self._save_dialog(path):
+            self.state["menu_actions"]["save_full"].trigger()
+        self.assertIn("hello both", self._read(path))
+
+    def test_save_both_and_debug_report_from_menu(self):
+        self.assertTrue(self._send_both_and_wait("hello both"))
+        path = os.path.join(self.tmp.name, "both.txt")
+        with self._save_dialog(path):
+            self.state["menu_actions"]["save_both"].trigger()
+        self.assertIn("hello both", self._read(path))
+        report = os.path.join(self.tmp.name, "debug.txt")
+        with self._save_dialog(report):
+            self.state["menu_actions"]["debug_report"].trigger()
+        text = self._read(report)
+        self.assertIn("DUO", text)
+        self.assertTrue(len(text) > 0)
+
+    def test_relay_menu_starts_and_stops_a_relay(self):
+        self.state["cap_spin"].setValue(50)
+        self.state["composer"].setPlainText("relay seed")
+        self.app.processEvents()
+        self.state["menu_actions"]["start_relay"].trigger()
+        self.assertIsNotNone(self.state["state"].get("relay"))
+        self.state["menu_actions"]["stop_relay"].trigger()
+        self.assertTrue(self._wait_for(
+            lambda: self.state["state"].get("relay") is None))
+        self.assertEqual(self.state["relay_status"].text(),
+                         "Relay stopped: stopped by you.")
+
+    def test_menu_states_mirror_buttons_when_busy(self):
+        actions = self.state["menu_actions"]
+        state = self.state["state"]
+        self.assertTrue(actions["save_conversation"].isEnabled())
+        self.assertTrue(self.state["save_convo"].isEnabled())
+        self.assertTrue(actions["start_relay"].isEnabled())
+        state["busy"] = True
+        self.state["refresh_buttons"]()
+        for name in ("save_conversation", "open_conversation",
+                     "save_full", "save_both", "start_relay"):
+            self.assertFalse(actions[name].isEnabled(), name)
+        self.assertFalse(self.state["save_convo"].isEnabled())
+        self.assertFalse(self.state["open_convo"].isEnabled())
+        state["busy"] = False
+        self.state["refresh_buttons"]()
+        for name in ("save_conversation", "open_conversation",
+                     "save_full", "save_both", "start_relay"):
+            self.assertTrue(actions[name].isEnabled(), name)
+
+    def test_relay_menu_states_follow_the_relay(self):
+        actions = self.state["menu_actions"]
+        state = self.state["state"]
+        self.assertTrue(actions["start_relay"].isEnabled())
+        self.assertFalse(actions["stop_relay"].isEnabled())
+        state["relay"] = RelaySession("A")
+        self.state["refresh_buttons"]()
+        self.assertFalse(actions["start_relay"].isEnabled())
+        self.assertTrue(actions["stop_relay"].isEnabled())
+        self.assertEqual(self.state["relay_btn"].text(), "Stop Relay")
+        state["relay"] = None
+        self.state["refresh_buttons"]()
+        self.assertTrue(actions["start_relay"].isEnabled())
+        self.assertFalse(actions["stop_relay"].isEnabled())
+
+    def test_about_dialog_shows_version_and_license(self):
+        import duo_menu
+        from PySide6 import QtWidgets
+        dialog = duo_menu.make_about_dialog(self.window, APP_VERSION)
+        try:
+            labels = dialog.findChildren(QtWidgets.QLabel)
+            text = "\n".join(label.text() for label in labels)
+            self.assertIn("DUO %s" % APP_VERSION, text)
+            self.assertIn("MIT", text)
+            self.assertNotIn("\u2014", text)
+            buttons = [btn for btn in
+                       dialog.findChildren(QtWidgets.QPushButton)
+                       if btn.text() == "Close"]
+            self.assertEqual(len(buttons), 1)
+            dialog.show()
+            self.app.processEvents()
+            self.assertTrue(dialog.isVisible())
+            buttons[0].click()
+            self.app.processEvents()
+            self.assertFalse(dialog.isVisible())
+        finally:
+            dialog.close()
+
+    def test_about_menu_item_opens_the_about_dialog(self):
+        with mock.patch("duo_menu.show_about_dialog") as show:
+            self.state["menu_actions"]["about"].trigger()
+        show.assert_called_once_with(self.window, APP_VERSION)
+
+    def test_how_to_use_dialog_shows_all_sections_and_closes(self):
+        import duo_menu
+        from PySide6 import QtWidgets
+        dialog = duo_menu.make_how_to_use_dialog(self.window)
+        try:
+            edits = dialog.findChildren(QtWidgets.QTextEdit)
+            self.assertEqual(len(edits), 1)
+            text = edits[0].toPlainText()
+            for heading, _body in duo_menu.HOW_TO_USE_SECTIONS:
+                self.assertIn(heading, text)
+            self.assertNotIn("\u2014", text)
+            buttons = [btn for btn in
+                       dialog.findChildren(QtWidgets.QPushButton)
+                       if btn.text() == "Close"]
+            self.assertEqual(len(buttons), 1)
+            dialog.show()
+            self.app.processEvents()
+            self.assertTrue(dialog.isVisible())
+            buttons[0].click()
+            self.app.processEvents()
+            self.assertFalse(dialog.isVisible())
+        finally:
+            dialog.close()
+
+    def test_how_to_use_menu_item_opens_the_index(self):
+        with mock.patch("duo_menu.show_how_to_use_dialog") as show:
+            self.state["menu_actions"]["how_to_use"].trigger()
+        show.assert_called_once_with(self.window)
+
+    def test_check_for_updates_menu_item_reports_latest(self):
+        self.state["menu_actions"]["check_updates"].trigger()
+        self.assertTrue(self._wait_for(
+            lambda: self.window.statusBar().currentMessage()
+            == MSG_UPDATE_LATEST, timeout=10))
+
+    def test_quit_menu_item_closes_the_window(self):
+        self.state["menu_actions"]["quit"].trigger()
+        self.assertTrue(self._wait_for(
+            lambda: not self.window.isVisible(), timeout=10))
+
+    def test_temperature_tooltip_and_nudge_have_no_em_dash(self):
+        tip = self.state["widgets"]["A"]["temperature"].toolTip()
+        self.assertIn(
+            "0.7 is Ollama's default. Lower is more focused, "
+            "higher is more random.", tip)
+        self.assertNotIn("\u2014", tip)
+        nudge = self.state["widgets"]["A"]["nudge"].text()
+        self.assertEqual(nudge, "History is long. Summarize?")
 
 
 if __name__ == "__main__":
