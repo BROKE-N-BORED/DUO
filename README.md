@@ -29,7 +29,12 @@ Everything in one app:
   them with it.
 - **Tasks** — give one model a job and have the other review it or
   continue it.
-- **Transcripts** — save either side, or both, to a plain text file.
+- **Transcripts** — save either side, or both, to a plain text file,
+  or save the full transcript: the whole conversation as it happened,
+  both sides interleaved in time order.
+- **Readable chat** — messages in the window are separated by a blank
+  line, with the sender's name in bold, so a long reply never runs
+  into the next message.
 
 ## What you need
 
@@ -166,7 +171,12 @@ bash run.sh
 - Save: each pane has a Save button that saves that side's
   conversation to a plain text file you pick. Save both, next to the
   send buttons, saves both sides in one file — the Model A section
-  first, then Model B.
+  first, then Model B. Save full transcript, next to Save both,
+  saves the whole conversation as it happened: both sides interleaved
+  in time order, each message prefixed with its side ("A -- You: ...",
+  "B -- <model>: ..."). Reordering or deleting messages never changes
+  the full transcript — it is what actually happened. Clearing a side
+  removes that side from it, since the conversation restarts.
 - The file reads like the window: a header line naming DUO, the model,
   and when it was saved, then each message in order with its labels
   ([relay], [task], [task handoff], the summary entry), one blank

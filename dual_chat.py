@@ -372,12 +372,14 @@ class ChatSide:
         self.history.append({"role": "user", "content": text})
         self.labels.append(label)
         self.display.append(display)
+        return label
 
     def add_assistant(self, text, label=None):
         self.history.append({"role": "assistant", "content": text})
-        self.labels.append(
-            label if label is not None else (self.model or "Assistant"))
+        label = label if label is not None else (self.model or "Assistant")
+        self.labels.append(label)
         self.display.append(None)
+        return label
 
     def clear(self):
         self.history = []
@@ -586,6 +588,13 @@ def default_both_filename(today=None):
     return "duo-both-%s.txt" % day
 
 
+def default_full_filename(today=None):
+    """Suggested filename for the full-transcript export, e.g.
+    "duo-full-2026-11-12.txt"."""
+    day = (today or datetime.date.today()).strftime("%Y-%m-%d")
+    return "duo-full-%s.txt" % day
+
+
 def _saved_stamp(when):
     moment = when or datetime.datetime.now()
     return moment.strftime("%Y-%m-%d %H:%M")
@@ -627,6 +636,20 @@ def format_both_transcript(convo, when=None):
         else:
             parts.extend(_side_blocks(side_obj))
     return "\n\n".join(parts) + "\n"
+
+
+def format_full_transcript(log, when=None):
+    """The full transcript: every logged message in arrival order,
+    both sides interleaved as the conversation actually happened.
+    Each message is prefixed with its side ("A -- You: ...",
+    "B -- <model>: ..."), one blank line between messages. An empty
+    log gets the header plus "No messages yet."."""
+    header = "DUO transcript -- saved %s" % _saved_stamp(when)
+    if not log:
+        return header + "\n\nNo messages yet.\n"
+    blocks = ["%s -- %s: %s" % (side, label, text)
+              for side, label, text in log]
+    return "\n\n".join([header] + blocks) + "\n"
 
 
 class RelaySession:
@@ -911,7 +934,7 @@ class MainWindow:
 
 def build_window(client=None):
     """Create the main window. Returns (window, app_state_dict)."""
-    from PySide6 import QtCore, QtWidgets
+    from PySide6 import QtCore, QtGui, QtWidgets
     import shiboken6
 
     client = client or OllamaClient()
@@ -980,6 +1003,10 @@ def build_window(client=None):
         transcript = QtWidgets.QTextEdit()
         transcript.setReadOnly(True)
         transcript.setPlaceholderText("No messages yet.")
+        # Wrap at the widget's width, set explicitly -- long model
+        # replies must wrap in the pane, never run off the edge.
+        transcript.setLineWrapMode(
+            QtWidgets.QTextEdit.LineWrapMode.WidgetWidth)
         layout.addWidget(transcript, stretch=1)
 
         # Stats line: the last completed turn's speed and RAM. Dashes
@@ -1102,6 +1129,8 @@ def build_window(client=None):
         btn_row.addWidget(btn)
     save_both = QtWidgets.QPushButton("Save both")
     btn_row.addWidget(save_both)
+    save_full = QtWidgets.QPushButton("Save full transcript")
+    btn_row.addWidget(save_full)
     d_layout.addLayout(btn_row)
 
     # --- relay row ---------------------------------------------------------
@@ -1216,34 +1245,102 @@ def build_window(client=None):
              # One-shot -- they clear after a send.
              "attachments": [],
              # The task in flight (a TaskSession), or None.
-             "task": None}
+             "task": None,
+             # The full transcript: every message that lands in either
+             # side's history, in arrival order, as (side, label,
+             # display text). Reorder/delete never touch it -- it is
+             # what actually happened. Clearing a side removes that
+             # side's entries; summarize leaves it alone.
+             "full_log": []}
 
     # --- helpers ----------------------------------------------------------
+    # Transcript formats: sender labels are bold, everything else
+    # plain. Defined here (Qt lives in this function, not the module).
+    _PLAIN_FMT = QtGui.QTextCharFormat()
+    _BOLD_FMT = QtGui.QTextCharFormat()
+    _BOLD_FMT.setFontWeight(QtGui.QFont.Weight.Bold)
+
     def scroll_to_end(transcript):
         bar = transcript.verticalScrollBar()
         bar.setValue(bar.maximum())
 
     def append_text(side, text):
+        # Raw append, always in the plain (non-bold) format: streaming
+        # chunks and reply bodies must never inherit the bold label
+        # format the cursor carries after a label insert.
         t = widgets[side]["transcript"]
         cursor = t.textCursor()
         cursor.movePosition(cursor.MoveOperation.End)
-        cursor.insertText(text)
+        cursor.insertText(text, _PLAIN_FMT)
         t.setTextCursor(cursor)
         scroll_to_end(t)
+
+    def _block_gap(cursor):
+        """A blank line before a new block, when the document already
+        holds something. Blocks end with exactly one "\n", so one more
+        "\n" is the blank line between messages."""
+        if not cursor.document().isEmpty():
+            cursor.insertText("\n", _PLAIN_FMT)
+
+    def append_message(side, label, text):
+        """Append one message block: a blank line separating it from
+        the previous block, a bold "label: ", then the text. The live
+        path and the re-render path both use this, so the window
+        always shows the same format."""
+        t = widgets[side]["transcript"]
+        cursor = t.textCursor()
+        cursor.movePosition(cursor.MoveOperation.End)
+        _block_gap(cursor)
+        cursor.insertText(label + ": ", _BOLD_FMT)
+        cursor.insertText(text, _PLAIN_FMT)
+        cursor.insertText("\n", _PLAIN_FMT)
+        t.setTextCursor(cursor)
+        scroll_to_end(t)
+
+    def begin_reply(side, label):
+        """Open a streaming reply: the blank-line gap plus the bold
+        label, with the body to follow as chunks arrive."""
+        t = widgets[side]["transcript"]
+        cursor = t.textCursor()
+        cursor.movePosition(cursor.MoveOperation.End)
+        _block_gap(cursor)
+        cursor.insertText(label + ": ", _BOLD_FMT)
+        t.setTextCursor(cursor)
+        scroll_to_end(t)
+
+    def append_note(side, text):
+        """Append a transient note ("(Relay stopped: ...)",
+        "(Picked for Model B.)") as its own block: blank-line gap,
+        plain text, trailing newline. Notes are not in the history,
+        so a re-render still drops them."""
+        t = widgets[side]["transcript"]
+        cursor = t.textCursor()
+        cursor.movePosition(cursor.MoveOperation.End)
+        _block_gap(cursor)
+        cursor.insertText(text, _PLAIN_FMT)
+        cursor.insertText("\n", _PLAIN_FMT)
+        t.setTextCursor(cursor)
+        scroll_to_end(t)
+
+    def log_event(side, label, text):
+        """Record one message in the shared chronological log (the
+        full transcript). Called for every message that lands in a
+        side's history, in arrival order."""
+        state["full_log"].append((side, label, text))
 
     def render_transcript(side):
         """Rebuild a pane's transcript from its history and labels.
 
-        Used after a reorder or delete. The format matches the live
-        transcript ("You: ...", "<model>: ...", "You [relay ...]: ...");
-        transient notes like "(Stopped.)" are not in the history, so a
-        re-render drops them.
+        Used after a reorder or delete. Rebuilt through append_message,
+        so the format matches the live transcript exactly -- blank
+        line between messages, bold sender labels. Transient notes
+        like "(Stopped.)" are not in the history, so a re-render
+        drops them.
         """
         side_obj = convo.sides[side]
-        lines = ["%s: %s" % (label, side_obj.display_text(i))
-                 for i, label in enumerate(side_obj.labels)]
-        widgets[side]["transcript"].setPlainText(
-            "\n".join(lines) + ("\n" if lines else ""))
+        widgets[side]["transcript"].clear()
+        for i, label in enumerate(side_obj.labels):
+            append_message(side, label, side_obj.display_text(i))
         scroll_to_end(widgets[side]["transcript"])
 
     def refresh_history_list(side):
@@ -1309,6 +1406,7 @@ def build_window(client=None):
         # half-written turn.
         save_idle = not busy and not relay_active
         save_both.setEnabled(save_idle)
+        save_full.setEnabled(save_idle)
         # Run Task: idle only, and only once the task text and both
         # pickers are set. Nothing is pre-selected, ever. The task
         # setup itself can't change mid-task.
@@ -1438,7 +1536,7 @@ def build_window(client=None):
         state["active"].add(side)
         set_status(side, "Thinking...")
         widgets[side]["reply_open"] = True
-        append_text(side, "%s: " % convo.sides[side].model)
+        begin_reply(side, convo.sides[side].model)
         refresh_buttons()
 
     def on_chunk(job_id, text):
@@ -1476,7 +1574,7 @@ def build_window(client=None):
             state["busy"] = False
         relay_status.setText("Relay stopped: %s." % reason)
         if note_side is not None:
-            append_text(note_side, "(Relay stopped: %s.)\n" % reason)
+            append_note(note_side, "(Relay stopped: %s.)" % reason)
         refresh_buttons()
 
     def forward_hop(session, from_side, framed):
@@ -1489,8 +1587,10 @@ def build_window(client=None):
         next_side = RelaySession.other(from_side)
         convo.sides[next_side].add_user(
             framed, label="You [relay from Model %s]" % from_side)
-        append_text(next_side,
-                    "You [relay from Model %s]: %s\n" % (from_side, framed))
+        append_message(next_side,
+                       "You [relay from Model %s]" % from_side, framed)
+        log_event(next_side, "You [relay from Model %s]" % from_side,
+                  framed)
         refresh_history_list(next_side)
         session.current_side = next_side
         session.hop_from = from_side
@@ -1526,8 +1626,9 @@ def build_window(client=None):
         convo.sides[other].add_user(
             framed, label="You [task handoff]",
             display=session.handoff_note())
-        append_text(other, "You [task handoff]: %s\n"
-                    % session.handoff_note())
+        append_message(other, "You [task handoff]",
+                       session.handoff_note())
+        log_event(other, "You [task handoff]", session.handoff_note())
         refresh_history_list(other)
         session.phase = "followup"
         state["queued"].add(other)
@@ -1595,7 +1696,8 @@ def build_window(client=None):
             finish_summarize(side, text)
             return
         finish_reply(side)
-        convo.sides[side].add_assistant(text)
+        label = convo.sides[side].add_assistant(text)
+        log_event(side, label, text)
         refresh_history_list(side)
         state["active"].discard(side)
         set_status(side, "Idle")
@@ -1640,12 +1742,12 @@ def build_window(client=None):
         side, is_summary = _job_side(job_id)
         if is_summary:
             state["summarizing"] = None
-            append_text(side, "(Summarize failed: %s)\n" % message)
+            append_note(side, "(Summarize failed: %s)" % message)
             set_status(side, "Idle")
             refresh_buttons()
             return
         finish_reply(side)
-        append_text(side, "(%s)\n" % message)
+        append_note(side, "(%s)" % message)
         state["active"].discard(side)
         set_status(side, "Idle")
         if state.get("relay") is not None:
@@ -1666,7 +1768,7 @@ def build_window(client=None):
             refresh_buttons()
             return
         finish_reply(side)
-        append_text(side, "(%s)\n" % MSG_STOPPED)
+        append_note(side, "(%s)" % MSG_STOPPED)
         state["active"].discard(side)
         state["queued"].discard(side)
         set_status(side, "Idle")
@@ -1832,6 +1934,15 @@ def build_window(client=None):
             format_both_transcript(convo),
             default_both_filename())
 
+    def do_save_full():
+        """Save the full transcript: both sides interleaved in the
+        order the conversation actually happened."""
+        if state["busy"] or state.get("relay") is not None:
+            return
+        save_text_to_file(
+            format_full_transcript(state["full_log"]),
+            default_full_filename())
+
     attach_btn.clicked.connect(on_attach_clicked)
 
     # --- sends ------------------------------------------------------------
@@ -1864,7 +1975,9 @@ def build_window(client=None):
         for side_obj in targets:
             side = side_obj.name
             side_obj.add_user(full, display=display)
-            append_text(side, "You: %s\n" % (display if display else text))
+            shown = display if display else text
+            append_message(side, "You", shown)
+            log_event(side, "You", shown)
             refresh_history_list(side)
             state["queued"].add(side)
             set_status(side, "Queued...")
@@ -1877,6 +1990,7 @@ def build_window(client=None):
     send_b.clicked.connect(lambda: do_send("B"))
     send_both.clicked.connect(lambda: do_send("Both"))
     save_both.clicked.connect(do_save_both)
+    save_full.clicked.connect(do_save_full)
 
     # --- summarize --------------------------------------------------------
     def do_summarize(side):
@@ -1945,7 +2059,9 @@ def build_window(client=None):
         clear_attachments()
         side_obj = convo.sides[start_side]
         side_obj.add_user(full, display=display)
-        append_text(start_side, "You: %s\n" % (display if display else text))
+        shown = display if display else text
+        append_message(start_side, "You", shown)
+        log_event(start_side, "You", shown)
         refresh_history_list(start_side)
         state["queued"].add(start_side)
         set_status(start_side, "Queued...")
@@ -2016,7 +2132,8 @@ def build_window(client=None):
         # the attached files stay put for the next normal send.
         task_edit.clear()
         worker_obj.add_user(text, label="You [task]")
-        append_text(worker, "You [task]: %s\n" % text)
+        append_message(worker, "You [task]", text)
+        log_event(worker, "You [task]", text)
         refresh_history_list(worker)
         state["queued"].add(worker)
         set_status(worker, "Queued...")
@@ -2073,9 +2190,10 @@ def build_window(client=None):
         state["compare_round"] = False
         state["busy"] = True
         convo.sides[other].add_user(picked)
-        append_text(other, "You: %s\n" % picked)
+        append_message(other, "You", picked)
+        log_event(other, "You", picked)
         refresh_history_list(other)
-        append_text(side, "(Picked for Model %s.)\n" % other)
+        append_note(side, "(Picked for Model %s.)" % other)
         state["queued"].add(other)
         set_status(other, "Queued...")
         runner.submit(other, make_job_fn(
@@ -2242,6 +2360,10 @@ def build_window(client=None):
         def clear():
             convo.sides[side].clear()
             widgets[side]["transcript"].clear()
+            # A cleared conversation restarts: that side's entries
+            # leave the full transcript too.
+            state["full_log"] = [entry for entry in state["full_log"]
+                                 if entry[0] != side]
             refresh_history_list(side)
             # A cleared side ends any compare offer: the pair is broken.
             state["compare"] = {}
@@ -2356,6 +2478,7 @@ def build_window(client=None):
         "do_run_task": do_run_task,
         "save_both": save_both, "do_save": do_save,
         "do_save_both": do_save_both,
+        "save_full": save_full, "do_save_full": do_save_full,
         "save_text_to_file": save_text_to_file,
     }
 
