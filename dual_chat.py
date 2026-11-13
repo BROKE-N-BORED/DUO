@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""DUO (Item 3) - two Ollama models side by side in one desktop window.
+"""DUO (Item 5) - two Ollama models side by side in one desktop window.
 
 Item 1: the shell, the model pickers, and send-to-A/B/both.
 Item 2: the auto-relay AI-to-AI loop. The user types a seed message, picks
@@ -25,8 +25,14 @@ Item 4: long-loop support. Each pane gets a Summarize button: that
   shows a stats line for the last completed turn: tokens/sec, time
   to first token, total turn time, and the model's RAM from
   Ollama /api/ps.
+Item 5: file upload. Attach up to 5 text files (100 KB each) to a
+  message: their contents ride along with the typed message as plain
+  text blocks the model can read. The window shows a short
+  "Attached: ..." tag instead of the full contents. Binary files are
+  skipped with a plain note. Attachments are one-shot -- they clear
+  after a send, and a relay only carries them on the seed message.
 
-NOT in Item 4 (later items): file upload, tasks, export, provider APIs.
+NOT in Item 5 (later items): tasks, export, provider APIs.
 """
 
 import json
@@ -85,6 +91,12 @@ MSG_REVIEW_EMPTY = "Nothing to forward -- edit the text or skip this hop."
 # DUAL_CHAT_PAIRS_FILE points at a different file (used by the tests).
 PAIRS_ENV = "DUAL_CHAT_PAIRS_FILE"
 PAIRS_FILENAME = "duo-pairs.json"
+
+# Attachments (Item 5): text files only, each at most 100 KB, at most
+# 5 attached at once. Contents are read at attach time, so a file
+# deleted before the send still goes through.
+MAX_ATTACHMENTS = 5
+MAX_ATTACHMENT_BYTES = 100 * 1024
 
 
 class OllamaError(Exception):
@@ -311,6 +323,10 @@ class ChatSide:
     entry ("You", "You [relay from Model A]", or the model name). Labels
     are window-only -- they never reach the model. ``instruction`` is
     this side's system prompt ("" means no system message).
+    ``display`` also runs parallel to ``history``: an optional shorter
+    text shown in the window instead of the full entry content (used
+    when a message carries attached files, so the transcript stays
+    readable). None means show the content as-is.
     """
 
     def __init__(self, name):
@@ -318,20 +334,30 @@ class ChatSide:
         self.model = None
         self.history = []  # [{"role": "user"/"assistant", "content": str}]
         self.labels = []
+        self.display = []
         self.instruction = ""
 
-    def add_user(self, text, label="You"):
+    def display_text(self, index):
+        """What the window shows for entry ``index``: the short display
+        text when one is set, else the full content."""
+        shown = self.display[index]
+        return shown if shown is not None else self.history[index]["content"]
+
+    def add_user(self, text, label="You", display=None):
         self.history.append({"role": "user", "content": text})
         self.labels.append(label)
+        self.display.append(display)
 
     def add_assistant(self, text, label=None):
         self.history.append({"role": "assistant", "content": text})
         self.labels.append(
             label if label is not None else (self.model or "Assistant"))
+        self.display.append(None)
 
     def clear(self):
         self.history = []
         self.labels = []
+        self.display = []
 
     def history_chars(self):
         """Total characters across this side's history contents."""
@@ -352,11 +378,13 @@ class ChatSide:
             return False
         kept = self.history[-SUMMARY_KEEP_LAST:]
         kept_labels = self.labels[-SUMMARY_KEEP_LAST:]
+        kept_display = self.display[-SUMMARY_KEEP_LAST:]
         entry = {"role": "user",
                  "content": "Earlier in this conversation: "
                             + summary_text.strip()}
         self.history = [entry] + kept
         self.labels = [SUMMARY_LABEL] + kept_labels
+        self.display = [None] + kept_display
         return True
 
     def move_up(self, index):
@@ -372,12 +400,14 @@ class ChatSide:
     def _swap(self, i, j):
         self.history[i], self.history[j] = self.history[j], self.history[i]
         self.labels[i], self.labels[j] = self.labels[j], self.labels[i]
+        self.display[i], self.display[j] = self.display[j], self.display[i]
 
     def delete_at(self, index):
         """Remove entry ``index``. No-op when out of range."""
         if 0 <= index < len(self.history):
             del self.history[index]
             del self.labels[index]
+            del self.display[index]
 
     def messages_for_model(self):
         """The messages a generation sends: system prompt (when set)
@@ -452,6 +482,52 @@ def save_pair(path, name, setup):
     with open(path, "w", encoding="utf-8") as fh:
         json.dump({"pairs": pairs}, fh, indent=2, sort_keys=True)
         fh.write("\n")
+
+
+class AttachmentError(Exception):
+    """A plain-language reason a file couldn't be attached."""
+
+
+def load_attachment(path):
+    """Read a file as an attachment: (name, text).
+
+    Raises AttachmentError with a plain message when the file is too
+    big, isn't decodable UTF-8, or can't be read. The size is checked
+    before reading, so a huge file is refused without loading it.
+    """
+    name = os.path.basename(path)
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        raise AttachmentError("Couldn't read '%s'." % name)
+    if size > MAX_ATTACHMENT_BYTES:
+        raise AttachmentError(
+            "'%s' is over 100 KB, so it wasn't attached." % name)
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            text = fh.read()
+    except (OSError, UnicodeDecodeError):
+        raise AttachmentError(
+            "'%s' isn't a text file, so it wasn't attached." % name)
+    return name, text
+
+
+def build_attached_message(files, text):
+    """Prepend file blocks to a typed message.
+
+    files is [(name, contents), ...]. Each file becomes a block
+    "File: <name>\n<contents>"; blocks and the typed message are
+    separated by a blank line. No files -> the message unchanged.
+    """
+    if not files:
+        return text
+    blocks = ["File: %s\n%s" % (name, contents) for name, contents in files]
+    return "\n\n".join(blocks) + "\n\n" + text
+
+
+def attachment_tag(names):
+    """The short transcript tag for attached files."""
+    return "(Attached: %s)" % ", ".join(names)
 
 
 class RelaySession:
@@ -845,6 +921,28 @@ def build_window(client=None):
     composer.setMaximumBlockCount(5)
     composer.setFixedHeight(64)
     d_layout.addWidget(composer)
+
+    # --- attachments -------------------------------------------------------
+    # Attach reads the file contents right away (text files only, up to
+    # 100 KB each, max 5). The list shows what will ride along with the
+    # next message; each row has an x to drop that file.
+    attach_row = QtWidgets.QHBoxLayout()
+    attach_btn = QtWidgets.QPushButton("Attach")
+    attach_row.addWidget(attach_btn)
+    attach_note = QtWidgets.QLabel(
+        "Text files only, up to 100 KB each, max 5 files.")
+    attach_note.setStyleSheet("font-size: 11px;")
+    attach_row.addWidget(attach_note)
+    attach_row.addStretch(1)
+    d_layout.addLayout(attach_row)
+
+    attach_frame = QtWidgets.QFrame()
+    attach_layout = QtWidgets.QVBoxLayout(attach_frame)
+    attach_layout.setContentsMargins(0, 0, 0, 0)
+    attach_layout.setSpacing(2)
+    attach_frame.setVisible(False)
+    d_layout.addWidget(attach_frame)
+
     btn_row = QtWidgets.QHBoxLayout()
     hint = QtWidgets.QLabel("Send to one side, or to both at once.")
     btn_row.addWidget(hint, stretch=1)
@@ -936,7 +1034,10 @@ def build_window(client=None):
              "pending_hop": None,
              # Last completed turn's stats per side (None until a turn
              # has run), and the side currently summarizing, if any.
-             "stats": {"A": None, "B": None}, "summarizing": None}
+             "stats": {"A": None, "B": None}, "summarizing": None,
+             # Attachments waiting for the next send: [{"name", "text"}].
+             # One-shot -- they clear after a send.
+             "attachments": []}
 
     # --- helpers ----------------------------------------------------------
     def scroll_to_end(transcript):
@@ -960,8 +1061,8 @@ def build_window(client=None):
         re-render drops them.
         """
         side_obj = convo.sides[side]
-        lines = ["%s: %s" % (label, msg["content"])
-                 for label, msg in zip(side_obj.labels, side_obj.history)]
+        lines = ["%s: %s" % (label, side_obj.display_text(i))
+                 for i, label in enumerate(side_obj.labels)]
         widgets[side]["transcript"].setPlainText(
             "\n".join(lines) + ("\n" if lines else ""))
         scroll_to_end(widgets[side]["transcript"])
@@ -972,8 +1073,8 @@ def build_window(client=None):
         lst.blockSignals(True)
         lst.clear()
         side_obj = convo.sides[side]
-        for label, msg in zip(side_obj.labels, side_obj.history):
-            text = msg["content"].replace("\n", " ")
+        for i, label in enumerate(side_obj.labels):
+            text = side_obj.display_text(i).replace("\n", " ")
             if len(text) > 70:
                 text = text[:67] + "..."
             lst.addItem("%s: %s" % (label, text))
@@ -1006,6 +1107,12 @@ def build_window(client=None):
         send_a.setEnabled(not busy and a_ready)
         send_b.setEnabled(not busy and b_ready)
         send_both.setEnabled(not busy and a_ready and b_ready)
+        # Attaching mid-generation or mid-relay makes no sense: the
+        # attachments clear at the send, so there is nothing to add to.
+        attach_idle = not busy and not relay_active
+        attach_btn.setEnabled(attach_idle)
+        for btn in attach_frame.findChildren(QtWidgets.QPushButton):
+            btn.setEnabled(attach_idle)
         relay_btn.setText("Stop Relay" if relay_active else "Start Relay")
         relay_btn.setEnabled(
             relay_active or (not busy and a_ready and b_ready))
@@ -1342,6 +1449,90 @@ def build_window(client=None):
     signals.cancelled.connect(on_cancelled)
     signals.idle.connect(on_idle)
 
+    # --- attachments ------------------------------------------------------
+    def refresh_attach_list():
+        """Rebuild the attached-files list from state["attachments"].
+
+        Each row is the file name plus an x button that drops that file.
+        The frame hides when nothing is attached.
+        """
+        while attach_layout.count():
+            item = attach_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+            layout = item.layout()
+            if layout is not None:
+                while layout.count():
+                    sub = layout.takeAt(0)
+                    if sub.widget() is not None:
+                        sub.widget().deleteLater()
+                layout.deleteLater()
+        for index, att in enumerate(state["attachments"]):
+            row = QtWidgets.QHBoxLayout()
+            name = QtWidgets.QLabel(att["name"])
+            row.addWidget(name)
+            row.addStretch(1)
+            drop = QtWidgets.QPushButton("x")
+            drop.setFixedWidth(28)
+            drop.clicked.connect(
+                (lambda i: lambda: remove_attachment(i))(index))
+            row.addWidget(drop)
+            attach_layout.addLayout(row)
+        attach_frame.setVisible(bool(state["attachments"]))
+        refresh_buttons()
+
+    def add_attachments(paths):
+        """Attach the given files, validating each one.
+
+        Files are read now (text only, 100 KB each, max 5 at once).
+        Skipped files get a plain note naming the file; valid ones
+        still attach. Returns the number of files added.
+        """
+        if state["busy"] or state.get("relay") is not None:
+            return 0
+        added = []
+        notes = []
+        for path in paths:
+            if len(state["attachments"]) >= MAX_ATTACHMENTS:
+                notes.append(
+                    "You can attach up to %d files at once."
+                    % MAX_ATTACHMENTS)
+                break
+            try:
+                name, text = load_attachment(path)
+            except AttachmentError as exc:
+                notes.append(str(exc))
+                continue
+            state["attachments"].append({"name": name, "text": text})
+            added.append(name)
+        refresh_attach_list()
+        if notes:
+            statusbar.showMessage(" ".join(notes), 5000)
+        elif added:
+            statusbar.showMessage(
+                "Attached: %s." % ", ".join(added), 3000)
+        return len(added)
+
+    def remove_attachment(index):
+        """Drop one attached file by its position in the list."""
+        if 0 <= index < len(state["attachments"]):
+            del state["attachments"][index]
+            refresh_attach_list()
+
+    def clear_attachments():
+        """Drop every attachment (after a send)."""
+        state["attachments"] = []
+        refresh_attach_list()
+
+    def on_attach_clicked():
+        paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
+            window, "Attach files")
+        if paths:
+            add_attachments(paths)
+
+    attach_btn.clicked.connect(on_attach_clicked)
+
     # --- sends ------------------------------------------------------------
     def do_send(action):
         text = composer.toPlainText().strip()
@@ -1353,15 +1544,26 @@ def build_window(client=None):
         except NoModelSelected as exc:
             statusbar.showMessage(str(exc), 4000)
             return
+        # Attached files ride along with this message: their contents
+        # are prepended as plain blocks the model can read. The window
+        # shows the typed message plus a short tag, not the contents.
+        attachments = list(state["attachments"])
+        full = build_attached_message(
+            [(a["name"], a["text"]) for a in attachments], text)
+        display = None
+        if attachments:
+            display = "%s\n%s" % (
+                text, attachment_tag([a["name"] for a in attachments]))
         state["busy"] = True
         # A new send starts a new round: any earlier compare offer ends.
         state["compare"] = {}
         state["compare_round"] = (action == "Both")
         composer.clear()
+        clear_attachments()
         for side_obj in targets:
             side = side_obj.name
-            side_obj.add_user(text)
-            append_text(side, "You: %s\n" % text)
+            side_obj.add_user(full, display=display)
+            append_text(side, "You: %s\n" % (display if display else text))
             refresh_history_list(side)
             state["queued"].add(side)
             set_status(side, "Queued...")
@@ -1428,10 +1630,20 @@ def build_window(client=None):
         # A relay is not a compare round.
         state["compare"] = {}
         state["compare_round"] = False
+        # Attached files ride with the seed message only -- relay hops
+        # are model text and never re-attach.
+        attachments = list(state["attachments"])
+        full = build_attached_message(
+            [(a["name"], a["text"]) for a in attachments], text)
+        display = None
+        if attachments:
+            display = "%s\n%s" % (
+                text, attachment_tag([a["name"] for a in attachments]))
         composer.clear()
+        clear_attachments()
         side_obj = convo.sides[start_side]
-        side_obj.add_user(text)
-        append_text(start_side, "You: %s\n" % text)
+        side_obj.add_user(full, display=display)
+        append_text(start_side, "You: %s\n" % (display if display else text))
         refresh_history_list(start_side)
         state["queued"].add(start_side)
         set_status(start_side, "Queued...")
@@ -1775,6 +1987,10 @@ def build_window(client=None):
         "render_transcript": render_transcript,
         "refresh_history_list": refresh_history_list,
         "do_summarize": do_summarize, "refresh_buttons": refresh_buttons,
+        "attach_btn": attach_btn, "attach_frame": attach_frame,
+        "attach_note": attach_note, "add_attachments": add_attachments,
+        "remove_attachment": remove_attachment,
+        "clear_attachments": clear_attachments,
     }
 
     refresh_pair_combo()

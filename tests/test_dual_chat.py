@@ -1,4 +1,4 @@
-"""Tests for DUO Items 1-4. No real Ollama needed: a fake Ollama HTTP
+"""Tests for DUO Items 1-5. No real Ollama needed: a fake Ollama HTTP
 server (and a fake client for the GUI tests) stands in for the real one.
 
 Run from the project root:  python3 -m unittest discover -s tests -v
@@ -17,12 +17,15 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from dual_chat import (  # noqa: E402
-    AGREEMENT_PHRASES, AWARE_TEMPLATE, COMPARE_PREFIX, Cancelled, ChatSide,
+    AGREEMENT_PHRASES, AWARE_TEMPLATE, COMPARE_PREFIX, MAX_ATTACHMENTS,
+    MAX_ATTACHMENT_BYTES, AttachmentError, Cancelled, ChatSide,
     Conversation, HISTORY_BUDGET_CHARS, NoModelSelected, OllamaClient,
     OllamaError, RelaySession, SUMMARY_KEEP_LAST, SUMMARY_LABEL,
-    SUMMARIZE_PROMPT, SerialRunner, compute_turn_stats, format_ram,
-    format_stats_line, load_pairs, pairs_path, parse_ollama_list_output,
-    parse_ps_payload, parse_stop_phrases, parse_tags_payload, save_pair,
+    SUMMARIZE_PROMPT, SerialRunner, attachment_tag,
+    build_attached_message, compute_turn_stats, format_ram,
+    format_stats_line, load_attachment, load_pairs, pairs_path,
+    parse_ollama_list_output, parse_ps_payload, parse_stop_phrases,
+    parse_tags_payload, save_pair,
 )
 
 
@@ -1585,6 +1588,11 @@ class DirectorGuiTests(unittest.TestCase):
         self.assertFalse(use_a.isEnabled())
         self.assertFalse(
             self.state["widgets"]["B"]["use_this"].isEnabled())
+        # Let the new send finish before the window closes: the runner
+        # is a daemon thread, and a job left running would fire into
+        # the next test's shared fake client.
+        self.assertTrue(self._wait_for(
+            lambda: not self.state["state"]["busy"], timeout=15))
 
 
 # ---------------------------------------------------------------------------
@@ -1881,6 +1889,334 @@ class Item4GuiTests(unittest.TestCase):
         self.assertTrue(self._wait_for(
             lambda: not self.state["state"]["busy"], timeout=10))
         self.assertTrue(btn.isEnabled())
+
+
+# ---------------------------------------------------------------------------
+# Attachments (Item 5): pure logic, no Qt
+# ---------------------------------------------------------------------------
+
+class AttachmentTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = self.tmp.name
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _write(self, name, data):
+        path = os.path.join(self.dir, name)
+        mode = "wb" if isinstance(data, bytes) else "w"
+        with open(path, mode) as fh:
+            fh.write(data)
+        return path
+
+    def test_load_text_file_exact(self):
+        path = self._write("notes.txt", "hello\nsecond line\n")
+        self.assertEqual(load_attachment(path),
+                         ("notes.txt", "hello\nsecond line\n"))
+
+    def test_load_binary_rejected_with_plain_note(self):
+        path = self._write("photo.png", b"\x89PNG\r\n\x1a\n\x00\xff\xfe")
+        with self.assertRaises(AttachmentError) as ctx:
+            load_attachment(path)
+        self.assertIn("photo.png", str(ctx.exception))
+        self.assertIn("isn't a text file", str(ctx.exception))
+
+    def test_load_oversized_rejected_with_plain_note(self):
+        path = self._write("big.txt", "x" * (MAX_ATTACHMENT_BYTES + 1))
+        with self.assertRaises(AttachmentError) as ctx:
+            load_attachment(path)
+        self.assertIn("big.txt", str(ctx.exception))
+        self.assertIn("over 100 KB", str(ctx.exception))
+
+    def test_load_exactly_at_cap_is_fine(self):
+        path = self._write("edge.txt", "x" * MAX_ATTACHMENT_BYTES)
+        name, text = load_attachment(path)
+        self.assertEqual(name, "edge.txt")
+        self.assertEqual(len(text), MAX_ATTACHMENT_BYTES)
+
+    def test_load_missing_file_plain_note(self):
+        with self.assertRaises(AttachmentError) as ctx:
+            load_attachment(os.path.join(self.dir, "gone.txt"))
+        self.assertIn("gone.txt", str(ctx.exception))
+        self.assertIn("Couldn't read", str(ctx.exception))
+
+    def test_build_message_no_files_unchanged(self):
+        self.assertEqual(build_attached_message([], "hello"), "hello")
+
+    def test_build_message_one_file_exact(self):
+        self.assertEqual(
+            build_attached_message([("a.txt", "AAA")], "read this"),
+            "File: a.txt\nAAA\n\nread this")
+
+    def test_build_message_two_files_exact(self):
+        self.assertEqual(
+            build_attached_message(
+                [("a.txt", "AAA"), ("b.md", "BBB")], "compare"),
+            "File: a.txt\nAAA\n\nFile: b.md\nBBB\n\ncompare")
+
+    def test_attachment_tag(self):
+        self.assertEqual(attachment_tag(["a.txt"]), "(Attached: a.txt)")
+        self.assertEqual(attachment_tag(["a.txt", "b.md"]),
+                         "(Attached: a.txt, b.md)")
+
+    def test_limits(self):
+        self.assertEqual(MAX_ATTACHMENTS, 5)
+        self.assertEqual(MAX_ATTACHMENT_BYTES, 100 * 1024)
+
+
+class ChatSideDisplayTests(unittest.TestCase):
+    def test_display_defaults_to_content(self):
+        side = ChatSide("A")
+        side.add_user("hello")
+        side.add_assistant("hi")
+        self.assertEqual(side.display_text(0), "hello")
+        self.assertEqual(side.display_text(1), "hi")
+
+    def test_display_override_shown_instead(self):
+        side = ChatSide("A")
+        side.add_user("File: a.txt\nAAA\n\nread this",
+                      display="read this\n(Attached: a.txt)")
+        self.assertEqual(side.display_text(0),
+                         "read this\n(Attached: a.txt)")
+        # The model still sees the full content.
+        self.assertEqual(side.history[0]["content"],
+                         "File: a.txt\nAAA\n\nread this")
+
+    def test_display_moves_and_deletes_with_entries(self):
+        side = ChatSide("A")
+        side.add_user("one", display="ONE")
+        side.add_user("two", display="TWO")
+        side.move_up(1)
+        self.assertEqual([side.display_text(i) for i in range(2)],
+                         ["TWO", "ONE"])
+        side.delete_at(0)
+        self.assertEqual(side.display_text(0), "ONE")
+        self.assertEqual(side.history[0]["content"], "one")
+
+    def test_display_survives_summarize_for_kept_entries(self):
+        side = ChatSide("A")
+        for i in range(6):
+            side.add_user("msg %d" % i, display="D%d" % i)
+        self.assertTrue(side.summarize("a summary"))
+        self.assertEqual(len(side.history), 5)
+        # The summary entry itself has no override; the kept four do.
+        self.assertEqual(side.display_text(0), side.history[0]["content"])
+        self.assertEqual([side.display_text(i) for i in range(1, 5)],
+                         ["D2", "D3", "D4", "D5"])
+
+    def test_clear_clears_display_too(self):
+        side = ChatSide("A")
+        side.add_user("x", display="X")
+        side.clear()
+        self.assertEqual(side.display, [])
+
+
+# ---------------------------------------------------------------------------
+# Attachments (Item 5): GUI tests
+# ---------------------------------------------------------------------------
+
+@unittest.skipUnless(os.environ.get("DUAL_CHAT_GUI_TESTS") == "1",
+                     "GUI tests run with DUAL_CHAT_GUI_TESTS=1")
+class Item5GuiTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        from PySide6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+        cls.client = FakeGuiClient()
+
+    def setUp(self):
+        from dual_chat import build_window
+        self.client.reset()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.pairs_file = os.path.join(self.tmp.name, "duo-pairs.json")
+        self._env = mock.patch.dict(
+            os.environ, {"DUAL_CHAT_PAIRS_FILE": self.pairs_file})
+        self._env.start()
+        self.window = build_window(self.client)
+        self.window.show()
+        self.state = self.window._dual_chat
+        self._wait_for(lambda: self.state["widgets"]["A"]["picker"].count() == 2)
+        self._pick_models()
+
+    def tearDown(self):
+        self.window.close()
+        self._env.stop()
+        self.tmp.cleanup()
+
+    def _wait_for(self, cond, timeout=10.0):
+        from PySide6.QtTest import QTest
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            QTest.qWait(50)
+            if cond():
+                return True
+        return cond()
+
+    def _pick_models(self):
+        self.state["widgets"]["A"]["picker"].setCurrentIndex(0)
+        self.state["widgets"]["B"]["picker"].setCurrentIndex(1)
+        self.app.processEvents()
+
+    def _write(self, name, data):
+        path = os.path.join(self.tmp.name, name)
+        mode = "wb" if isinstance(data, bytes) else "w"
+        with open(path, mode) as fh:
+            fh.write(data)
+        return path
+
+    def _attach(self, *paths):
+        return self.state["add_attachments"](list(paths))
+
+    def _last_messages_for(self, model):
+        for seen_model, messages in reversed(self.client.messages_seen):
+            if seen_model == model:
+                return messages
+        return None
+
+    def _send_both_and_wait(self, text):
+        self.state["composer"].setPlainText(text)
+        self.state["send_both"].click()
+        return self._wait_for(lambda: (
+            len(self.state["convo"].sides["A"].history) >= 2
+            and len(self.state["convo"].sides["B"].history) >= 2
+            and not self.state["state"]["busy"]), timeout=15)
+
+    def test_attach_list_shows_names_and_attaching_calls_nothing(self):
+        a = self._write("notes.txt", "AAA")
+        b = self._write("plan.md", "BBB")
+        self.assertEqual(self._attach(a, b), 2)
+        self.assertEqual([att["name"] for att in
+                          self.state["state"]["attachments"]],
+                         ["notes.txt", "plan.md"])
+        self.assertTrue(self.state["attach_frame"].isVisible())
+        from PySide6.QtWidgets import QLabel
+        labels = [w.text() for w in
+                  self.state["attach_frame"].findChildren(QLabel)]
+        self.assertIn("notes.txt", labels)
+        self.assertIn("plan.md", labels)
+        # Attaching is free -- no model call.
+        self.assertEqual(self.client.calls, [])
+
+    def test_send_to_both_carries_exact_file_contents(self):
+        a = self._write("notes.txt", "alpha contents")
+        b = self._write("plan.md", "beta contents")
+        self._attach(a, b)
+        self.assertTrue(self._send_both_and_wait("read these"))
+        expected = ("File: notes.txt\nalpha contents\n\n"
+                    "File: plan.md\nbeta contents\n\nread these")
+        for model in ("fake-a:latest", "fake-b:latest"):
+            messages = self._last_messages_for(model)
+            self.assertEqual(messages[-1]["role"], "user")
+            self.assertEqual(messages[-1]["content"], expected)
+        # The transcripts show the tag, not the file contents.
+        for side in ("A", "B"):
+            transcript = self.state["widgets"][side]["transcript"] \
+                .toPlainText()
+            self.assertIn("You: read these", transcript)
+            self.assertIn("(Attached: notes.txt, plan.md)", transcript)
+            self.assertNotIn("alpha contents", transcript)
+            self.assertNotIn("beta contents", transcript)
+
+    def test_binary_file_skipped_with_note(self):
+        bad = self._write("photo.png", b"\x89PNG\r\n\x1a\n\x00\xff\xfe")
+        self.assertEqual(self._attach(bad), 0)
+        self.assertEqual(self.state["state"]["attachments"], [])
+        message = self.window.statusBar().currentMessage()
+        self.assertIn("photo.png", message)
+        self.assertIn("isn't a text file", message)
+        self.assertEqual(self.client.calls, [])
+
+    def test_oversized_file_skipped_with_note(self):
+        big = self._write("huge.txt", "x" * (MAX_ATTACHMENT_BYTES + 1))
+        self.assertEqual(self._attach(big), 0)
+        self.assertEqual(self.state["state"]["attachments"], [])
+        message = self.window.statusBar().currentMessage()
+        self.assertIn("huge.txt", message)
+        self.assertIn("over 100 KB", message)
+
+    def test_sixth_file_refused(self):
+        paths = [self._write("f%d.txt" % i, "x") for i in range(6)]
+        self.assertEqual(self._attach(*paths), 5)
+        self.assertEqual(len(self.state["state"]["attachments"]), 5)
+        message = self.window.statusBar().currentMessage()
+        self.assertIn("up to 5 files", message)
+
+    def test_attachments_clear_after_send(self):
+        self._attach(self._write("notes.txt", "AAA"))
+        self.assertTrue(self.state["attach_frame"].isVisible())
+        self.assertTrue(self._send_both_and_wait("read this"))
+        self.assertEqual(self.state["state"]["attachments"], [])
+        self.assertFalse(self.state["attach_frame"].isVisible())
+
+    def test_remove_button_drops_one_file(self):
+        self._attach(self._write("a.txt", "AAA"),
+                     self._write("b.txt", "BBB"))
+        from PySide6.QtWidgets import QPushButton
+        buttons = self.state["attach_frame"].findChildren(QPushButton)
+        self.assertEqual(len(buttons), 2)
+        buttons[0].click()
+        self.assertEqual([att["name"] for att in
+                          self.state["state"]["attachments"]], ["b.txt"])
+        self.assertTrue(self.state["attach_frame"].isVisible())
+        buttons = self.state["attach_frame"].findChildren(QPushButton)
+        buttons[0].click()
+        self.assertEqual(self.state["state"]["attachments"], [])
+        self.assertFalse(self.state["attach_frame"].isVisible())
+
+    def test_relay_carries_files_on_seed_only(self):
+        self._attach(self._write("notes.txt", "seed file contents"))
+        self.state["start_picker"].setCurrentIndex(0)
+        self.state["cap_spin"].setValue(2)
+        self.state["mode_picker"].setCurrentIndex(0)  # Blind
+        self.state["composer"].setPlainText("discuss this")
+        self.state["relay_btn"].click()
+        ok = self._wait_for(lambda: (
+            self.state["relay_status"].text().startswith("Relay stopped")
+            and not self.state["state"]["busy"]), timeout=15)
+        self.assertTrue(ok, "relay should run to the cap")
+        seen = self.client.messages_seen
+        self.assertEqual(len(seen), 2)
+        seed_messages = seen[0][1]
+        self.assertEqual(seed_messages[-1]["content"],
+                         "File: notes.txt\nseed file contents\n\ndiscuss this")
+        hop_messages = seen[1][1]
+        self.assertNotIn("seed file contents",
+                         json.dumps(hop_messages))
+        # The seed's transcript shows the tag, not the contents.
+        transcript = self.state["widgets"]["A"]["transcript"].toPlainText()
+        self.assertIn("(Attached: notes.txt)", transcript)
+        self.assertNotIn("seed file contents", transcript)
+
+    def test_attach_disabled_mid_generation(self):
+        btn = self.state["attach_btn"]
+        self.assertTrue(btn.isEnabled())
+        self.client.delay = 0.5
+        self.client.replies = {"fake-a:latest": ["one two three four five"]}
+        self.state["composer"].setPlainText("slow one")
+        self.state["send_a"].click()
+        self.assertTrue(self._wait_for(
+            lambda: self.state["state"]["busy"], timeout=5))
+        self.assertFalse(btn.isEnabled())
+        self.assertTrue(self._wait_for(
+            lambda: not self.state["state"]["busy"], timeout=15))
+        self.assertTrue(btn.isEnabled())
+
+    def test_render_transcript_keeps_short_display_after_reorder(self):
+        self._attach(self._write("notes.txt", "secret contents here"))
+        self.assertTrue(self._send_both_and_wait("read this"))
+        self.state["render_transcript"]("A")
+        transcript = self.state["widgets"]["A"]["transcript"].toPlainText()
+        self.assertIn("(Attached: notes.txt)", transcript)
+        self.assertNotIn("secret contents here", transcript)
+        # And the history editor shows the short version too.
+        self.state["refresh_history_list"]("A")
+        lst = self.state["widgets"]["A"]["hist_list"]
+        items = [lst.item(i).text() for i in range(lst.count())]
+        self.assertTrue(any("(Attached: notes.txt)" in item
+                            for item in items))
+        self.assertFalse(any("secret contents here" in item
+                             for item in items))
 
 
 if __name__ == "__main__":

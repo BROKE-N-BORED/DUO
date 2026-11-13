@@ -8,11 +8,12 @@ Or start a relay: type a seed message, press Start Relay, and the two
 models talk to each other — each reply is handed to the other model,
 one turn at a time, until the turn cap or a stop condition.
 
-This is Item 4 of the project: the shell, the model pickers,
+This is Item 5 of the project: the shell, the model pickers,
 send-to-A/B/both, the auto-relay loop, the director controls
 (history editing, hop review, instructions, saved pairs, compare
-mode), and long-loop support (summarize, budget nudge, per-turn
-speed and RAM readout). Files, tasks, and the rest come later.
+mode), long-loop support (summarize, budget nudge, per-turn
+speed and RAM readout), and file upload. Tasks and the rest
+come later.
 
 ## What you need
 
@@ -104,6 +105,23 @@ bash run.sh
   RAM from Ollama ("1.9 GB in RAM", or "not loaded" when it isn't
   running). Dashes until a turn has run; "n/a" when Ollama doesn't
   report a number.
+
+## Files
+
+- Attach: the Attach button next to the message box opens a file
+  picker (pick more than one at once). Attached files show in a list
+  above the message box; the x drops one.
+- When you send, each attached text file's contents are sent with
+  your message as a plain block ("File: name" plus the contents),
+  so the model can read it. Your window shows the message with a
+  short "(Attached: name)" tag, not the full contents.
+- Text files only, up to 100 KB each, max 5 at once. A file that
+  isn't text, or is too big, gets a plain note naming it and is
+  skipped — nothing crashes.
+- Attachments are one-shot: they clear after a send. In a relay they
+  ride with the seed message only, never with the hops.
+- You still need to type a message to send — attachments go with a
+  message, they don't replace it.
 
 ## Tests
 
