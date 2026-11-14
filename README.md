@@ -138,7 +138,8 @@ bash run.sh
 - Send to A talks only to the left model. Send to B talks only to the
   right model. Send to Both sends the same message to each side, one
   after the other — A first, then B — so the PC never runs two models
-  at the same time.
+  at the same time. The three buttons stay greyed out until you type
+  something to send; attaching files alone does not enable them.
 - Keyboard: Ctrl+Enter sends to both models. Tick "Enter to send"
   (under the message box) and plain Enter sends to both too, with
   Shift+Enter still adding a new line. The tick is remembered between

@@ -1054,6 +1054,9 @@ class GuiTests(unittest.TestCase):
             window.close()
 
     def test_send_buttons_follow_picks(self):
+        # The composer needs text too (v0.43, T21): sends stay off
+        # on an empty composer, so type first, then check the picks.
+        self.state["composer"].setPlainText("Hello.")
         self.state["widgets"]["A"]["picker"].setCurrentIndex(0)
         self.app.processEvents()
         self.assertTrue(self.state["send_a"].isEnabled())
@@ -6344,14 +6347,23 @@ class KeyboardSendGuiTests(unittest.TestCase):
         # The composer clears after a send, same as the button.
         self.assertEqual(self.state["composer"].toPlainText(), "")
 
-    def test_ctrl_enter_empty_shows_note_and_sends_nothing(self):
+    def test_ctrl_enter_empty_sends_nothing_and_shows_no_note(self):
+        # v0.43 (T21): the send buttons are disabled on an empty
+        # composer, so Ctrl+Enter is swallowed and sends nothing --
+        # and shows no note either. (Before v0.43 the keypress
+        # reached do_send, which showed the "Type a message first."
+        # note; the note itself still exists as the phone deck's
+        # backstop and for the relay's empty seed.)
         from PySide6.QtCore import Qt
         self._pick_models()
         self.client.calls.clear()
+        before = self.state["status_label"].text()
         self._key_click(Qt.Key_Return, Qt.ControlModifier)
-        self.assertEqual(self.state["status_label"].text(),
-                         MSG_EMPTY)
+        self.assertEqual(self.state["status_label"].text(), before)
+        self.assertNotEqual(before, MSG_EMPTY)
         self.assertEqual(self.client.calls, [])
+        self.assertEqual(self.state["convo"].sides["A"].messages, [])
+        self.assertEqual(self.state["convo"].sides["B"].messages, [])
 
     def test_ctrl_enter_without_models_does_nothing(self):
         # No models picked: Send to Both is disabled, so Ctrl+Enter
@@ -6781,7 +6793,7 @@ class FrontDoorTests(unittest.TestCase):
 
     def test_changelog_covers_every_version(self):
         log = self._read("CHANGELOG.md")
-        for version in ["0.%d" % n for n in range(1, 43)]:
+        for version in ["0.%d" % n for n in range(1, 44)]:
             self.assertIn(version, log)
 
     def test_gitignore_covers_runtime_files(self):
@@ -9896,13 +9908,17 @@ class ActivityIndicatorGuiTests(unittest.TestCase):
                 # clears in the on_idle signal queued after it --
                 # a click landing before idle hits a disabled
                 # button and the second send never starts.
-                # (Same shape as the v0.35 Item6 race.)
+                # (Same shape as the v0.35 Item6 race.) The
+                # composer was cleared by the first send, so type
+                # the second message first: sends need text too
+                # (v0.43, T21), and the button stays off on an
+                # empty composer even once idle.
+                state["composer"].setPlainText("second")
                 self.assertTrue(self._wait_for(
                     lambda: state["send_a"].isEnabled(), timeout=10))
                 # A new send right away: the error light gives way
                 # to the new turn, and the hold timer never drags
                 # the side back to anything wrong afterwards.
-                state["composer"].setPlainText("second")
                 state["send_a"].click()
                 self.assertTrue(self._wait_for(
                     lambda: state["side_state"]["A"] == "thinking",
@@ -10856,8 +10872,9 @@ class GuidedPickerGuiTests(unittest.TestCase):
         self.app.processEvents()
         self.assertEqual(self.state["convo"].sides["A"].model,
                          "fake-b:latest")
-        self.assertTrue(self.state["send_a"].isEnabled())
+        # Sends need composer text too (v0.43, T21): type first.
         self.state["composer"].setPlainText("hello big model")
+        self.assertTrue(self.state["send_a"].isEnabled())
         self.state["send_a"].click()
         self.assertTrue(self._wait_for(lambda: (
             len(self.state["convo"].sides["A"].messages) >= 2
@@ -12695,6 +12712,188 @@ class FieldExplanationsGuiTests(unittest.TestCase):
         self.assertTrue(self.state["relay_explain"].isVisible())
         self.assertTrue(self.state["stop_explain"].isVisible())
         self.assertGreaterEqual(self.state["stop_edit"].width(), 200)
+
+
+class SendGateGuiTests(unittest.TestCase):
+    """v0.43 (audit T21): the send buttons stay disabled while the
+    composer is empty -- whitespace-only counts as empty -- and
+    enable the moment it has text, provided the existing gates
+    pass too (idle, target model picked). Attachments alone never
+    enable a send: a typed message is still required (v0.5). The
+    update check is stubbed, as in MenuBarGuiTests, so no test
+    touches the network."""
+
+    @classmethod
+    def setUpClass(cls):
+        from PySide6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+        cls.client = FakeGuiClient()
+
+    def setUp(self):
+        # The section choices are persisted, so clear them (and
+        # the director choice) before every window: each test
+        # starts from the defaults.
+        self._clear_section_settings()
+        from dual_chat import build_window
+        self._patcher = mock.patch(
+            "dual_chat.check_for_update",
+            return_value=("latest", None))
+        self._patcher.start()
+        self.client.reset()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.window = build_window(self.client, logger=TEST_LOGGER)
+        self.window.show()
+        self.state = self.window._dual_chat
+        self._wait_for(lambda: self.state["widgets"]["A"]["picker"].count() == 2)
+        self._pick_models()
+
+    def tearDown(self):
+        self.window.close()
+        self.app.processEvents()
+        self._patcher.stop()
+        self.tmp.cleanup()
+        self._clear_section_settings()
+
+    def _clear_section_settings(self):
+        from PySide6.QtCore import QSettings
+        from dual_chat import SETTING_DIRECTOR_COLLAPSED
+        from dual_chat import SETTING_SECTION_COLLAPSED
+        settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
+        settings.remove(SETTING_DIRECTOR_COLLAPSED)
+        for key in ("relay", "pairs", "tasks"):
+            settings.remove(SETTING_SECTION_COLLAPSED % key)
+        settings.sync()
+
+    def _wait_for(self, cond, timeout=10.0):
+        from PySide6.QtTest import QTest
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            QTest.qWait(50)
+            if cond():
+                return True
+        return cond()
+
+    def _pick_models(self):
+        self.state["widgets"]["A"]["picker"].setCurrentIndex(0)
+        self.state["widgets"]["B"]["picker"].setCurrentIndex(1)
+        self.app.processEvents()
+
+    def _write(self, name, data):
+        path = os.path.join(self.tmp.name, name)
+        mode = "wb" if isinstance(data, bytes) else "w"
+        with open(path, mode) as fh:
+            fh.write(data)
+        return path
+
+    def _attach(self, *paths):
+        return self.state["add_attachments"](list(paths))
+
+    def _start_relay(self, seed, cap=10):
+        self.state["start_picker"].setCurrentIndex(0)
+        self.state["cap_spin"].setValue(cap)
+        self.state["mode_picker"].setCurrentIndex(0)  # Blind
+        self.state["composer"].setPlainText(seed)
+        self.app.processEvents()
+        self.state["relay_btn"].click()
+
+    def _assert_sends(self, a, b, both):
+        self.assertEqual(self.state["send_a"].isEnabled(), a)
+        self.assertEqual(self.state["send_b"].isEnabled(), b)
+        self.assertEqual(self.state["send_both"].isEnabled(), both)
+
+    def test_send_buttons_disabled_with_empty_composer(self):
+        # Models picked, idle, nothing typed: all three off.
+        self.assertEqual(self.state["composer"].toPlainText(), "")
+        self._assert_sends(False, False, False)
+
+    def test_send_buttons_disabled_with_whitespace_only_composer(self):
+        self.state["composer"].setPlainText("   \n\t  ")
+        self.app.processEvents()
+        self._assert_sends(False, False, False)
+
+    def test_send_buttons_enable_with_text_and_follow_picks(self):
+        self.state["composer"].setPlainText("Hello.")
+        self.app.processEvents()
+        self._assert_sends(True, True, True)
+        # Unpicking A takes its button and Both with it; B stays.
+        self.state["widgets"]["A"]["picker"].setCurrentIndex(-1)
+        self.app.processEvents()
+        self._assert_sends(False, True, False)
+        # And the other way round.
+        self.state["widgets"]["A"]["picker"].setCurrentIndex(0)
+        self.state["widgets"]["B"]["picker"].setCurrentIndex(-1)
+        self.app.processEvents()
+        self._assert_sends(True, False, False)
+
+    def test_typing_enables_and_clearing_disables(self):
+        # No other action: the textChanged connection re-runs the
+        # enablement funnel at once.
+        self._assert_sends(False, False, False)
+        self.state["composer"].setPlainText("hi")
+        self.app.processEvents()
+        self._assert_sends(True, True, True)
+        self.state["composer"].setPlainText("")
+        self.app.processEvents()
+        self._assert_sends(False, False, False)
+
+    def test_attachments_alone_do_not_enable_send(self):
+        path = self._write("notes.txt", "some notes")
+        self.assertEqual(self._attach(path), 1)
+        self.assertEqual(len(self.state["state"]["attachments"]), 1)
+        self._assert_sends(False, False, False)
+        # Typing with the attachment on still enables normally.
+        self.state["composer"].setPlainText("read this")
+        self.app.processEvents()
+        self._assert_sends(True, True, True)
+
+    def test_busy_disables_all_three_with_text(self):
+        # A slow turn: while it runs, text in the composer does
+        # not re-enable anything; once idle, the text enables all.
+        self.client.replies = {
+            "fake-a:latest": ["one two three four five six seven eight"]}
+        self.client.delay = 0.3
+        try:
+            self.state["composer"].setPlainText("slow one")
+            self.state["send_a"].click()
+            self.assertTrue(self._wait_for(
+                lambda: self.state["side_state"]["A"] == "thinking",
+                timeout=10))
+            # The send cleared the composer; type again mid-turn.
+            self.state["composer"].setPlainText("more text")
+            self.app.processEvents()
+            self._assert_sends(False, False, False)
+            self.assertTrue(self._wait_for(
+                lambda: not self.state["state"]["busy"], timeout=15))
+            self._assert_sends(True, True, True)
+        finally:
+            self.client.delay = 0.02
+
+    def test_relay_running_disables_all_three_with_text(self):
+        self.client.replies = {
+            "fake-a:latest": ["one two three four five six"],
+            "fake-b:latest": ["seven eight nine ten eleven twelve"]}
+        self.client.delay = 0.3
+        try:
+            self._start_relay("talk", cap=10)
+            self.assertTrue(self._wait_for(
+                lambda: self.state["side_state"]["A"] == "thinking",
+                timeout=10))
+            # The seed cleared the composer; type mid-relay.
+            self.state["composer"].setPlainText("not now")
+            self.app.processEvents()
+            self._assert_sends(False, False, False)
+            self.state["relay_btn"].click()  # Stop Relay
+            # Wait for idle as well as the end line: the cancel
+            # lands in on_idle, which fires after the status text
+            # updates (the v0.35 chip-race shape -- wait for the
+            # condition the assertion needs, not a proxy).
+            self.assertTrue(self._wait_for(
+                lambda: self.state["relay_status"].text().startswith(
+                    "Relay stopped")
+                and not self.state["state"]["busy"], timeout=15))
+            self._assert_sends(True, True, True)
+        finally:
+            self.client.delay = 0.02
 
 
 if __name__ == "__main__":

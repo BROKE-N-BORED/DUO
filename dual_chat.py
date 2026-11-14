@@ -247,7 +247,7 @@ from duo_workers import (_ModelLoader, _OllamaStarter, _SignalObject,
 
 
 APP_NAME = "DUO"
-APP_VERSION = "0.42"
+APP_VERSION = "0.43"
 
 # Plain-language messages shown in the panes. No tracebacks in the UI.
 MSG_STOPPED = "Stopped."
@@ -1690,9 +1690,15 @@ def build_window(client=None, logger=None, deck_port=None):
         relay_active = relay is not None and relay.active
         a_ready = convo.sides["A"].model is not None
         b_ready = convo.sides["B"].model is not None
-        send_a.setEnabled(not busy and a_ready)
-        send_b.setEnabled(not busy and b_ready)
-        send_both.setEnabled(not busy and a_ready and b_ready)
+        # Send buttons (v0.43, T21): disabled while the composer is
+        # empty -- whitespace-only counts as empty. Attachments
+        # alone never enable a send: a typed message is still
+        # required even with files attached (v0.5).
+        composer_has_text = bool(composer.toPlainText().strip())
+        send_a.setEnabled(not busy and a_ready and composer_has_text)
+        send_b.setEnabled(not busy and b_ready and composer_has_text)
+        send_both.setEnabled(not busy and a_ready and b_ready
+                             and composer_has_text)
         # Attaching mid-generation or mid-relay makes no sense: the
         # attachments clear at the send, so there is nothing to add to.
         attach_idle = not busy and not relay_active
@@ -2741,6 +2747,9 @@ def build_window(client=None, logger=None, deck_port=None):
     send_a.clicked.connect(lambda: do_send("A"))
     send_b.clicked.connect(lambda: do_send("B"))
     send_both.clicked.connect(lambda: do_send("Both"))
+    # Send buttons follow the composer (v0.43, T21): typing or
+    # clearing text re-runs the enablement funnel at once.
+    composer.textChanged.connect(refresh_buttons)
 
     # --- keyboard send ----------------------------------------------------
     # Ctrl+Enter sends to both models, from the keyboard. With the
@@ -2749,7 +2758,9 @@ def build_window(client=None, logger=None, deck_port=None):
     # never inserts a newline -- and it only fires while the Send to
     # Both button is enabled (idle, both models picked), so the
     # keyboard path has exactly the button's guards. Empty composer:
-    # do_send shows the same "Type a message first." note as a click.
+    # the button is disabled (v0.43, T21), so the keypress is
+    # swallowed and sends nothing. send_message still rejects
+    # empty text itself -- that check is the phone deck's backstop.
     class _ComposerKeys(QtCore.QObject):
         def eventFilter(self, obj, event):
             if event.type() == QtCore.QEvent.KeyPress:

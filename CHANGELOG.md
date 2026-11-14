@@ -1,7 +1,19 @@
 # DUO changelog
 
 Every version, newest first. v0.1–v0.17 were built on 2026-11-12;
-v0.18–v0.35 on 2026-11-13; v0.36–v0.42 on 2026-11-14.
+v0.18–v0.35 on 2026-11-13; v0.36–v0.43 on 2026-11-14.
+
+## v0.43 — 2026-11-14
+
+The send buttons stay greyed out until there is something to
+send. Send to A, Send to B, and Send to Both are disabled while
+the message box is empty — spaces alone do not count — and they
+light up the moment you type. Attaching files alone does not
+enable them: a typed message is still required. The keyboard
+send (Ctrl+Enter, or plain Enter with "Enter to send" ticked)
+follows the same rule, since it only fires while Send to Both
+is enabled. The phone deck is unchanged: it already turns away
+an empty send with a plain message.
 
 ## v0.42 — 2026-11-14
 
