@@ -29,6 +29,8 @@ from dual_chat import (  # noqa: E402
     CONVERSATION_FORMAT_VERSION, DECK_PAGE_HTML,
     DECK_PORT, ERROR_STATE_HOLD_MS, FULL_LOG_MAX_ENTRIES,
     FULL_LOG_TRIMMED_NOTE,
+    HIST_EDITOR_DEFAULT_HEIGHT, HIST_EDITOR_MIN_HEIGHT,
+    HIST_TRANSCRIPT_MIN_HEIGHT,
     MAX_ATTACHMENTS,
     MAX_ATTACHMENT_BYTES, MODEL_FIT_RESERVE_BYTES, MSG_EMPTY,
     MSG_MODEL_FAILED, MSG_OLLAMA_DOWN,
@@ -37,6 +39,7 @@ from dual_chat import (  # noqa: E402
     MSG_UPDATE_AVAILABLE, MSG_UPDATE_FAILED, MSG_UPDATE_LATEST,
     SETTINGS_APP, SETTINGS_ORG, SETTING_DIRECTOR_COLLAPSED,
     SETTING_ENTER_TO_SEND,
+    SETTING_HIST_SPLITTER_STATE,
     SETTING_SPLITTER_STATE, SETTING_TEMPERATURE,
     SETTING_WINDOW_GEOMETRY,
     SIDE_STATES,
@@ -6656,7 +6659,7 @@ class FrontDoorTests(unittest.TestCase):
 
     def test_changelog_covers_every_version(self):
         log = self._read("CHANGELOG.md")
-        for version in ["0.%d" % n for n in range(1, 38)]:
+        for version in ["0.%d" % n for n in range(1, 39)]:
             self.assertIn(version, log)
 
     def test_gitignore_covers_runtime_files(self):
@@ -11392,6 +11395,191 @@ class DirectorSectionsGuiTests(unittest.TestCase):
         self.assertTrue(self._wait_for_relay_stopped(),
                         "the relay should run to its stop")
         self.assertTrue(self.state["relay_section"].isHidden())
+
+
+class HistorySplitterGuiTests(unittest.TestCase):
+    """v0.38 (audit T20): the history editor is resizable -- each
+    pane's transcript block and history editor live in a vertical
+    QSplitter with a draggable divider, instead of the old fixed
+    110 px list. The transcript never drops below 100 px, the
+    editor never below 60 px, collapsing keeps the last size, and
+    the split is remembered between runs. The minima only hold
+    when the window has room for them, so these tests give the
+    window room (tall, director collapsed) before asserting them.
+    The update check is stubbed, as in MenuBarGuiTests, so no
+    test touches the network."""
+
+    @classmethod
+    def setUpClass(cls):
+        from PySide6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+        cls.client = FakeGuiClient()
+
+    def setUp(self):
+        # The split is persisted, so clear it (and the director,
+        # geometry, and pane-split choices) before every window:
+        # each test starts from the defaults.
+        self._clear_hist_settings()
+        from dual_chat import build_window
+        self._patcher = mock.patch(
+            "dual_chat.check_for_update",
+            return_value=("latest", None))
+        self._patcher.start()
+        self.client.reset()
+        self.window = build_window(self.client, logger=TEST_LOGGER)
+        self.window.show()
+        self.state = self.window._dual_chat
+        self._wait_for(lambda: self.state["widgets"]["A"]["picker"].count() == 2)
+        self._pick_models()
+
+    def tearDown(self):
+        self.window.close()
+        self.app.processEvents()
+        self._patcher.stop()
+        self._clear_hist_settings()
+
+    def _clear_hist_settings(self):
+        from PySide6.QtCore import QSettings
+        settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
+        settings.remove(SETTING_DIRECTOR_COLLAPSED)
+        settings.remove(SETTING_WINDOW_GEOMETRY)
+        settings.remove(SETTING_SPLITTER_STATE)
+        for side in ("A", "B"):
+            settings.remove(SETTING_HIST_SPLITTER_STATE % side)
+        settings.sync()
+
+    def _wait_for(self, cond, timeout=10.0):
+        from PySide6.QtTest import QTest
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            QTest.qWait(50)
+            if cond():
+                return True
+        return cond()
+
+    def _pick_models(self):
+        self.state["widgets"]["A"]["picker"].setCurrentIndex(0)
+        self.state["widgets"]["B"]["picker"].setCurrentIndex(1)
+        self.app.processEvents()
+
+    def _room(self):
+        # Tall window, director collapsed: the panes have room, so
+        # the splitter minima can actually hold.
+        self.window.resize(1100, 900)
+        if self.state["director"].isVisible():
+            self.state["director_toggle"].click()
+        self.app.processEvents()
+        self._wait_for(
+            lambda: self.state["widgets"]["A"]["transcript"].height()
+            > 300)
+
+    def _expand_editor(self, side="A"):
+        toggle = self.state["widgets"][side]["hist_toggle"]
+        if not toggle.isChecked():
+            toggle.click()
+        self.assertTrue(self._wait_for(
+            lambda: self.state["widgets"][side]["hist_frame"]
+            .isVisible()))
+
+    def test_splitter_holds_transcript_and_editor(self):
+        from PySide6 import QtWidgets
+        from PySide6.QtCore import Qt
+        for side in ("A", "B"):
+            w = self.state["widgets"][side]
+            split = w["hist_split"]
+            self.assertIsInstance(split, QtWidgets.QSplitter)
+            self.assertEqual(split.orientation(), Qt.Vertical)
+            self.assertEqual(split.count(), 2)
+            # The editor is the bottom half; the transcript lives
+            # in the top half's frame.
+            self.assertIs(split.widget(1), w["hist_frame"])
+            self.assertIs(w["transcript"].parent(),
+                          split.widget(0))
+
+    def test_default_expand_is_110(self):
+        self._room()
+        for side in ("A", "B"):
+            self._expand_editor(side)
+            frame = self.state["widgets"][side]["hist_frame"]
+            self.assertAlmostEqual(
+                frame.height(), HIST_EDITOR_DEFAULT_HEIGHT, delta=10)
+
+    def test_setting_sizes_changes_editor_height(self):
+        self._room()
+        self._expand_editor("A")
+        w = self.state["widgets"]["A"]
+        split = w["hist_split"]
+        split.setSizes([400, 100])
+        self.app.processEvents()
+        self.assertAlmostEqual(w["hist_frame"].height(), 100,
+                               delta=15)
+        tall_transcript = w["transcript"].height()
+        split.setSizes([150, 300])
+        self.app.processEvents()
+        self.assertAlmostEqual(w["hist_frame"].height(), 300,
+                               delta=15)
+        # The transcript gives up the room the editor takes.
+        self.assertLess(w["transcript"].height(), tall_transcript)
+
+    def test_minima_hold(self):
+        self._room()
+        self._expand_editor("A")
+        w = self.state["widgets"]["A"]
+        split = w["hist_split"]
+        split.setSizes([10, 1000])
+        self.app.processEvents()
+        self.assertGreaterEqual(w["transcript"].height(),
+                                HIST_TRANSCRIPT_MIN_HEIGHT)
+        self.assertLessEqual(w["transcript"].height(),
+                             HIST_TRANSCRIPT_MIN_HEIGHT + 20)
+        split.setSizes([1000, 10])
+        self.app.processEvents()
+        self.assertGreaterEqual(w["hist_frame"].height(),
+                                HIST_EDITOR_MIN_HEIGHT)
+        self.assertLessEqual(w["hist_frame"].height(),
+                             HIST_EDITOR_MIN_HEIGHT + 20)
+
+    def test_collapse_hides_and_expand_restores_last_size(self):
+        self._room()
+        self._expand_editor("A")
+        w = self.state["widgets"]["A"]
+        w["hist_split"].setSizes([300, 200])
+        self.app.processEvents()
+        self.assertAlmostEqual(w["hist_frame"].height(), 200,
+                               delta=15)
+        w["hist_toggle"].click()
+        self.app.processEvents()
+        self.assertTrue(w["hist_frame"].isHidden())
+        w["hist_toggle"].click()
+        self.assertTrue(self._wait_for(
+            lambda: w["hist_frame"].isVisible()))
+        self.assertAlmostEqual(w["hist_frame"].height(), 200,
+                               delta=15)
+
+    def test_sizes_persist_across_rebuild(self):
+        from dual_chat import build_window
+        self._room()
+        self._expand_editor("A")
+        w = self.state["widgets"]["A"]
+        w["hist_split"].setSizes([300, 200])
+        self.app.processEvents()
+        self.assertAlmostEqual(w["hist_frame"].height(), 200,
+                               delta=15)
+        self.window.close()
+        self.app.processEvents()
+        # A fresh window, built after the close saved the split.
+        # The director starts collapsed (that choice persisted
+        # too), so the panes have room without another click.
+        self.window = build_window(self.client,
+                                   logger=TEST_LOGGER)
+        self.window.show()
+        self.state = self.window._dual_chat
+        self._wait_for(lambda: self.state["widgets"]["A"]["picker"].count() == 2)
+        self._pick_models()
+        self.assertFalse(self.state["director"].isVisible())
+        self._expand_editor("A")
+        frame = self.state["widgets"]["A"]["hist_frame"]
+        self.assertAlmostEqual(frame.height(), 200, delta=15)
 
 
 if __name__ == "__main__":

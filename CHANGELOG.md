@@ -1,7 +1,17 @@
 # DUO changelog
 
 Every version, newest first. v0.1–v0.17 were built on 2026-11-12;
-v0.18–v0.35 on 2026-11-13; v0.36–v0.37 on 2026-11-14.
+v0.18–v0.35 on 2026-11-13; v0.36–v0.38 on 2026-11-14.
+
+## v0.38 — 2026-11-14
+
+The history editor is resizable now. Each pane's message list
+used to be a fixed height — now there is a divider between the
+chat and the history list, and you drag it to make the list
+taller or shorter. DUO remembers the split per pane. The divider
+cannot crush either side: the chat never drops below 100 pixels
+and the list never below 60. Closing the editor keeps your size,
+so it opens back where you left it.
 
 ## v0.37 — 2026-11-14
 

@@ -306,7 +306,7 @@ def make_debug_logger(log_dir=None):
         return _NullLogger()
 
 APP_NAME = "DUO"
-APP_VERSION = "0.37"
+APP_VERSION = "0.38"
 
 # Plain-language messages shown in the panes. No tracebacks in the UI.
 MSG_STOPPED = "Stopped."
@@ -383,6 +383,15 @@ SETTING_SECTION_COLLAPSED = "director/%s_collapsed"
 # split are remembered the same way, saved when the window closes.
 SETTING_WINDOW_GEOMETRY = "window/geometry"
 SETTING_SPLITTER_STATE = "window/splitter"
+# History editor (v0.38, T20): each pane's transcript/history split
+# is remembered the same way. %s is the side ("A"/"B").
+SETTING_HIST_SPLITTER_STATE = "history_splitter/%s"
+# History editor floors (v0.38, T20): the divider can never crush
+# the transcript below 100 px or the editor below 60 px; the editor
+# opens at 110 px, the height it had when it was fixed.
+HIST_TRANSCRIPT_MIN_HEIGHT = 100
+HIST_EDITOR_MIN_HEIGHT = 60
+HIST_EDITOR_DEFAULT_HEIGHT = 110
 # Model parameters (v0.19): each side's temperature is remembered
 # per side the same way. %s is the side ("A"/"B").
 SETTING_TEMPERATURE = "temperature/%s"
@@ -865,6 +874,14 @@ def build_window(client=None, logger=None, deck_port=None):
         instr_edit.setVisible(False)
         layout.addWidget(instr_edit)
 
+        # Transcript block (v0.38, T20): the transcript and its
+        # rows, as the top half of the history splitter -- the
+        # divider resizes them against the history editor.
+        top_frame = QtWidgets.QFrame()
+        top_layout = QtWidgets.QVBoxLayout(top_frame)
+        top_layout.setContentsMargins(0, 0, 0, 0)
+        top_layout.setSpacing(6)
+
         transcript = QtWidgets.QTextEdit()
         transcript.setReadOnly(True)
         # Links in a rendered reply open in the default browser
@@ -877,7 +894,9 @@ def build_window(client=None, logger=None, deck_port=None):
         # replies must wrap in the pane, never run off the edge.
         transcript.setLineWrapMode(
             QtWidgets.QTextEdit.LineWrapMode.WidgetWidth)
-        layout.addWidget(transcript, stretch=1)
+        # The divider can never crush the transcript below this.
+        transcript.setMinimumHeight(HIST_TRANSCRIPT_MIN_HEIGHT)
+        top_layout.addWidget(transcript, stretch=1)
 
         # Search row: find text in this pane's transcript. Display
         # only -- it never changes history, labels, or the saved
@@ -893,13 +912,13 @@ def build_window(client=None, logger=None, deck_port=None):
         search_row.addWidget(search_prev)
         search_next = QtWidgets.QPushButton("Next")
         search_row.addWidget(search_next)
-        layout.addLayout(search_row)
+        top_layout.addLayout(search_row)
 
         # Stats line: the last completed turn's speed and RAM. Dashes
         # until a turn has run.
         stats = QtWidgets.QLabel(format_stats_line(None))
         stats.setStyleSheet("font-size: 11px;")
-        layout.addWidget(stats)
+        top_layout.addWidget(stats)
 
         # Activity row (v0.29): a small colored light and small words
         # saying what this side is doing right now -- grey Idle,
@@ -918,7 +937,7 @@ def build_window(client=None, logger=None, deck_port=None):
         activity_label.setStyleSheet("font-size: 11px;")
         activity_row.addWidget(activity_label)
         activity_row.addStretch(1)
-        layout.addLayout(activity_row)
+        top_layout.addLayout(activity_row)
 
         # Session token total: every token this side has generated
         # or been prompted with since the app started. Clear never
@@ -926,7 +945,7 @@ def build_window(client=None, logger=None, deck_port=None):
         session_tokens = QtWidgets.QLabel(
             format_session_line({"out": 0, "in": 0}))
         session_tokens.setStyleSheet("font-size: 11px;")
-        layout.addWidget(session_tokens)
+        top_layout.addWidget(session_tokens)
 
         # Summarize row: the nudge label appears when this side's
         # history passes the budget; the button is always here.
@@ -938,7 +957,7 @@ def build_window(client=None, logger=None, deck_port=None):
         summarize_btn.setEnabled(False)
         summarize_row.addWidget(summarize_btn)
         summarize_row.addStretch(1)
-        layout.addLayout(summarize_row)
+        top_layout.addLayout(summarize_row)
 
         # History editor: reorder or delete any message. Hidden by
         # default; the model sees the edited order on the next turn.
@@ -947,7 +966,11 @@ def build_window(client=None, logger=None, deck_port=None):
         hist_layout.setContentsMargins(0, 0, 0, 0)
         hist_layout.setSpacing(4)
         hist_list = QtWidgets.QListWidget()
-        hist_list.setFixedHeight(110)
+        # No fixed height any more (v0.38, T20): the list is as tall
+        # as the divider leaves it, down to one row. The frame's own
+        # floor is the 60 px minimum, so the buttons stay reachable.
+        hist_list.setMinimumHeight(24)
+        hist_frame.setMinimumHeight(HIST_EDITOR_MIN_HEIGHT)
         hist_layout.addWidget(hist_list)
         hist_btn_row = QtWidgets.QHBoxLayout()
         hist_up = QtWidgets.QPushButton("Up")
@@ -959,7 +982,22 @@ def build_window(client=None, logger=None, deck_port=None):
         hist_btn_row.addStretch(1)
         hist_layout.addLayout(hist_btn_row)
         hist_frame.setVisible(False)
-        layout.addWidget(hist_frame)
+
+        # History splitter (v0.38, T20): the transcript block and
+        # the history editor, with a draggable divider. The editor
+        # keeps its size (stretch 0); the transcript takes the rest.
+        # Every drag is saved as it happens, so the size survives
+        # hiding the editor.
+        hist_split = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+        hist_split.addWidget(top_frame)
+        hist_split.addWidget(hist_frame)
+        hist_split.setStretchFactor(0, 1)
+        hist_split.setStretchFactor(1, 0)
+        hist_split.splitterMoved.connect(
+            (lambda s: lambda *a: prefs.setValue(
+                SETTING_HIST_SPLITTER_STATE % s,
+                hist_split.saveState()))(side))
+        layout.addWidget(hist_split, stretch=1)
 
         bottom = QtWidgets.QHBoxLayout()
         status = QtWidgets.QLabel("Idle")
@@ -993,6 +1031,7 @@ def build_window(client=None, logger=None, deck_port=None):
             "instr_toggle": instr_toggle, "instr_edit": instr_edit,
             "use_this": use_this, "hist_toggle": hist_toggle,
             "hist_frame": hist_frame, "hist_list": hist_list,
+            "hist_split": hist_split,
             "hist_up": hist_up, "hist_down": hist_down,
             "hist_delete": hist_delete,
             "stats": stats, "session_tokens": session_tokens,
@@ -3088,13 +3127,27 @@ def build_window(client=None, logger=None, deck_port=None):
                 "Instructions ▾" if checked else "Instructions ▸")
         return toggled
 
+    def restore_hist_split(side):
+        """Put a pane's history divider back where it was: the saved
+        split, or the 110 px default when nothing is saved."""
+        split = widgets[side]["hist_split"]
+        saved = prefs.value(SETTING_HIST_SPLITTER_STATE % side)
+        if saved is None or not split.restoreState(saved):
+            split.setSizes([200, HIST_EDITOR_DEFAULT_HEIGHT])
+
     def make_hist_toggle(side):
         def toggled(checked):
+            if not checked:
+                # Save before hiding: a hidden child saves as 0.
+                prefs.setValue(
+                    SETTING_HIST_SPLITTER_STATE % side,
+                    widgets[side]["hist_split"].saveState())
             widgets[side]["hist_frame"].setVisible(checked)
             widgets[side]["hist_toggle"].setText(
                 "History ▾" if checked else "History ▸")
             if checked:
                 refresh_history_list(side)
+                restore_hist_split(side)
         return toggled
 
     def make_instr_changed(side):
@@ -3802,6 +3855,14 @@ def build_window(client=None, logger=None, deck_port=None):
                 else window.geometry())
         prefs.setValue(SETTING_WINDOW_GEOMETRY, geom)
         prefs.setValue(SETTING_SPLITTER_STATE, panes.saveState())
+        for _side in ("A", "B"):
+            # Only a visible editor saves: a hidden child saves as 0,
+            # which would crush the editor on the next open. A
+            # hidden editor keeps the size its last drag saved.
+            if widgets[_side]["hist_frame"].isVisible():
+                prefs.setValue(
+                    SETTING_HIST_SPLITTER_STATE % _side,
+                    widgets[_side]["hist_split"].saveState())
         prefs.sync()
         # Closing mid-generation must stop the work: without this,
         # the runner thread keeps a relay going in the closed window,

@@ -191,6 +191,8 @@ bash run.sh
 ## Director controls
 
 - History: each pane has a History button that opens its message list.
+  Drag the divider between the chat and the list to resize it; DUO
+  remembers the split per pane.
   Select a message and use Up / Down to move it, or Delete to remove
   it. The model sees the edited order on its next turn. Editing is
   only available while nothing is generating.
