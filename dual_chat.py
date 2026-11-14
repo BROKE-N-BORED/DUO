@@ -306,7 +306,7 @@ def make_debug_logger(log_dir=None):
         return _NullLogger()
 
 APP_NAME = "DUO"
-APP_VERSION = "0.33"
+APP_VERSION = "0.34"
 
 # Plain-language messages shown in the panes. No tracebacks in the UI.
 MSG_STOPPED = "Stopped."
@@ -352,6 +352,17 @@ SIDE_STATES = {
 # How long the red light holds after a failed turn (ms) before the
 # side goes back to idle. A new job starting first overrides it.
 ERROR_STATE_HOLD_MS = 5000
+# Relay chip (v0.34, redesign R3): the relay's status dot and words.
+# The same palette as the activity lights, so the colors mean the
+# same thing everywhere: grey idle, green working, amber waiting on
+# you. The text is None where it comes from the relay session --
+# the running turn counts, the review pause, and the end reason.
+RELAY_CHIP_STATES = {
+    "idle": ("#8a8a8a", "Relay off"),
+    "running": ("#2fbf5a", None),
+    "review": ("#e8a33d", None),
+    "ended": ("#8a8a8a", None),
+}
 # System meter (v0.29): how often the status bar re-reads /proc.
 METER_REFRESH_MS = 1000
 
@@ -1198,8 +1209,49 @@ def build_window(client=None, logger=None, deck_port=None):
     review_frame.setVisible(False)
     d_layout.addWidget(review_frame)
 
-    relay_status = QtWidgets.QLabel("Relay off.")
-    d_layout.addWidget(relay_status)
+    # --- relay status chip (v0.34) -------------------------------------
+    # The relay's status lives OUTSIDE the collapsible director area,
+    # in a small chip row directly under the panes: a dot, the status
+    # words, and a Stop button that only shows while a relay runs.
+    # The old status label sat at the bottom of the director, so
+    # collapsing the director hid the relay's state entirely -- the
+    # chip stays visible either way, and it is the only relay status
+    # display. The relay row loses its label in the move, which also
+    # relieves some of its crowding (audit T24, subsumed by R4).
+    relay_chip = QtWidgets.QFrame()
+    relay_chip.setFrameShape(QtWidgets.QFrame.StyledPanel)
+    chip_layout = QtWidgets.QHBoxLayout(relay_chip)
+    chip_layout.setContentsMargins(6, 3, 6, 3)
+    chip_layout.setSpacing(6)
+    relay_dot = QtWidgets.QLabel()
+    relay_dot.setFixedSize(12, 12)
+    relay_dot.setStyleSheet(
+        "background-color: %s; border-radius: 6px;"
+        % RELAY_CHIP_STATES["idle"][0])
+    chip_layout.addWidget(relay_dot)
+    relay_status = QtWidgets.QLabel(RELAY_CHIP_STATES["idle"][1])
+    relay_status.setStyleSheet("font-size: 11px;")
+    chip_layout.addWidget(relay_status)
+    chip_layout.addStretch(1)
+    relay_chip_stop = QtWidgets.QPushButton("Stop")
+    relay_chip_stop.setVisible(False)
+    chip_layout.addWidget(relay_chip_stop)
+    root.addWidget(relay_chip)
+
+    def set_relay_chip(chip_state, text=None):
+        """The one setter for the relay chip: dot color, status words,
+        and whether the chip's Stop button shows. ``text`` overrides
+        the state's default words -- the running turn counts, the
+        review pause, and the end reason all come from the relay
+        session. The Stop button shows only while a relay runs:
+        idle and ended have nothing to stop, and a review pause
+        already has its own Stop in the review box.
+        """
+        color, default_text = RELAY_CHIP_STATES[chip_state]
+        relay_dot.setStyleSheet(
+            "background-color: %s; border-radius: 6px;" % color)
+        relay_status.setText(default_text if text is None else text)
+        relay_chip_stop.setVisible(chip_state == "running")
 
     # --- director toggle (v0.31) --------------------------------------
     # One toggle for the whole director area, on the boundary between
@@ -1949,7 +2001,9 @@ def build_window(client=None, logger=None, deck_port=None):
         # again -- no on_idle signal will come to say so.
         if not state["active"] and not state["queued"]:
             state["busy"] = False
-        relay_status.setText("Relay stopped: %s." % reason)
+        # The chip holds the end reason until the next relay starts,
+        # exactly as the old label did -- no timeout, nothing hidden.
+        set_relay_chip("ended", "Relay stopped: %s." % reason)
         if note_side is not None:
             append_note(note_side, "(Relay stopped: %s.)" % reason)
         refresh_buttons()
@@ -1973,7 +2027,7 @@ def build_window(client=None, logger=None, deck_port=None):
         session.hop_from = from_side
         state["queued"].add(next_side)
         set_side_state(next_side, "queued")
-        relay_status.setText(session.status_running())
+        set_relay_chip("running", session.status_running())
         runner.submit(next_side, make_job_fn(
             next_side, convo.sides[next_side].model,
             convo.sides[next_side].messages_for_model()))
@@ -2042,8 +2096,9 @@ def build_window(client=None, logger=None, deck_port=None):
             % (from_side, next_side, session.mode))
         review_edit.setPlainText(framed)
         review_frame.setVisible(True)
-        relay_status.setText("Relay paused for review: turn %d/%d."
-                             % (session.turns_done + 1, session.turn_cap))
+        set_relay_chip("review",
+                       "Relay paused for review: turn %d/%d."
+                       % (session.turns_done + 1, session.turn_cap))
         # The receiving side waits on the user now: amber, "Waiting
         # for you to review…". Forwarding flips it to queued;
         # skipping or stopping ends the relay, which clears it.
@@ -2732,7 +2787,7 @@ def build_window(client=None, logger=None, deck_port=None):
         refresh_history_list(start_side)
         state["queued"].add(start_side)
         set_side_state(start_side, "queued")
-        relay_status.setText(session.status_running())
+        set_relay_chip("running", session.status_running())
         runner.submit(start_side, make_job_fn(
             start_side, side_obj.model, side_obj.messages_for_model()))
         refresh_buttons()
@@ -2759,6 +2814,11 @@ def build_window(client=None, logger=None, deck_port=None):
             do_start_relay()
 
     relay_btn.clicked.connect(on_relay_button)
+    # The chip's Stop is the same action as the relay row's Stop
+    # button: it ends the relay through stop_relay, so the end line
+    # reads "Relay stopped: stopped by you." either way. It only
+    # shows while a relay runs (set_relay_chip owns that).
+    relay_chip_stop.clicked.connect(stop_relay)
 
     # --- tasks ------------------------------------------------------------
     def do_run_task():
@@ -3533,6 +3593,9 @@ def build_window(client=None, logger=None, deck_port=None):
         "cap_spin": cap_spin, "mode_picker": mode_picker,
         "stop_edit": stop_edit, "agree_check": agree_check,
         "relay_status": relay_status,
+        "relay_chip": relay_chip, "relay_dot": relay_dot,
+        "relay_chip_stop": relay_chip_stop,
+        "set_relay_chip": set_relay_chip,
         "do_start_relay": do_start_relay, "stop_relay": stop_relay,
         "review_check": review_check, "review_frame": review_frame,
         "review_label": review_label, "review_edit": review_edit,

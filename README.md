@@ -151,7 +151,10 @@ bash run.sh
   hides the whole director area so the panes take the whole window;
   click it again to bring everything back. The toggle stays visible
   either way, your choice is remembered between runs, and a relay
-  or task keeps running while the controls are hidden.
+  or task keeps running while the controls are hidden. The relay's
+  status lives in a chip above the toggle — a dot and the turn
+  count — so you can always see what a relay is doing and stop it,
+  collapsed or not.
 - DUO checks for a newer Release once at startup and says so in
   the status bar when one is out; the "Check for updates" button
   next to Phone deck runs the same check on demand. It never

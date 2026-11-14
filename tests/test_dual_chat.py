@@ -1208,7 +1208,7 @@ class RelayGuiTests(unittest.TestCase):
     def test_relay_needs_seed_text(self):
         self.state["relay_btn"].click()
         self.app.processEvents()
-        self.assertEqual(self.state["relay_status"].text(), "Relay off.")
+        self.assertEqual(self.state["relay_status"].text(), "Relay off")
         self.assertEqual(self.client.calls, [])
 
     def test_blind_relay_delivers_bare_text(self):
@@ -6543,7 +6543,7 @@ class FrontDoorTests(unittest.TestCase):
 
     def test_changelog_covers_every_version(self):
         log = self._read("CHANGELOG.md")
-        for version in ["0.%d" % n for n in range(1, 34)]:
+        for version in ["0.%d" % n for n in range(1, 35)]:
             self.assertIn(version, log)
 
     def test_gitignore_covers_runtime_files(self):
@@ -10635,6 +10635,215 @@ class GuidedPickerGuiTests(unittest.TestCase):
         convo, _log = data_to_conversation(data)
         self.assertEqual(convo.sides["A"].model, "fake-a:latest")
         self.assertEqual(convo.sides["B"].model, "fake-b:latest")
+@unittest.skipUnless(os.environ.get("DUAL_CHAT_GUI_TESTS") == "1",
+                     "GUI tests run with DUAL_CHAT_GUI_TESTS=1")
+class RelayChipGuiTests(unittest.TestCase):
+    """v0.34 (redesign R3): the relay's status lives in a chip under
+    the panes, outside the collapsible director area -- a dot, the
+    status words, and a Stop button that only shows while a relay
+    runs. The chip is the only relay status display: the old label
+    at the bottom of the director is gone. The update check is
+    stubbed, as in MenuBarGuiTests, so no test touches the network."""
+
+    @classmethod
+    def setUpClass(cls):
+        from PySide6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+        cls.client = FakeGuiClient()
+
+    def setUp(self):
+        # The collapsed choice is persisted, so clear it before
+        # every window: each test starts from the default
+        # (expanded).
+        self._clear_director_collapsed()
+        from dual_chat import build_window
+        self._patcher = mock.patch(
+            "dual_chat.check_for_update",
+            return_value=("latest", None))
+        self._patcher.start()
+        self.client.reset()
+        self.window = build_window(self.client, logger=TEST_LOGGER)
+        self.window.show()
+        self.state = self.window._dual_chat
+        self._wait_for(lambda: self.state["widgets"]["A"]["picker"].count() == 2)
+        self._pick_models()
+
+    def tearDown(self):
+        self.window.close()
+        self.app.processEvents()
+        self._patcher.stop()
+        self._clear_director_collapsed()
+
+    def _clear_director_collapsed(self):
+        from PySide6.QtCore import QSettings
+        settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
+        settings.remove(SETTING_DIRECTOR_COLLAPSED)
+        settings.sync()
+
+    def _wait_for(self, cond, timeout=10.0):
+        from PySide6.QtTest import QTest
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            QTest.qWait(50)
+            if cond():
+                return True
+        return cond()
+
+    def _pick_models(self):
+        self.state["widgets"]["A"]["picker"].setCurrentIndex(0)
+        self.state["widgets"]["B"]["picker"].setCurrentIndex(1)
+        self.app.processEvents()
+
+    def _start_relay(self, seed, cap=10):
+        self.state["start_picker"].setCurrentIndex(0)
+        self.state["cap_spin"].setValue(cap)
+        self.state["mode_picker"].setCurrentIndex(0)
+        self.state["stop_edit"].setText("")
+        self.state["agree_check"].setChecked(False)
+        self.state["composer"].setPlainText(seed)
+        self.app.processEvents()
+        self.state["relay_btn"].click()
+
+    def _start_review_relay(self, seed, cap=3):
+        self.state["review_check"].setChecked(True)
+        self.state["start_picker"].setCurrentIndex(0)
+        self.state["cap_spin"].setValue(cap)
+        self.state["mode_picker"].setCurrentIndex(0)  # Blind
+        self.state["composer"].setPlainText(seed)
+        self.app.processEvents()
+        self.state["relay_btn"].click()
+
+    def _wait_for_review(self, timeout=15.0):
+        return self._wait_for(
+            lambda: self.state["review_frame"].isVisible()
+            and self.state["state"].get("pending_hop") is not None,
+            timeout=timeout)
+
+    def _wait_for_relay_stopped(self, timeout=15.0):
+        return self._wait_for(lambda: self.state["relay_status"].text()
+                              .startswith("Relay stopped"), timeout=timeout)
+
+    def _dot_color(self):
+        return self.state["relay_dot"].styleSheet()
+
+    def test_chip_sits_outside_the_director(self):
+        from PySide6 import QtWidgets
+        director = self.state["director"]
+        chip = self.state["relay_chip"]
+        # Neither the chip nor its text label is a descendant of
+        # the director frame: collapsing cannot hide them.
+        self.assertNotIn(chip,
+                         director.findChildren(QtWidgets.QFrame))
+        self.assertNotIn(self.state["relay_status"],
+                         director.findChildren(QtWidgets.QLabel))
+        self.assertTrue(chip.isVisible())
+        self.state["director_toggle"].click()
+        self.app.processEvents()
+        self.assertTrue(director.isHidden())
+        self.assertTrue(chip.isVisible())
+        self.assertTrue(self.state["relay_status"].isVisible())
+        self.assertTrue(self.state["director_toggle"].isVisible())
+
+    def test_idle_chip_reads_relay_off_with_grey_dot(self):
+        self.assertEqual(self.state["relay_status"].text(), "Relay off")
+        self.assertIn("#8a8a8a", self._dot_color())
+        self.assertFalse(self.state["relay_chip_stop"].isVisible())
+        self.assertNotIn("\u2014", self.state["relay_status"].text())
+
+    def test_running_chip_shows_turns_and_active_side(self):
+        self.client.replies = {"fake-a:latest": [" ".join(["word"] * 100)],
+                               "fake-b:latest": ["short"]}
+        self._start_relay("Go on.", cap=10)
+        self.assertTrue(self._wait_for(
+            lambda: self.state["relay_status"].text().startswith(
+                "Relay on: turn 1/10, you to A")))
+        self.assertIn("#2fbf5a", self._dot_color())
+        self.assertTrue(self.state["relay_chip_stop"].isVisible())
+        self.state["relay_btn"].click()
+        self.assertTrue(self._wait_for_relay_stopped())
+
+    def test_review_pause_shows_amber_chip(self):
+        self.client.replies = {"fake-a:latest": ["apple pie"],
+                               "fake-b:latest": ["banana split"]}
+        self._start_review_relay("Talk about fruit.", cap=3)
+        self.assertTrue(self._wait_for_review())
+        self.assertTrue(self.state["relay_status"].text().startswith(
+            "Relay paused for review: turn 2/3."))
+        self.assertIn("#e8a33d", self._dot_color())
+        # The review box has its own Stop: the chip's stays hidden.
+        self.assertFalse(self.state["relay_chip_stop"].isVisible())
+        self.state["review_stop"].click()
+        self.assertTrue(self._wait_for_relay_stopped())
+
+    def test_chip_stop_ends_relay_like_the_relay_row_stop(self):
+        self.client.replies = {"fake-a:latest": [" ".join(["word"] * 200)]}
+        self._start_relay("Go on and on.", cap=50)
+        self.assertTrue(self._wait_for(
+            lambda: self.state["relay_status"].text().startswith(
+                "Relay on: turn 1/50")))
+        self.assertTrue(self.state["relay_chip_stop"].isVisible())
+        self.state["relay_chip_stop"].click()
+        self.assertTrue(self._wait_for_relay_stopped())
+        self.assertIn("stopped by you",
+                      self.state["relay_status"].text())
+        self.assertIsNone(self.state["state"].get("relay"))
+        self.assertFalse(self.state["state"]["busy"])
+        self.assertEqual(self.client.calls, ["fake-a:latest"])
+        # Nothing else starts after the stop.
+        time.sleep(1.0)
+        self.app.processEvents()
+        self.assertEqual(self.client.calls, ["fake-a:latest"])
+        self.assertFalse(self.state["relay_chip_stop"].isVisible())
+
+    def test_chip_holds_end_reason_after_relay_ends(self):
+        self.client.replies = {"fake-a:latest": ["one turn"]}
+        self._start_relay("Just once.", cap=1)
+        self.assertTrue(self._wait_for_relay_stopped())
+        self.assertEqual(self.state["relay_status"].text(),
+                         "Relay stopped: turn cap reached.")
+        self.assertIn("#8a8a8a", self._dot_color())
+        self.assertFalse(self.state["relay_chip_stop"].isVisible())
+
+    def test_relay_row_has_no_status_label(self):
+        # The relay row is the director's first row of controls; the
+        # chip's text label is not in it, and no other status label
+        # lives in the director -- the chip is the only display.
+        from PySide6 import QtWidgets
+        director = self.state["director"]
+        labels = [w for w in director.findChildren(QtWidgets.QLabel)
+                  if "Relay" in w.text()]
+        self.assertEqual(labels, [])
+        self.assertNotIn(self.state["relay_status"],
+                         director.findChildren(QtWidgets.QLabel))
+
+    def test_menu_start_relay_while_collapsed_updates_chip(self):
+        self.client.replies = {"fake-a:latest": [" ".join(["word"] * 100)],
+                               "fake-b:latest": ["short"]}
+        self.state["director_toggle"].click()
+        self.app.processEvents()
+        self.assertTrue(self.state["director"].isHidden())
+        # The composer is hidden but still takes text; the Relay
+        # menu starts the relay from outside the director.
+        self.state["start_picker"].setCurrentIndex(0)
+        self.state["cap_spin"].setValue(10)
+        self.state["composer"].setPlainText("Go on.")
+        self.app.processEvents()
+        menu = self.state["menu_actions"]
+        self.assertTrue(menu["start_relay"].isEnabled())
+        menu["start_relay"].trigger()
+        self.assertTrue(self._wait_for(
+            lambda: self.state["relay_status"].text().startswith(
+                "Relay on: turn 1/10, you to A")),
+            "the chip should show the running relay, collapsed "
+            "or not")
+        self.assertTrue(self.state["relay_chip"].isVisible())
+        self.assertIn("#2fbf5a", self._dot_color())
+        self.assertTrue(self.state["relay_chip_stop"].isVisible())
+        self.assertTrue(menu["stop_relay"].isEnabled())
+        menu["stop_relay"].trigger()
+        self.assertTrue(self._wait_for_relay_stopped())
+        self.assertIn("stopped by you",
+                      self.state["relay_status"].text())
 
 
 if __name__ == "__main__":

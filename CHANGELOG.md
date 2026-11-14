@@ -1,7 +1,21 @@
 # DUO changelog
 
 Every version, newest first. v0.1–v0.17 were built on 2026-11-12;
-v0.18–v0.33 on 2026-11-13.
+v0.18–v0.34 on 2026-11-13.
+
+## v0.34 — 2026-11-13
+
+The relay's status moved out of the director into a chip that sits
+under the panes, above the Director toggle: a dot, the status words,
+and a Stop button. It used to live at the bottom of the director, so
+collapsing the director hid the relay's state entirely — now the
+chip stays visible either way, and it is the only relay status
+display. Grey means the relay is off, green means it is running
+(with the turn count and which side is answering), amber means it is
+paused for your review. The Stop button only shows while a relay is
+running, and it stops the relay exactly like the relay row's Stop
+button. When a relay ends, the chip holds the reason until the next
+relay starts.
 
 ## v0.33 — 2026-11-13
 
