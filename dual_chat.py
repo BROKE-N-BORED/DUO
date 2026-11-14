@@ -305,7 +305,7 @@ def make_debug_logger(log_dir=None):
         return _NullLogger()
 
 APP_NAME = "DUO"
-APP_VERSION = "0.31"
+APP_VERSION = "0.32"
 
 # Plain-language messages shown in the panes. No tracebacks in the UI.
 MSG_STOPPED = "Stopped."
@@ -3149,6 +3149,22 @@ def build_window(client=None, logger=None, deck_port=None):
 
     def make_clear(side):
         def clear():
+            side_obj = convo.sides[side]
+            if side_obj.messages:
+                # One misclick used to wipe a conversation with no way
+                # back. Ask first, and say how much is at stake. An
+                # empty pane has nothing to lose, so it clears
+                # without asking.
+                count = len(side_obj.messages)
+                noun = "message" if count == 1 else "messages"
+                answer = QtWidgets.QMessageBox.question(
+                    window, "Clear Model %s?" % side,
+                    "This clears %d %s from Model %s. Keep going?"
+                    % (count, noun, side),
+                    QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                    QtWidgets.QMessageBox.No)
+                if answer != QtWidgets.QMessageBox.Yes:
+                    return
             convo.sides[side].clear()
             widgets[side]["transcript"].clear()
             widgets[side]["reply_body_pos"] = None

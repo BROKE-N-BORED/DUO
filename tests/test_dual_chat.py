@@ -842,6 +842,26 @@ class FakeGuiClient:
         return text
 
 
+def _answer_yes():
+    """Answer Yes to any QMessageBox.question dialog (context manager).
+
+    v0.32: Clear asks first, so tests that clear a pane with messages
+    answer the dialog through this instead of hanging on a real one.
+    """
+    from PySide6.QtWidgets import QMessageBox
+    return mock.patch.object(
+        QMessageBox, "question",
+        return_value=QMessageBox.StandardButton.Yes)
+
+
+def _answer_no():
+    """Answer No to any QMessageBox.question dialog (context manager)."""
+    from PySide6.QtWidgets import QMessageBox
+    return mock.patch.object(
+        QMessageBox, "question",
+        return_value=QMessageBox.StandardButton.No)
+
+
 @unittest.skipUnless(os.environ.get("DUAL_CHAT_GUI_TESTS") == "1",
                      "GUI tests run with DUAL_CHAT_GUI_TESTS=1")
 class GuiTests(unittest.TestCase):
@@ -956,7 +976,8 @@ class GuiTests(unittest.TestCase):
             self.state["widgets"]["A"]["transcript"].toPlainText()
             and len(self.state["convo"].sides["A"].messages) == 2),
             timeout=15))
-        self.state["widgets"]["A"]["clear"].click()
+        with _answer_yes():
+            self.state["widgets"]["A"]["clear"].click()
         self.assertEqual(self.state["convo"].sides["A"].messages, [])
         self.assertEqual(self.state["widgets"]["A"]["transcript"]
                          .toPlainText(), "")
@@ -2366,7 +2387,8 @@ class Item4GuiTests(unittest.TestCase):
             self._stats("A"),
             "-- tok/s · -- out / -- in · first token -- · "
             "turn -- · RAM --")
-        self.state["widgets"]["A"]["clear"].click()
+        with _answer_yes():
+            self.state["widgets"]["A"]["clear"].click()
         self.assertEqual(
             self._stats("A"),
             "-- tok/s · -- out / -- in · first token -- · "
@@ -4439,7 +4461,8 @@ class Item9GuiTests(unittest.TestCase):
         self.assertTrue(self._send_both_and_wait("hello both"))
         log = self.state["state"]["full_log"]
         self.assertEqual(len(log), 4)
-        self.state["widgets"]["A"]["clear"].click()
+        with _answer_yes():
+            self.state["widgets"]["A"]["clear"].click()
         self.app.processEvents()
         self.assertEqual(
             self.state["state"]["full_log"],
@@ -4726,11 +4749,13 @@ class FullLogCapGuiTests(unittest.TestCase):
         self.assertTrue(state["full_log_trimmed"])
         # The trimmed log holds both sides; clearing one leaves the
         # other side's entries and the flag.
-        self.state["widgets"]["A"]["clear"].click()
+        with _answer_yes():
+            self.state["widgets"]["A"]["clear"].click()
         self.app.processEvents()
         self.assertTrue(state["full_log"])
         self.assertTrue(state["full_log_trimmed"])
-        self.state["widgets"]["B"]["clear"].click()
+        with _answer_yes():
+            self.state["widgets"]["B"]["clear"].click()
         self.app.processEvents()
         self.assertEqual(state["full_log"], [])
         self.assertFalse(state["full_log_trimmed"])
@@ -6389,7 +6414,7 @@ class FrontDoorTests(unittest.TestCase):
 
     def test_changelog_covers_every_version(self):
         log = self._read("CHANGELOG.md")
-        for version in ["0.%d" % n for n in range(1, 32)]:
+        for version in ["0.%d" % n for n in range(1, 33)]:
             self.assertIn(version, log)
 
     def test_gitignore_covers_runtime_files(self):
@@ -6916,8 +6941,9 @@ class ConversationGuiTests(unittest.TestCase):
             self.assertEqual(json.load(fh)["version"],
                              CONVERSATION_FORMAT_VERSION)
         # Clear both panes, then open the file back.
-        self.state["widgets"]["A"]["clear"].click()
-        self.state["widgets"]["B"]["clear"].click()
+        with _answer_yes():
+            self.state["widgets"]["A"]["clear"].click()
+            self.state["widgets"]["B"]["clear"].click()
         self.app.processEvents()
         self.assertEqual(self.state["convo"].sides["A"].messages, [])
         self.assertEqual(self.state["convo"].sides["B"].messages, [])
@@ -7275,7 +7301,8 @@ class TokenCountGuiTests(unittest.TestCase):
             "ttft_s": 0.5, "total_s": 2.5}}
         self.assertTrue(self._send_to_a_and_wait("Hello"))
         self.assertEqual(self._session("A"), "Session: 42 out / 128 in")
-        self.state["widgets"]["A"]["clear"].click()
+        with _answer_yes():
+            self.state["widgets"]["A"]["clear"].click()
         self.app.processEvents()
         # The stats line resets to dashes, the session total stays.
         self.assertEqual(
@@ -7777,7 +7804,8 @@ class TranscriptSearchGuiTests(unittest.TestCase):
         w["search_edit"].setText("rain")
         self.app.processEvents()
         self.assertEqual(w["search_count"].text(), "3 matches")
-        w["clear"].click()
+        with _answer_yes():
+            w["clear"].click()
         self.app.processEvents()
         self.assertEqual(w["search_edit"].text(), "")
         self.assertEqual(w["search_count"].text(), "")
@@ -9757,8 +9785,9 @@ class MenuBarGuiTests(unittest.TestCase):
         path = os.path.join(self.tmp.name, "convo.json")
         with self._save_dialog(path):
             self.state["menu_actions"]["save_conversation"].trigger()
-        self.state["widgets"]["A"]["clear"].click()
-        self.state["widgets"]["B"]["clear"].click()
+        with _answer_yes():
+            self.state["widgets"]["A"]["clear"].click()
+            self.state["widgets"]["B"]["clear"].click()
         self.app.processEvents()
         self.assertEqual(self.state["convo"].sides["A"].messages, [])
         with self._open_dialog(path):
@@ -10083,6 +10112,217 @@ class DirectorCollapseGuiTests(unittest.TestCase):
         toggle.click()
         self.app.processEvents()
         self.assertTrue(toggle.isVisible())
+
+
+@unittest.skipUnless(os.environ.get("DUAL_CHAT_GUI_TESTS") == "1",
+                     "GUI tests run with DUAL_CHAT_GUI_TESTS=1")
+class ClearConfirmGuiTests(unittest.TestCase):
+    """v0.32 (redesign R1): Clear asks first on a pane with messages.
+
+    The dialog names the side and counts the messages at stake, Yes
+    clears exactly as before, No and Escape leave everything
+    untouched, and an empty pane clears without asking. The update
+    check is stubbed, as in MenuBarGuiTests, so no test touches the
+    network.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        from PySide6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+        cls.client = FakeGuiClient()
+
+    def setUp(self):
+        from dual_chat import build_window
+        self._patcher = mock.patch(
+            "dual_chat.check_for_update",
+            return_value=("latest", None))
+        self._patcher.start()
+        self.client.reset()
+        self.window = build_window(self.client, logger=TEST_LOGGER)
+        self.window.show()
+        self.state = self.window._dual_chat
+        self._wait_for(lambda: self.state["widgets"]["A"]["picker"].count() == 2)
+        self._pick_models()
+
+    def tearDown(self):
+        self.window.close()
+        self.app.processEvents()
+        self._patcher.stop()
+
+    def _wait_for(self, cond, timeout=10.0):
+        from PySide6.QtTest import QTest
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            QTest.qWait(50)
+            if cond():
+                return True
+        return cond()
+
+    def _pick_models(self):
+        self.state["widgets"]["A"]["picker"].setCurrentIndex(0)
+        self.state["widgets"]["B"]["picker"].setCurrentIndex(1)
+        self.app.processEvents()
+
+    def _send_to_a_and_wait(self, text):
+        self.state["composer"].setPlainText(text)
+        self.state["send_a"].click()
+        return self._wait_for(lambda: (
+            len(self.state["convo"].sides["A"].messages) >= 2
+            and not self.state["state"]["busy"]), timeout=15)
+
+    def _send_to_b_and_wait(self, text):
+        self.state["composer"].setPlainText(text)
+        self.state["send_b"].click()
+        return self._wait_for(lambda: (
+            len(self.state["convo"].sides["B"].messages) >= 2
+            and not self.state["state"]["busy"]), timeout=15)
+
+    def _seed(self, side, user_text, assistant_text=None):
+        side_obj = self.state["convo"].sides[side]
+        side_obj.add_user(user_text)
+        if assistant_text is not None:
+            side_obj.add_assistant(assistant_text)
+        self.state["render_transcript"](side)
+        self.app.processEvents()
+
+    def _snapshot_a(self):
+        convo = self.state["convo"]
+        return (copy.deepcopy(convo.sides["A"].messages),
+                list(self.state["state"]["full_log"]),
+                copy.deepcopy(self.state["state"]["stats"]["A"]),
+                self.state["widgets"]["A"]["transcript"].toPlainText(),
+                self.state["widgets"]["A"]["session_tokens"].text())
+
+    def _assert_snapshot_a(self, snap):
+        messages, full_log, stats, text, session = snap
+        convo = self.state["convo"]
+        self.assertEqual(convo.sides["A"].messages, messages)
+        self.assertEqual(self.state["state"]["full_log"], full_log)
+        self.assertEqual(self.state["state"]["stats"]["A"], stats)
+        self.assertEqual(
+            self.state["widgets"]["A"]["transcript"].toPlainText(), text)
+        self.assertEqual(
+            self.state["widgets"]["A"]["session_tokens"].text(), session)
+
+    def test_dialog_names_the_side_and_counts_the_messages(self):
+        from PySide6.QtWidgets import QMessageBox
+        self._seed("A", "Hello", "Hi back")
+        with mock.patch.object(QMessageBox, "question",
+                               return_value=QMessageBox.StandardButton.Yes
+                               ) as asked:
+            self.state["widgets"]["A"]["clear"].click()
+        self.assertEqual(asked.call_count, 1)
+        _parent, title, text, buttons, default = asked.call_args[0]
+        self.assertEqual(title, "Clear Model A?")
+        self.assertEqual(text,
+                         "This clears 2 messages from Model A. "
+                         "Keep going?")
+        self.assertEqual(buttons, QMessageBox.Yes | QMessageBox.No)
+        self.assertEqual(default, QMessageBox.StandardButton.No)
+        self.assertNotIn("\u2014", text)
+        self.assertNotIn("\u2014", title)
+        # Yes went through: the pane cleared.
+        self.assertEqual(self.state["convo"].sides["A"].messages, [])
+
+    def test_dialog_says_message_for_one(self):
+        from PySide6.QtWidgets import QMessageBox
+        self._seed("B", "Only one")
+        with mock.patch.object(QMessageBox, "question",
+                               return_value=QMessageBox.StandardButton.No
+                               ) as asked:
+            self.state["widgets"]["B"]["clear"].click()
+        self.assertEqual(asked.call_count, 1)
+        _parent, title, text, _buttons, _default = asked.call_args[0]
+        self.assertEqual(title, "Clear Model B?")
+        self.assertEqual(text,
+                         "This clears 1 message from Model B. "
+                         "Keep going?")
+        # No went through: the one message is still there.
+        self.assertEqual(len(self.state["convo"].sides["B"].messages), 1)
+
+    def test_yes_clears_history_full_log_and_stats(self):
+        self.assertTrue(self._send_to_a_and_wait("Hello"))
+        self.assertTrue(self._send_to_b_and_wait("Hello too"))
+        session_before = (
+            self.state["widgets"]["A"]["session_tokens"].text())
+        self.assertNotEqual(
+            self.state["widgets"]["A"]["stats"].text(),
+            "-- tok/s · -- out / -- in · first token -- · "
+            "turn -- · RAM --")
+        with _answer_yes():
+            self.state["widgets"]["A"]["clear"].click()
+        self.app.processEvents()
+        self.assertEqual(self.state["convo"].sides["A"].messages, [])
+        self.assertEqual(
+            self.state["widgets"]["A"]["transcript"].toPlainText(), "")
+        self.assertEqual(
+            [entry for entry in self.state["state"]["full_log"]
+             if entry[0] == "A"], [])
+        self.assertTrue(
+            [entry for entry in self.state["state"]["full_log"]
+             if entry[0] == "B"])
+        self.assertIsNone(self.state["state"]["stats"]["A"])
+        self.assertEqual(
+            self.state["widgets"]["A"]["stats"].text(),
+            "-- tok/s · -- out / -- in · first token -- · "
+            "turn -- · RAM --")
+        # The session total is a record of the session, not of the
+        # pane: clearing leaves it alone.
+        self.assertEqual(
+            self.state["widgets"]["A"]["session_tokens"].text(),
+            session_before)
+
+    def test_no_leaves_everything_untouched(self):
+        self.assertTrue(self._send_to_a_and_wait("Hello"))
+        before = self._snapshot_a()
+        with _answer_no():
+            self.state["widgets"]["A"]["clear"].click()
+        self.app.processEvents()
+        self._assert_snapshot_a(before)
+
+    def test_escape_leaves_everything_untouched(self):
+        from PySide6 import QtCore, QtTest, QtWidgets
+        self.assertTrue(self._send_to_a_and_wait("Hello"))
+        before = self._snapshot_a()
+        seen = []
+
+        def press_escape():
+            dialog = QtWidgets.QApplication.activeModalWidget()
+            seen.append(dialog is not None)
+            if dialog is not None:
+                QtTest.QTest.keyClick(dialog, QtCore.Qt.Key_Escape)
+
+        def force_close():
+            # Safety net: never leave a modal dialog open if the
+            # Escape keypress did not land.
+            dialog = QtWidgets.QApplication.activeModalWidget()
+            if dialog is not None:
+                dialog.reject()
+
+        escape_timer = QtCore.QTimer()
+        escape_timer.setSingleShot(True)
+        escape_timer.timeout.connect(press_escape)
+        safety_timer = QtCore.QTimer()
+        safety_timer.setSingleShot(True)
+        safety_timer.timeout.connect(force_close)
+        escape_timer.start(200)
+        safety_timer.start(5000)
+        self.state["widgets"]["A"]["clear"].click()
+        escape_timer.stop()
+        safety_timer.stop()
+        self.app.processEvents()
+        self.assertEqual(seen, [True],
+                         "the confirmation dialog should have appeared")
+        self._assert_snapshot_a(before)
+
+    def test_empty_pane_clears_without_asking(self):
+        from PySide6.QtWidgets import QMessageBox
+        with mock.patch.object(QMessageBox, "question") as asked:
+            self.state["widgets"]["A"]["clear"].click()
+        self.app.processEvents()
+        self.assertEqual(asked.call_count, 0)
+        self.assertEqual(self.state["convo"].sides["A"].messages, [])
 
 
 if __name__ == "__main__":

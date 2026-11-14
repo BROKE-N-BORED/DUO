@@ -1,7 +1,16 @@
 # DUO changelog
 
 Every version, newest first. v0.1–v0.17 were built on 2026-11-12;
-v0.18–v0.31 on 2026-11-13.
+v0.18–v0.32 on 2026-11-13.
+
+## v0.32 — 2026-11-13
+
+Clear asks before it wipes. Clicking Clear on a pane that has
+messages now shows a plain question — "This clears 2 messages from
+Model A. Keep going?" — with Yes and No, and No is the default, so
+a misclick or an Escape keypress loses nothing. A pane with no
+messages still clears straight away, with no question, since there
+is nothing to lose.
 
 ## v0.31 — 2026-11-13
 

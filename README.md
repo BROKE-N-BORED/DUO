@@ -137,8 +137,9 @@ bash run.sh
   to use is a built-in index explaining everything DUO does, in
   plain language and with no web.
 - Stop ends the turn in progress on that side. Clear wipes that side's
-  conversation. Conversations are not saved automatically — Save
-  conversation (next to the save buttons) keeps the whole
+  conversation, and asks first — it tells you how many messages you
+  are about to lose, and No is the default. Conversations are not
+  saved automatically — Save conversation (next to the save buttons) keeps the whole
   conversation in a file you can open again later, and the Save
   buttons keep a transcript as a text file.
 - The window remembers its size, position, and the split between
