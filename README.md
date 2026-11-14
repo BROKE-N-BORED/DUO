@@ -76,6 +76,8 @@ Everything in one app:
   the split between the panes are remembered between runs, so it
   opens where you left it. The title bar shows the version, and
   the window has its own icon.
+- **One window only** — launching DUO twice does not open a second
+  window: the DUO already running comes to the front instead.
 - **Update check** — DUO checks GitHub once at startup and says in
   the status bar when a newer Release is out (silently saying
   nothing when offline), and a "Check for updates" button runs the

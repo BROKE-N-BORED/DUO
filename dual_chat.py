@@ -185,7 +185,8 @@ import threading
 # duo_deck.py in v0.31, the background Qt workers to duo_workers.py
 # in v0.39, the relay session to duo_model.py in v0.40, the debug
 # log fallback to duo_debug.py and the attachments to
-# duo_attachments.py in v0.42), and
+# duo_attachments.py in v0.42, and the single-instance socket to
+# duo_single.py in v0.44), and
 # re-exports the moved names so
 # `from dual_chat import ...` keeps working unchanged -- the
 # tests, the installer, and the deck all import through here.
@@ -217,6 +218,9 @@ from duo_ollama import (
     parse_ollama_list_output, parse_ps_payload, parse_tags_payload,
     parse_tags_sizes, parse_version,)
 from duo_runner import SerialRunner
+from duo_single import (SINGLE_INSTANCE_ENV, SINGLE_INSTANCE_NAME,
+                        SingleInstance, notify_existing,
+                        single_instance_name,)
 from duo_stats import (
     MODEL_FIT_RESERVE_BYTES, STATS_EMPTY_LINE, compute_turn_stats,
     cpu_percent_between, format_model_entry, format_ram,
@@ -247,7 +251,7 @@ from duo_workers import (_ModelLoader, _OllamaStarter, _SignalObject,
 
 
 APP_NAME = "DUO"
-APP_VERSION = "0.43"
+APP_VERSION = "0.44"
 
 # Plain-language messages shown in the panes. No tracebacks in the UI.
 MSG_STOPPED = "Stopped."
@@ -3951,9 +3955,19 @@ def main(argv=None):
         _show_missing_pyside6()
         return 1
     app = QtWidgets.QApplication(argv)
+    # Single instance (v0.44, U27): a second launch asks the DUO
+    # already running to come to the front and exits cleanly --
+    # acquire() already sent the show message when it found one,
+    # so there is nothing more to do here.
+    guard = SingleInstance()
+    if not guard.acquire():
+        return 0
     logger = make_debug_logger()
     logger.install_crash_handler()
     window = build_window(OllamaClient(base_url), logger=logger)
+    guard.set_show_callback(
+        lambda: (window.show(), window.raise_(),
+                 window.activateWindow()))
     window.show()
     return app.exec()
 

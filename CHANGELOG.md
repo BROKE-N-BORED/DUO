@@ -1,7 +1,17 @@
 # DUO changelog
 
 Every version, newest first. v0.1–v0.17 were built on 2026-11-12;
-v0.18–v0.35 on 2026-11-13; v0.36–v0.43 on 2026-11-14.
+v0.18–v0.35 on 2026-11-13; v0.36–v0.44 on 2026-11-14.
+
+## v0.44 — 2026-11-14
+
+One DUO at a time now. Launching DUO twice no longer opens a
+second window: the DUO already running comes to the front, and
+the second launch exits quietly. That also means no second
+phone-deck server fighting over the port, and no two copies
+writing to the same saved pairs and presets. If DUO ever
+crashes, the next launch still starts cleanly instead of
+tripping over the socket the crashed copy left behind.
 
 ## v0.43 — 2026-11-14
 

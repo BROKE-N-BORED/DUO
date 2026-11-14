@@ -49,6 +49,7 @@ from dual_chat import (  # noqa: E402
     SETTING_WINDOW_GEOMETRY,
     SIDE_COLORS,
     SIDE_STATES,
+    SINGLE_INSTANCE_ENV, SINGLE_INSTANCE_NAME,
     TASK_CONTINUE_TEMPLATE, TASK_FOLLOW_UPS, TASK_REVIEW_TEMPLATE,
     TASK_REVISE_TEMPLATE, TASK_ROUNDS_DEFAULT, TASK_ROUNDS_MAX,
     TASK_ROUNDS_MIN,
@@ -60,6 +61,7 @@ from dual_chat import (  # noqa: E402
     NoModelSelected,
     OllamaClient, OllamaError, OllamaServerManager, RelaySession,
     SUMMARY_KEEP_LAST, SUMMARY_LABEL, SUMMARIZE_PROMPT, SerialRunner,
+    SingleInstance,
     TaskSession, TranscriptError, append_full_log_entry, attachment_tag,
     build_attached_message,
     build_deck_state, check_for_update, compute_turn_stats,
@@ -80,6 +82,7 @@ from dual_chat import (  # noqa: E402
     make_debug_logger,
     markdown_to_html,
     model_fits,
+    notify_existing,
     pair_tooltip, pairs_path, parse_cpu_times, parse_meminfo,
     parse_ollama_list_output, parse_ps_payload,
     parse_side_transcript, parse_stop_phrases, parse_tags_payload,
@@ -89,6 +92,7 @@ from dual_chat import (  # noqa: E402
     render_qr_pixmap,
     sanitize_filename_part,
     save_conversation_file, save_pair, save_preset,
+    single_instance_name,
     valid_temperature, write_text_atomic,
 )
 
@@ -6793,7 +6797,7 @@ class FrontDoorTests(unittest.TestCase):
 
     def test_changelog_covers_every_version(self):
         log = self._read("CHANGELOG.md")
-        for version in ["0.%d" % n for n in range(1, 44)]:
+        for version in ["0.%d" % n for n in range(1, 45)]:
             self.assertIn(version, log)
 
     def test_gitignore_covers_runtime_files(self):
@@ -8803,7 +8807,7 @@ class ModuleSplitTests(unittest.TestCase):
                "duo_markdown", "duo_model", "duo_transcript",
                "duo_storage", "duo_runner", "duo_icon", "duo_menu",
                "duo_deck", "duo_workers", "duo_debug",
-               "duo_attachments")
+               "duo_attachments", "duo_single")
 
     def _tree(self):
         return os.path.dirname(
@@ -8840,6 +8844,7 @@ class ModuleSplitTests(unittest.TestCase):
         import duo_model
         import duo_ollama
         import duo_runner
+        import duo_single
         import duo_stats
         import duo_storage
         import duo_tasks
@@ -8897,6 +8902,14 @@ class ModuleSplitTests(unittest.TestCase):
             (dual_chat.MAX_ATTACHMENTS, duo_attachments.MAX_ATTACHMENTS),
             (dual_chat.MAX_ATTACHMENT_BYTES,
              duo_attachments.MAX_ATTACHMENT_BYTES),
+            (dual_chat.SingleInstance, duo_single.SingleInstance),
+            (dual_chat.notify_existing, duo_single.notify_existing),
+            (dual_chat.single_instance_name,
+             duo_single.single_instance_name),
+            (dual_chat.SINGLE_INSTANCE_NAME,
+             duo_single.SINGLE_INSTANCE_NAME),
+            (dual_chat.SINGLE_INSTANCE_ENV,
+             duo_single.SINGLE_INSTANCE_ENV),
         ]
         for through_dual_chat, original in pairs:
             self.assertIs(through_dual_chat, original, original)
@@ -9202,6 +9215,12 @@ class MessageStructureTests(unittest.TestCase):
                   encoding="utf-8") as fh:
             script = fh.read()
         self.assertIn('"duo_attachments.py": 0o100644', script)
+
+    def test_zip_includes_the_single_module(self):
+        with open(os.path.join(self._tree(), "build_zip.py"),
+                  encoding="utf-8") as fh:
+            script = fh.read()
+        self.assertIn('"duo_single.py": 0o100644', script)
 
 class UpdateCheckTests(unittest.TestCase):
     """v0.28 (audit T17): the update check's pure core -- version
@@ -12894,6 +12913,207 @@ class SendGateGuiTests(unittest.TestCase):
             self._assert_sends(True, True, True)
         finally:
             self.client.delay = 0.02
+
+
+# ---------------------------------------------------------------------------
+# Single instance (v0.44, redesign U27)
+# ---------------------------------------------------------------------------
+
+class SingleInstanceTests(unittest.TestCase):
+    """The single-instance name: the default, and the env override
+    the tests use so a test run never touches the real DUO's
+    socket."""
+
+    def test_default_name(self):
+        env = dict(os.environ)
+        env.pop(SINGLE_INSTANCE_ENV, None)
+        with mock.patch.dict(os.environ, env, clear=True):
+            self.assertEqual(single_instance_name(),
+                             SINGLE_INSTANCE_NAME)
+        self.assertEqual(SINGLE_INSTANCE_NAME, "BrokeNBoredDUO")
+
+    def test_env_override_name(self):
+        with mock.patch.dict(os.environ,
+                             {SINGLE_INSTANCE_ENV: "duo-test-xyz"}):
+            self.assertEqual(single_instance_name(), "duo-test-xyz")
+
+    def test_empty_env_falls_back_to_default(self):
+        with mock.patch.dict(os.environ, {SINGLE_INSTANCE_ENV: ""}):
+            self.assertEqual(single_instance_name(),
+                             SINGLE_INSTANCE_NAME)
+
+
+@unittest.skipUnless(os.environ.get("DUAL_CHAT_GUI_TESTS") == "1",
+                     "GUI tests run with DUAL_CHAT_GUI_TESTS=1")
+class SingleInstanceGuiTests(unittest.TestCase):
+    """One DUO at a time: acquire and release, a second acquire
+    reporting already running, the show callback firing when a
+    later launch asks, a stale socket from a crashed DUO not
+    blocking a fresh start, and a real second process exiting
+    cleanly. Each test uses a unique server name, so tests never
+    see each other's sockets -- or the real DUO's."""
+
+    _counter = 0
+
+    @classmethod
+    def setUpClass(cls):
+        from PySide6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+
+    def _tree(self):
+        return os.path.dirname(
+            os.path.dirname(os.path.abspath(__file__)))
+
+    def _unique_name(self):
+        SingleInstanceGuiTests._counter += 1
+        return "duo-test-single-%d-%d" % (
+            os.getpid(), SingleInstanceGuiTests._counter)
+
+    def _wait_for(self, cond, timeout=10.0):
+        from PySide6.QtTest import QTest
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            QTest.qWait(50)
+            if cond():
+                return True
+        return cond()
+
+    def test_acquire_succeeds_when_free(self):
+        guard = SingleInstance(name=self._unique_name())
+        try:
+            self.assertTrue(guard.acquire())
+            self.assertFalse(guard.already_running)
+        finally:
+            guard.release()
+
+    def test_release_frees_the_name(self):
+        name = self._unique_name()
+        first = SingleInstance(name=name)
+        self.assertTrue(first.acquire())
+        first.release()
+        second = SingleInstance(name=name)
+        try:
+            self.assertTrue(second.acquire())
+            self.assertFalse(second.already_running)
+        finally:
+            second.release()
+
+    def test_second_acquire_reports_already_running(self):
+        name = self._unique_name()
+        first = SingleInstance(name=name)
+        self.assertTrue(first.acquire())
+        try:
+            second = SingleInstance(name=name)
+            self.assertFalse(second.acquire())
+            self.assertTrue(second.already_running)
+            second.release()  # no-op: it never listened
+        finally:
+            first.release()
+
+    def test_notify_fires_the_show_callback(self):
+        shown = []
+        guard = SingleInstance(name=self._unique_name())
+        guard.set_show_callback(lambda: shown.append(True))
+        self.assertTrue(guard.acquire())
+        try:
+            self.assertTrue(notify_existing(guard.name))
+            self.assertTrue(self._wait_for(lambda: len(shown) >= 1))
+        finally:
+            guard.release()
+
+    def test_notify_returns_false_when_nobody_listens(self):
+        self.assertFalse(notify_existing(self._unique_name()))
+
+    def test_stale_socket_does_not_block_a_fresh_acquire(self):
+        # A helper process listens, then dies without cleanup
+        # (os._exit skips every destructor) -- the socket file
+        # lingers exactly as a crashed DUO leaves it.
+        name = self._unique_name()
+        helper = (
+            "import os, sys\n"
+            "sys.path.insert(0, %r)\n"
+            "from PySide6.QtCore import QCoreApplication\n"
+            "from PySide6.QtNetwork import QLocalServer\n"
+            "app = QCoreApplication([])\n"
+            "server = QLocalServer()\n"
+            "assert server.listen(%r)\n"
+            "sys.stdout.write('socket=%%s\\n' %% "
+            "server.fullServerName())\n"
+            "sys.stdout.flush()\n"
+            "os._exit(3)\n" % (self._tree(), name)
+        )
+        env = dict(os.environ)
+        env["QT_QPA_PLATFORM"] = "offscreen"
+        proc = subprocess.run(
+            [sys.executable, "-c", helper],
+            capture_output=True, text=True, timeout=60, env=env)
+        self.assertEqual(proc.returncode, 3, proc.stderr)
+        socket_path = [line.split("=", 1)[1]
+                       for line in proc.stdout.splitlines()
+                       if line.startswith("socket=")][0]
+        self.assertTrue(os.path.exists(socket_path),
+                        "the crashed listener's socket should linger")
+        # A bare listen trips over the stale file...
+        from PySide6.QtNetwork import QLocalServer
+        bare = QLocalServer()
+        self.assertFalse(bare.listen(name))
+        # ...but acquire() clears it first and listens fine.
+        guard = SingleInstance(name=name)
+        try:
+            self.assertTrue(guard.acquire())
+            self.assertFalse(guard.already_running)
+        finally:
+            guard.release()
+
+    def test_second_process_exits_cleanly(self):
+        # A real second launch against a real first one: the first
+        # runs the full app offscreen, the second finds it, asks
+        # it to come forward, and exits 0 within seconds -- it
+        # never opens a window of its own.
+        name = self._unique_name()
+        env = dict(os.environ)
+        env["DUO_SINGLE_INSTANCE_NAME"] = name
+        env["QT_QPA_PLATFORM"] = "offscreen"
+        app_path = os.path.join(self._tree(), "dual_chat.py")
+        first = subprocess.Popen(
+            [sys.executable, app_path],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, env=env, cwd=self._tree())
+        try:
+            # Wait for the first instance to be listening before
+            # launching the second: probe with a bare connect
+            # (no show message -- this is only a readiness check).
+            from PySide6.QtNetwork import QLocalSocket
+
+            def _listening():
+                sock = QLocalSocket()
+                sock.connectToServer(name)
+                ok = sock.waitForConnected(500)
+                sock.disconnectFromServer()
+                return ok
+
+            self.assertTrue(self._wait_for(_listening, timeout=30),
+                            "first instance never started listening")
+            started = time.monotonic()
+            second = subprocess.run(
+                [sys.executable, app_path],
+                capture_output=True, text=True, timeout=60,
+                env=env, cwd=self._tree())
+            elapsed = time.monotonic() - started
+            self.assertEqual(second.returncode, 0,
+                             second.stderr[-500:])
+            self.assertLess(elapsed, 20, elapsed)
+            self.assertNotIn("Traceback", second.stderr)
+            self.assertNotIn("Traceback", second.stdout)
+        finally:
+            first.terminate()
+            try:
+                first.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                first.kill()
+                first.wait(timeout=10)
+            first.stdout.close()
+            first.stderr.close()
 
 
 if __name__ == "__main__":
