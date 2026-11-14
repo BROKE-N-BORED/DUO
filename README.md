@@ -58,9 +58,10 @@ Everything in one app:
   once you send your first message.
 - **Stays connected** — if Ollama stalls briefly while the computer
   is busy, a turn retries a few times instead of giving up, and a
-  slow Ollama is never reported as "not running". If Ollama really
-  is down, the Start Ollama button in the bottom row is ready to
-  press, and it starts Ollama from inside DUO.
+  slow Ollama is never reported as "not running". Models stay loaded
+  for the session, and the model list gets a few tries too. If
+  Ollama really is down, the panes say so in plain words — start
+  Ollama yourself (`ollama serve` in a terminal) and try again.
 - **Debug report** — DUO keeps a log of what it does (events and
   timings only, never your messages). The Debug report button
   writes one file with the app version, Ollama's status, the
@@ -426,13 +427,10 @@ connection dropped, the partial reply stays in the pane with a plain
 note — DUO never retries a half-streamed turn, because that would
 repeat the part you already saw.
 
-If Ollama has genuinely stopped, the panes say so in plain words and
-the Start Ollama button in the bottom row is enabled (it stays
-greyed out while Ollama answers, so it can never start a second
-server while one is running). Press it and DUO
-starts Ollama itself — no terminal, no extra steps. When DUO closes,
-it stops only the server it started; a server you started yourself
-is left alone.
+If Ollama has genuinely stopped, the panes say so in plain words.
+Start Ollama yourself — `ollama serve` in a terminal — and try
+again. DUO never starts or stops a server: closing DUO leaves
+Ollama running exactly as it found it.
 
 If something keeps going wrong, press Debug report (next to the save
 buttons) and send the file it writes. It holds the app version,

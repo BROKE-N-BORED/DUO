@@ -3,12 +3,12 @@ in v0.39, redesign R5 -- dual_chat.py was 17 lines under its 4,000-line
 bound and the first-run guide needed room).
 
 The signal bridge (_Signals / _SignalObject) carries runner callbacks
-from worker threads onto the GUI thread, and the three thread classes
-load the model list, start Ollama, and run the update check off the
-GUI thread. PySide6 is imported lazily inside the functions (the
-duo_menu.py precedent), so this module -- and dual_chat.py, which
-imports it -- still import cleanly on a machine without PySide6
-(the v0.14 first-run guard).
+from worker threads onto the GUI thread, and the two thread classes
+load the model list and run the update check off the GUI thread.
+PySide6 is imported lazily inside the functions (the duo_menu.py
+precedent), so this module -- and dual_chat.py, which imports it --
+still import cleanly on a machine without PySide6 (the v0.14
+first-run guard).
 """
 import time
 
@@ -44,7 +44,6 @@ class _SignalObject:
             idle = Signal()
             models_loaded = Signal(list)
             models_failed = Signal(str)
-            ollama_started = Signal(bool, str)
             # Update check: (result, manual) where result is
             # check_for_update's ("newer"/"latest"/"failed", version)
             # and manual says whether the button asked for it.
@@ -62,7 +61,6 @@ class _SignalObject:
         self.idle = self._inner.idle
         self.models_loaded = self._inner.models_loaded
         self.models_failed = self._inner.models_failed
-        self.ollama_started = self._inner.ollama_started
         self.update_checked = self._inner.update_checked
         self.phone_send = self._inner.phone_send
 
@@ -109,24 +107,6 @@ class _ModelLoader:
                         signals.models_failed.emit(str(exc))
                     except RuntimeError:
                         pass  # Window gone; nothing left to update.
-
-        self.thread = _Thread()
-
-
-class _OllamaStarter:
-    """Starts Ollama off the GUI thread (the wait for the probe can
-    take seconds). Emits (ok, message) through signals.ollama_started."""
-
-    def __init__(self, manager, signals):
-        from PySide6.QtCore import QThread
-
-        class _Thread(QThread):
-            def run(self):
-                ok, message = manager.start()
-                try:
-                    signals.ollama_started.emit(ok, message)
-                except RuntimeError:
-                    pass  # Window gone; nothing left to update.
 
         self.thread = _Thread()
 

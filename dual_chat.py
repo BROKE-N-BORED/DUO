@@ -238,10 +238,9 @@ from duo_model import (
 from duo_motion import DirectorSpring, install_motion
 from duo_ollama import (
     CHAT_MAX_ATTEMPTS, CHAT_RETRY_DELAYS, CHAT_TIMEOUT, DEFAULT_OLLAMA_URL,
-    MSG_MODEL_FAILED, MSG_OLLAMA_DOWN, MSG_OLLAMA_NOT_INSTALLED,
-    MSG_OLLAMA_SLOW, MSG_OLLAMA_START_FAILED, OLLAMA_URL_ENV,
+    MSG_MODEL_FAILED, MSG_OLLAMA_DOWN, MSG_OLLAMA_SLOW, OLLAMA_URL_ENV,
     UPDATE_CHECK_TIMEOUT, UPDATE_CHECK_URL, UPDATE_CHECK_URL_ENV, Cancelled,
-    OllamaClient, OllamaError, OllamaServerManager, check_for_update,
+    OllamaClient, OllamaError, check_for_update,
     parse_ollama_list_output, parse_ps_payload, parse_tags_payload,
     parse_tags_sizes, parse_version,)
 from duo_runner import SerialRunner
@@ -274,12 +273,12 @@ from duo_transcript import (
     default_full_filename, default_side_filename,
     format_both_transcript, format_full_transcript, format_side_transcript,
     load_side_transcript_file, parse_side_transcript, sanitize_filename_part,)
-from duo_workers import (_ModelLoader, _OllamaStarter, _SignalObject,
+from duo_workers import (_ModelLoader, _SignalObject,
                          _Signals, _UpdateChecker, _qt,)
 
 
 APP_NAME = "DUO"
-APP_VERSION = "0.48"
+APP_VERSION = "0.49"
 
 
 
@@ -324,7 +323,6 @@ def build_window(client=None, logger=None, deck_port=None):
             lambda: _debug_log.check_ollama(ollama_url))
     logger.register_dependency("PySide6-Essentials")
     logger.action("DUO %s started" % APP_VERSION)
-    ollama_manager = OllamaServerManager(client)
     signals = _Signals()
     convo = Conversation()
 
@@ -767,15 +765,6 @@ def build_window(client=None, logger=None, deck_port=None):
     btn_row.addWidget(phone_btn)
     update_btn = QtWidgets.QPushButton("Check for updates")
     btn_row.addWidget(update_btn)
-    # Start Ollama (v0.35, T23): it used to hide in the status bar
-    # and only appear after a failure -- now it lives here with the
-    # other app-level actions, always visible, and its enablement
-    # follows whether Ollama last answered (refresh_buttons): on
-    # while Ollama is down, greyed out while it answers, so it can
-    # never start a second server while one is already running.
-    start_ollama_btn = QtWidgets.QPushButton("Start Ollama")
-    start_ollama_btn.setEnabled(False)
-    btn_row.addWidget(start_ollama_btn)
     d_layout.addLayout(btn_row)
 
     # --- director sections (v0.37, R4) -------------------------------
@@ -1079,8 +1068,7 @@ def build_window(client=None, logger=None, deck_port=None):
 
     set_status_message("Loading models...")
     # The status bar holds only the status message and the system
-    # meter (v0.35, T23): the Start Ollama button moved to the
-    # bottom button row, where the actions live.
+    # meter.
 
     # System meter (v0.29): the whole machine's CPU % and RAM in the
     # status bar, re-read from /proc once a second. Two small file
@@ -1145,16 +1133,6 @@ def build_window(client=None, logger=None, deck_port=None):
              # disabled with a "Loading models..." placeholder until
              # the list lands or the load fails.
              "models_loading": False,
-             # Whether Ollama last answered (v0.35, T23): the Start
-             # Ollama button is enabled only while this is True --
-             # never clickable into starting a second server while
-             # one answers. False until a probe or a turn says
-             # otherwise.
-             "ollama_down": False,
-             # True while a DUO-started server is still starting:
-             # the button stays disabled until the starter reports
-             # back, so a second click can't start a second server.
-             "ollama_starting": False,
              # Total RAM in bytes, read once at startup for the
              # picker's fit labels (v0.33, U39). None when /proc
              # can't be read: the pickers then show sizes only.
@@ -1581,14 +1559,6 @@ def build_window(client=None, logger=None, deck_port=None):
         relay_btn.setText("Stop Relay" if relay_active else "Start Relay")
         relay_btn.setEnabled(
             relay_active or (not busy and a_ready and b_ready))
-        # Start Ollama (v0.35, T23): enabled only while Ollama is
-        # down -- and off while the model list is loading (its
-        # state is unknown until the probe lands) or while a start
-        # is already in flight.
-        start_ollama_btn.setEnabled(
-            state.get("ollama_down", False)
-            and not state.get("models_loading", False)
-            and not state.get("ollama_starting", False))
         for widget in (start_picker, cap_spin, mode_picker, stop_edit,
                        agree_check, review_check):
             widget.setEnabled(not relay_active)
@@ -1798,14 +1768,6 @@ def build_window(client=None, logger=None, deck_port=None):
         if model in running:
             return "%s in RAM" % format_ram(running[model])
         return "not loaded"
-
-    def set_ollama_down(down):
-        """Record whether Ollama last answered (v0.35, T23). The
-        Start Ollama button's enablement follows this in
-        refresh_buttons: on while Ollama is down, greyed out while
-        it answers."""
-        state["ollama_down"] = down
-        refresh_buttons()
 
     def make_job_fn(job_id, model, messages, track_stats=True):
         holder = {"metrics": None, "ram": None}
@@ -2209,12 +2171,6 @@ def build_window(client=None, logger=None, deck_port=None):
             refresh_stats_label(side)
         logger.error("turn failed: side %s, model %s: %s"
                      % (side, convo.sides[side].model, message))
-        # Ollama down or unresponsive: enable the Start Ollama
-        # button. A slow Ollama enables it too -- restarting it is
-        # the sensible remedy for both, and the button reports its
-        # own outcome honestly.
-        if message in (MSG_OLLAMA_DOWN, MSG_OLLAMA_SLOW):
-            set_ollama_down(True)
         if state.get("relay") is not None:
             end_relay(message)
         if state.get("task") is not None:
@@ -3410,7 +3366,6 @@ def build_window(client=None, logger=None, deck_port=None):
         else:
             set_status_message(
                 "Ollama connected but no models found. Pull a model first.")
-        set_ollama_down(False)
         refresh_buttons()
 
     def on_models_failed(message):
@@ -3420,8 +3375,6 @@ def build_window(client=None, logger=None, deck_port=None):
         for side in ("A", "B"):
             widgets[side]["picker"].setPlaceholderText("Pick a model")
         set_status_message(message)
-        if message in (MSG_OLLAMA_DOWN, MSG_OLLAMA_SLOW):
-            set_ollama_down(True)
         refresh_buttons()
 
     signals.models_loaded.connect(populate_models)
@@ -3459,38 +3412,6 @@ def build_window(client=None, logger=None, deck_port=None):
         loader.thread.finished.connect(
             lambda: loaders.remove(loader) if loader in loaders else None)
         loader.thread.start()
-
-    # --- Start Ollama ------------------------------------------------------
-    starters = []
-
-    def do_start_ollama():
-        """Start Ollama from inside DUO (off the GUI thread -- the
-        wait for the probe can take seconds)."""
-        logger.action("Start Ollama pressed")
-        state["ollama_starting"] = True
-        set_status_message("Starting Ollama...")
-        refresh_buttons()
-        starter = _OllamaStarter(ollama_manager, signals)
-        starters.append(starter)
-        starter.thread.finished.connect(
-            lambda: starters.remove(starter) if starter in starters else None)
-        starter.thread.start()
-
-    def on_ollama_started(ok, message):
-        if not alive():
-            return
-        state["ollama_starting"] = False
-        logger.action("Start Ollama finished: %s" % message)
-        set_status_message(message)
-        if ok:
-            set_ollama_down(False)
-            load_models()
-        else:
-            set_ollama_down(True)
-        refresh_buttons()
-
-    signals.ollama_started.connect(on_ollama_started)
-    start_ollama_btn.clicked.connect(do_start_ollama)
 
     # --- update check (v0.28) ---------------------------------------------
     # Two triggers, one check: once automatically at startup (below,
@@ -3747,10 +3668,6 @@ def build_window(client=None, logger=None, deck_port=None):
         "save_text_to_file": save_text_to_file,
         "debug_btn": debug_btn, "do_debug_report": do_debug_report,
         "debug_logger": logger,
-        "start_ollama_btn": start_ollama_btn,
-        "ollama_manager": ollama_manager,
-        "do_start_ollama": do_start_ollama,
-        "set_ollama_down": set_ollama_down,
         "send_message": send_message,
         "log_event": log_event,
         "set_side_state": set_side_state, "side_state": side_state,
@@ -3780,22 +3697,20 @@ def build_window(client=None, logger=None, deck_port=None):
         "set_tasks_collapsed": _set_tasks_collapsed,
     }
 
-    # Closing the window stops a server DUO itself started -- no orphan
-    # `ollama serve` processes left behind. A server started any other
-    # way is untouched.
+    # Closing the window stops only DUO: Ollama keeps running, the
+    # way DUO found it -- DUO never starts or stops a server.
     _orig_close_event = window.closeEvent
 
     def _on_close(event):
-        # Threads this window started (model loads, Ollama starts,
-        # update checks) must finish before the window goes away:
-        # destroying a running QThread aborts the whole process
-        # ("QThread: Destroyed while thread '' is still running",
-        # exit 134 in the full suite). Each worker is bounded by
-        # its own timeout (5s for the model load and the update
-        # check, 15s for the Ollama start), so the wait always
-        # ends; the workers only do network I/O and emit one
-        # signal, so waiting here cannot deadlock.
-        for _holders in (loaders, starters, update_checkers):
+        # Threads this window started (model loads, update checks)
+        # must finish before the window goes away: destroying a
+        # running QThread aborts the whole process ("QThread:
+        # Destroyed while thread '' is still running", exit 134 in
+        # the full suite). Each worker is bounded (the model load by
+        # its retries, the update check by its 5s timeout), so the
+        # wait always ends; the workers only do network I/O and
+        # emit one signal, so waiting here cannot deadlock.
+        for _holders in (loaders, update_checkers):
             for _holder in list(_holders):
                 if _holder.thread.isRunning():
                     _holder.thread.wait()
@@ -3837,7 +3752,6 @@ def build_window(client=None, logger=None, deck_port=None):
             state["task"].active = False
         if deck_server is not None:
             deck_server.stop()
-        ollama_manager.stop()
         # The meter timer, the error-light timers, and the
         # sparkline timers are parented to the window, but close()
         # only hides a top-level window -- the timers would keep

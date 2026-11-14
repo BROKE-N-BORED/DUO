@@ -1,15 +1,24 @@
-"""Ollama over localhost HTTP: the client, its retry rules,
-and the server manager. Stdlib only.
+"""Ollama over localhost HTTP: the client and its retry rules.
+Stdlib only.
 
 Split out of dual_chat.py in v0.25 (audit T14). The retry
 constants live here: the client reads them from this module.
+
+v0.49: the client now matches Code Forge's robustness -- a
+transient HTTP 500 (the llama-server start timeout) is retried
+like a dropped connection, every chat request carries
+keep_alive "30m" so models stay loaded for the session, the
+model list is retried before falling back, and the final error
+is decided by what the attempts actually failed with, not by a
+fresh probe that can itself fail under load. The Start Ollama
+button and the server manager are gone: DUO no longer starts
+Ollama, it stays connected to the one that is running.
 """
 
 import json
 import os
 import shutil
 import subprocess
-import threading
 import time
 import urllib.error
 import urllib.request
@@ -25,14 +34,6 @@ MSG_OLLAMA_DOWN = "Ollama isn't running. Start Ollama and try again."
 
 
 MSG_OLLAMA_SLOW = "Ollama is slow or busy right now. Try again in a moment."
-
-
-MSG_OLLAMA_NOT_INSTALLED = (
-    "Ollama isn't installed on this computer, so DUO can't start it.")
-
-
-MSG_OLLAMA_START_FAILED = (
-    "Ollama didn't start. Try starting it yourself and try again.")
 
 
 MSG_MODEL_FAILED = "That model couldn't be loaded. Pick another model and try again."
@@ -51,6 +52,37 @@ CHAT_MAX_ATTEMPTS = 3
 
 
 CHAT_RETRY_DELAYS = (2.0, 5.0)  # pause before attempt 2, then attempt 3
+
+
+# Code Forge sends keep_alive "30m" on every chat request (its Audit
+# B20): Ollama's 5-minute default unloads the model during any wait
+# past five minutes, and the next generation pays a full reload from
+# disk. DUO sends the same value, so a model stays loaded for the
+# session instead of unloading between turns.
+CHAT_KEEP_ALIVE = "30m"
+
+
+# StartFix (Code Forge, 2026-11-11): Ollama refusing a generation
+# with HTTP 500 "timed out waiting for llama-server to start" means
+# it gave up waiting for the model's runner process to come up --
+# on a hard-drive machine, usually while the disk is busy loading
+# or swapping models. The failure is transient and precedes any
+# token, so it is retried like a dropped connection. Any other HTTP
+# error is still a plain model failure, never retried.
+LLAMA_START_TIMEOUT_MARKER = "timed out waiting for llama-server to start"
+
+
+# The model list (/api/tags) gets the same patience as a turn: one
+# 5s attempt under a pegged CPU is not enough evidence that Ollama
+# is down. Three attempts at Code Forge's 8s timeout, then the
+# `ollama list` fallback.
+TAGS_TIMEOUT = 8
+
+
+TAGS_MAX_ATTEMPTS = 3
+
+
+TAGS_RETRY_DELAYS = (1.0, 2.0)  # pause before attempt 2, then attempt 3
 
 
 class OllamaError(Exception):
@@ -193,6 +225,12 @@ def check_for_update(current_version, url=None, timeout=UPDATE_CHECK_TIMEOUT,
     return ("latest", None)
 
 
+def llama_start_timeout(detail):
+    """True when an Ollama error body is the llama-server start
+    timeout -- Ollama's own wording, matched on the body text."""
+    return LLAMA_START_TIMEOUT_MARKER in (detail or "").lower()
+
+
 def _ollama_failure_kind(exc):
     """Classify a chat failure: "down" when Ollama refused the
     connection (nothing listening), "slow" when it timed out (up but
@@ -228,12 +266,27 @@ class OllamaClient:
         self.base_url = (base_url or os.environ.get(OLLAMA_URL_ENV)
                          or DEFAULT_OLLAMA_URL).rstrip("/")
 
-    def list_models(self, timeout=5):
+    def _fetch_tags_payload(self, timeout=TAGS_TIMEOUT):
+        """The /api/tags JSON payload, retried like a turn: a slow
+        Ollama under load can miss one short attempt, and that is
+        not evidence it is down. Raises the last error when every
+        attempt fails, so the caller falls back to `ollama list`."""
+        last_error = None
+        for attempt in range(1, TAGS_MAX_ATTEMPTS + 1):
+            try:
+                req = urllib.request.Request(self.base_url + "/api/tags")
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    return json.loads(resp.read().decode("utf-8"))
+            except Exception as exc:  # noqa: BLE001 - retried, then fallback
+                last_error = exc
+                if attempt < TAGS_MAX_ATTEMPTS:
+                    time.sleep(TAGS_RETRY_DELAYS[attempt - 1])
+        raise last_error
+
+    def list_models(self, timeout=TAGS_TIMEOUT):
         """Return installed model names, or raise OllamaError."""
         try:
-            req = urllib.request.Request(self.base_url + "/api/tags")
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                return parse_tags_payload(json.loads(resp.read().decode("utf-8")))
+            return parse_tags_payload(self._fetch_tags_payload(timeout))
         except Exception:
             pass  # Fall through to the `ollama list` fallback.
         try:
@@ -249,16 +302,14 @@ class OllamaClient:
         except Exception:
             raise OllamaError(MSG_OLLAMA_DOWN)
 
-    def list_models_with_sizes(self, timeout=5):
+    def list_models_with_sizes(self, timeout=TAGS_TIMEOUT):
         """Return installed models as [(name, size-in-bytes), ...],
         sorted by name, or raise OllamaError. Sizes come from
         /api/tags; the `ollama list` fallback has no sizes, so its
         entries carry None. A model with no size still lists -- the
         picker shows its name without a size."""
         try:
-            req = urllib.request.Request(self.base_url + "/api/tags")
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                return parse_tags_sizes(json.loads(resp.read().decode("utf-8")))
+            return parse_tags_sizes(self._fetch_tags_payload(timeout))
         except Exception:
             pass  # Fall through to the `ollama list` fallback.
         try:
@@ -274,19 +325,6 @@ class OllamaClient:
             raise
         except Exception:
             raise OllamaError(MSG_OLLAMA_DOWN)
-
-    def probe(self, timeout=5):
-        """True when Ollama answers /api/tags, False otherwise.
-
-        A fast liveness check: used between retries and by the Start
-        Ollama wait loop. Never raises."""
-        try:
-            req = urllib.request.Request(self.base_url + "/api/tags")
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                resp.read()
-            return True
-        except Exception:
-            return False
 
     def chat_stream(self, model, messages, on_chunk, cancel_event,
                     timeout=CHAT_TIMEOUT, on_metrics=None, on_retry=None,
@@ -313,12 +351,14 @@ class OllamaClient:
 
         Retry rule: failures BEFORE the first content chunk (connect
         refused, timeout waiting for the first token, connection cut
-        early) are retried up to CHAT_MAX_ATTEMPTS times, with a pause
-        between attempts that Stop interrupts at once. Once content
-        has streamed, a failure ends the turn: the partial text the
-        caller already received stays, and the turn fails with the
-        slow/busy message -- never retry a half-streamed turn, it
-        would duplicate the partial reply.
+        early, and Ollama's transient HTTP 500 "timed out waiting
+        for llama-server to start") are retried up to
+        CHAT_MAX_ATTEMPTS times, with a pause between attempts that
+        Stop interrupts at once. Once content has streamed, a
+        failure ends the turn: the partial text the caller already
+        received stays, and the turn fails with the slow/busy
+        message -- never retry a half-streamed turn, it would
+        duplicate the partial reply.
         """
         started = time.monotonic()
         for attempt in range(1, CHAT_MAX_ATTEMPTS + 1):
@@ -344,13 +384,15 @@ class OllamaClient:
     def _final_ollama_error(self, retryable):
         """The plain error for a turn that exhausted its retries.
 
-        A fresh probe decides the message: Ollama answering now means
-        it was slow or busy, not down -- never call a slow Ollama
-        "not running". Only a probe that fails too earns the down
-        message."""
-        if self.probe():
-            return OllamaError(MSG_OLLAMA_SLOW)
-        return OllamaError(MSG_OLLAMA_DOWN)
+        The last attempt's failure kind decides: a refused
+        connection means nothing is listening (Ollama is down); a
+        timeout or any other failure means Ollama was up but not
+        answering (slow or busy). No fresh probe -- under a pegged
+        CPU the probe itself can fail and misreport a busy Ollama
+        as down."""
+        if retryable.kind == "down":
+            return OllamaError(MSG_OLLAMA_DOWN)
+        return OllamaError(MSG_OLLAMA_SLOW)
 
     def _chat_attempt(self, model, messages, on_chunk, cancel_event,
                       timeout, started, on_metrics, options=None):
@@ -360,7 +402,8 @@ class OllamaClient:
         failure after content already streamed), or _Retryable (a
         failure before any content streamed -- safe to try again).
         """
-        payload = {"model": model, "messages": messages, "stream": True}
+        payload = {"model": model, "messages": messages, "stream": True,
+                   "keep_alive": CHAT_KEEP_ALIVE}
         if options is not None:
             payload["options"] = options
         body = json.dumps(payload).encode("utf-8")
@@ -370,14 +413,17 @@ class OllamaClient:
         try:
             resp = urllib.request.urlopen(req, timeout=timeout)
         except urllib.error.HTTPError as exc:
-            # Ollama answered with a status: it is up, and a missing
-            # model will not fix itself by retrying.
+            # Ollama answered with a status. One 500 is transient:
+            # the llama-server start timeout (Code Forge's StartFix)
+            # means the model wasn't up yet -- retry it like a
+            # dropped connection. Anything else is a model failure
+            # a retry cannot fix.
             try:
                 detail = json.loads(exc.read().decode("utf-8")).get("error", "")
             except Exception:
                 detail = ""
-            if "not found" in detail.lower() or "model" in detail.lower():
-                raise OllamaError(MSG_MODEL_FAILED)
+            if llama_start_timeout(detail):
+                raise _Retryable(exc, "slow")
             raise OllamaError(MSG_MODEL_FAILED)
         except Exception as exc:
             raise _Retryable(exc, _ollama_failure_kind(exc))
@@ -440,105 +486,3 @@ class OllamaClient:
                 return parse_ps_payload(json.loads(resp.read().decode("utf-8")))
         except Exception:
             raise OllamaError(MSG_OLLAMA_DOWN)
-
-
-class OllamaServerManager:
-    """Starts `ollama serve` from inside DUO and cleans it up.
-
-    Only ever manages a server DUO itself started: the process handle
-    is tracked here, and stop() terminates just that process. A server
-    the user started themselves is never touched.
-
-    start() is blocking (it waits for the probe, up to ``timeout``
-    seconds) -- call it off the GUI thread. It returns (ok, message):
-    ok is True with "Ollama is running." on success, False with a
-    plain-language reason otherwise.
-    """
-
-    START_TIMEOUT = 15.0
-    PROBE_INTERVAL = 0.5
-
-    def __init__(self, client):
-        self.client = client
-        self._process = None
-        self._lock = threading.Lock()
-
-    @property
-    def running(self):
-        """True while a DUO-started server process is alive."""
-        with self._lock:
-            return self._process is not None and self._process.poll() is None
-
-    def start(self, timeout=None):
-        """Start Ollama if it is not already answering.
-
-        Already running (by anyone) counts as success -- nothing is
-        spawned. Returns (ok, message); never raises.
-        """
-        if timeout is None:
-            timeout = self.START_TIMEOUT
-        try:
-            if self.client.probe():
-                return True, "Ollama is running."
-        except Exception:
-            pass
-        if shutil.which("ollama") is None:
-            return False, MSG_OLLAMA_NOT_INSTALLED
-        with self._lock:
-            process = self._process
-        if process is not None and process.poll() is None:
-            # A previous start is still coming up: wait on it instead
-            # of spawning a second server and orphaning the first.
-            pass
-        else:
-            try:
-                process = subprocess.Popen(
-                    ["ollama", "serve"],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                    stdin=subprocess.DEVNULL, start_new_session=True)
-            except OSError:
-                return False, MSG_OLLAMA_START_FAILED
-            with self._lock:
-                self._process = process
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            try:
-                if self.client.probe(timeout=2):
-                    return True, "Ollama is running."
-            except Exception:
-                pass
-            if process.poll() is not None:
-                # The server died on its own (already running under
-                # another user, bad install, ...): one last probe in
-                # case another server is actually answering.
-                try:
-                    if self.client.probe(timeout=2):
-                        return True, "Ollama is running."
-                except Exception:
-                    pass
-                with self._lock:
-                    self._process = None
-                return False, MSG_OLLAMA_START_FAILED
-            time.sleep(self.PROBE_INTERVAL)
-        return False, MSG_OLLAMA_START_FAILED
-
-    def stop(self):
-        """Stop the server DUO started, if it is still running.
-
-        Terminates only DUO's own process; a server started any other
-        way is left alone. Never raises."""
-        with self._lock:
-            process = self._process
-            self._process = None
-        if process is None:
-            return
-        try:
-            if process.poll() is None:
-                process.terminate()
-                try:
-                    process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait(timeout=5)
-        except Exception:
-            pass

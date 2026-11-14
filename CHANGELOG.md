@@ -1,7 +1,28 @@
 # DUO changelog
 
 Every version, newest first. v0.1–v0.17 were built on 2026-11-12;
-v0.18–v0.35 on 2026-11-13; v0.36–v0.48 on 2026-11-14.
+v0.18–v0.35 on 2026-11-13; v0.36–v0.49 on 2026-11-14.
+
+## v0.49 — 2026-11-14
+
+The Ollama connection fixed, and the Start Ollama button gone.
+DUO used to drop Ollama where Code Forge never did: a turn that
+hit Ollama's transient "timed out waiting for llama-server to
+start" died on the spot instead of retrying, models unloaded
+after five idle minutes because DUO sent no keep-alive, the
+model list got one short attempt before giving up, and a slow
+probe under load could call a busy Ollama "not running". All
+four are fixed in the client now: the start timeout is retried
+like a dropped connection, every chat request carries keep-alive
+"30m" so models stay loaded for the session, the model list gets
+three attempts at eight seconds, and the down-or-slow error comes
+from what the attempts actually failed with — a refused
+connection means down, anything else means slow or busy. The
+Start Ollama button is removed entirely — DUO no longer starts
+Ollama, it stays connected to the one that is running. The
+plain-language Ollama errors stay: they only fire when Ollama is
+genuinely unreachable now, and the remedy is starting Ollama
+yourself (`ollama serve` in a terminal).
 
 ## v0.48 — 2026-11-14
 

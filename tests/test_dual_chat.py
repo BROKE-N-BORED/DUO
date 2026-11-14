@@ -37,8 +37,7 @@ from dual_chat import (  # noqa: E402
     HIST_TRANSCRIPT_MIN_HEIGHT,
     MAX_ATTACHMENTS,
     MAX_ATTACHMENT_BYTES, MODEL_FIT_RESERVE_BYTES, MSG_EMPTY,
-    MSG_MODEL_FAILED, MSG_OLLAMA_DOWN,
-    MSG_OLLAMA_NOT_INSTALLED, MSG_OLLAMA_SLOW, MSG_OLLAMA_START_FAILED,
+    MSG_MODEL_FAILED, MSG_OLLAMA_DOWN, MSG_OLLAMA_SLOW,
     MSG_PHONE_BUSY, MSG_PHONE_RELAY, MSG_PHONE_TARGET,
     MSG_UPDATE_AVAILABLE, MSG_UPDATE_FAILED, MSG_UPDATE_LATEST,
     SETTINGS_APP, SETTINGS_ORG, SETTING_DIRECTOR_COLLAPSED,
@@ -59,7 +58,7 @@ from dual_chat import (  # noqa: E402
     ChatMessage, ChatSide, Conversation, ConversationError, DeckServer,
     HISTORY_BUDGET_CHARS,
     NoModelSelected,
-    OllamaClient, OllamaError, OllamaServerManager, RelaySession,
+    OllamaClient, OllamaError, RelaySession,
     SUMMARY_KEEP_LAST, SUMMARY_LABEL, SUMMARIZE_PROMPT, SerialRunner,
     SingleInstance,
     TaskSession, TranscriptError, append_full_log_entry, attachment_tag,
@@ -5034,12 +5033,23 @@ class FlakyOllamaHandler(FakeOllamaHandler):
     mode "fail_always": drop every /api/chat request. /api/tags still
     answers, so the probe says Ollama is up.
     mode "drop_after_two": stream two chunks, then cut the connection.
-    chat_posts counts the /api/chat requests the server saw.
+    mode "llama_500_n": answer the first fail_n /api/chat requests
+    with HTTP 500 "timed out waiting for llama-server to start"
+    (Ollama's transient start timeout), then serve normally.
+    mode "tags_fail": drop every /api/tags request; /api/chat serves
+    normally -- a broken tags endpoint must not poison a chat.
+    mode "tags_fail_n": drop the first fail_n /api/tags requests,
+    then serve normally.
+    mode "chat_and_tags_fail": drop every /api/chat and every
+    /api/tags request -- both endpoints down at once.
+    chat_posts counts the /api/chat requests the server saw;
+    tags_gets counts the /api/tags requests.
     """
 
     mode = "fail_n"
     fail_n = 0
     chat_posts = 0
+    tags_gets = 0
 
     def _drop(self):
         # RST, not a clean FIN: a clean close after content would look
@@ -5056,6 +5066,18 @@ class FlakyOllamaHandler(FakeOllamaHandler):
         except OSError:
             pass
 
+    def do_GET(self):
+        if self.path == "/api/tags":
+            type(self).tags_gets += 1
+            if self.mode in ("tags_fail", "chat_and_tags_fail"):
+                self._drop()
+                return
+            if (self.mode == "tags_fail_n"
+                    and type(self).tags_gets <= self.fail_n):
+                self._drop()
+                return
+        return super().do_GET()
+
     def do_POST(self):
         if self.path != "/api/chat":
             return super().do_POST()
@@ -5063,8 +5085,20 @@ class FlakyOllamaHandler(FakeOllamaHandler):
         if self.mode == "fail_always":
             self._drop()
             return
+        if self.mode == "chat_and_tags_fail":
+            self._drop()
+            return
         if self.mode == "fail_n" and type(self).chat_posts <= self.fail_n:
             self._drop()
+            return
+        if self.mode == "llama_500_n" and type(self).chat_posts <= self.fail_n:
+            # Read the body first so the client sees a clean 500,
+            # not a reset.
+            length = int(self.headers.get("Content-Length") or 0)
+            self.rfile.read(length)
+            self._send_json(
+                {"error": "timed out waiting for llama-server to start"},
+                status=500)
             return
         if self.mode == "drop_after_two":
             # Stream two chunks without reading the request body, give
@@ -5093,6 +5127,7 @@ def start_flaky_server(mode, fail_n=0):
     Flaky.mode = mode
     Flaky.fail_n = fail_n
     Flaky.chat_posts = 0
+    Flaky.tags_gets = 0
     server = ThreadingHTTPServer(("127.0.0.1", 0), Flaky)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -5104,15 +5139,19 @@ class OllamaClientRetryTests(unittest.TestCase):
 
     def setUp(self):
         # Fast backoff in tests; the production pauses are seconds.
-        # The constant lives in duo_ollama since the v0.25 split --
-        # patch it there, where the client reads it.
+        # The constants live in duo_ollama since the v0.25 split --
+        # patch them there, where the client reads them.
         self._patcher = mock.patch("duo_ollama.CHAT_RETRY_DELAYS",
                                    (0.01, 0.01))
         self._patcher.start()
+        self._tags_patcher = mock.patch("duo_ollama.TAGS_RETRY_DELAYS",
+                                        (0.01, 0.01))
+        self._tags_patcher.start()
         self._servers = []
 
     def tearDown(self):
         self._patcher.stop()
+        self._tags_patcher.stop()
         for server in self._servers:
             server.shutdown()
             server.server_close()
@@ -5145,8 +5184,9 @@ class OllamaClientRetryTests(unittest.TestCase):
         self.assertEqual(str(ctx.exception), MSG_OLLAMA_DOWN)
 
     def test_retry_exhausted_when_ollama_slow(self):
-        # The server answers /api/tags (so the probe says up) but drops
-        # every /api/chat: slow/busy, never "not running".
+        # The server drops every /api/chat: slow/busy, never
+        # "not running". The error comes from what the attempts
+        # failed with, not from a probe.
         handler, url = self._start("fail_always")
         client = OllamaClient(url)
         with self.assertRaises(OllamaError) as ctx:
@@ -5155,6 +5195,100 @@ class OllamaClientRetryTests(unittest.TestCase):
                 lambda t: None, threading.Event())
         self.assertEqual(str(ctx.exception), MSG_OLLAMA_SLOW)
         self.assertEqual(handler.chat_posts, CHAT_MAX_ATTEMPTS)
+
+    def test_llama_start_timeout_is_retried(self):
+        # v0.49 (Code Forge's StartFix): Ollama's transient HTTP 500
+        # "timed out waiting for llama-server to start" is retried
+        # like a dropped connection -- the turn completes instead
+        # of dying on a model that just wasn't up yet.
+        handler, url = self._start("llama_500_n", fail_n=1)
+        client = OllamaClient(url)
+        seen = []
+        full = client.chat_stream(
+            "fake-a:latest", [{"role": "user", "content": "hi"}],
+            seen.append, threading.Event())
+        self.assertEqual(full, "Hello from A.")
+        self.assertEqual(seen, ["Hello ", "from A."])
+        self.assertEqual(handler.chat_posts, 2)
+
+    def test_other_http_errors_are_not_retried(self):
+        # The retry is only for the llama-server start timeout: a
+        # real model failure (unknown model, HTTP 404) still fails
+        # at once with the model message, after one request.
+        handler, url = self._start("fail_n")
+        client = OllamaClient(url)
+        with self.assertRaises(OllamaError) as ctx:
+            client.chat_stream(
+                "no-such-model:latest",
+                [{"role": "user", "content": "hi"}],
+                lambda t: None, threading.Event())
+        self.assertEqual(str(ctx.exception), MSG_MODEL_FAILED)
+        self.assertEqual(handler.chat_posts, 1)
+
+    def test_chat_sends_keep_alive(self):
+        # v0.49 (Code Forge's Audit B20): every chat request carries
+        # keep_alive "30m", so the model stays loaded for the
+        # session instead of unloading after Ollama's 5-minute
+        # default and paying a full reload on the next turn.
+        FakeOllamaHandler.bodies.clear()
+        _, url = self._start("fail_n")
+        client = OllamaClient(url)
+        client.chat_stream(
+            "fake-a:latest", [{"role": "user", "content": "hi"}],
+            lambda t: None, threading.Event())
+        self.assertEqual(len(FakeOllamaHandler.bodies), 1)
+        self.assertEqual(FakeOllamaHandler.bodies[0].get("keep_alive"),
+                         "30m")
+
+    def test_tags_retry_succeeds_after_two_failures(self):
+        # v0.49: the model list is retried like a turn -- two
+        # dropped /api/tags attempts under load don't lose the
+        # list, the third attempt lands it.
+        handler, url = self._start("tags_fail_n", fail_n=2)
+        client = OllamaClient(url)
+        self.assertEqual(client.list_models(),
+                         ["fake-a:latest", "fake-b:latest"])
+        self.assertEqual(handler.tags_gets, 3)
+
+    def test_chat_succeeds_when_tags_is_broken(self):
+        # v0.49: /api/tags failing under load must not poison a
+        # chat -- the tags endpoint is dead here and the turn still
+        # completes, with no error at all.
+        _, url = self._start("tags_fail")
+        client = OllamaClient(url)
+        full = client.chat_stream(
+            "fake-a:latest", [{"role": "user", "content": "hi"}],
+            lambda t: None, threading.Event())
+        self.assertEqual(full, "Hello from A.")
+
+    def test_exhausted_retries_report_slow_when_tags_also_down(self):
+        # v0.49: when the chat attempts fail AND /api/tags is down
+        # too, the error is still slow/busy -- the attempts failed
+        # with dropped connections, not refusals. The old
+        # probe-based error would have misreported this as
+        # "Ollama isn't running".
+        handler, url = self._start("chat_and_tags_fail")
+        client = OllamaClient(url)
+        with self.assertRaises(OllamaError) as ctx:
+            client.chat_stream(
+                "fake-a:latest", [{"role": "user", "content": "hi"}],
+                lambda t: None, threading.Event())
+        self.assertEqual(str(ctx.exception), MSG_OLLAMA_SLOW)
+        self.assertEqual(handler.chat_posts, CHAT_MAX_ATTEMPTS)
+
+    def test_unreachable_ollama_plain_error_without_hang(self):
+        # v0.49 (c): a genuinely unreachable Ollama still produces
+        # the plain down error -- quickly, with no traceback and no
+        # hang. Nothing listens on port 9, so every attempt is a
+        # refused connection.
+        client = OllamaClient("http://127.0.0.1:9")
+        started = time.time()
+        with self.assertRaises(OllamaError) as ctx:
+            client.chat_stream(
+                "fake-a:latest", [{"role": "user", "content": "hi"}],
+                lambda t: None, threading.Event())
+        self.assertEqual(str(ctx.exception), MSG_OLLAMA_DOWN)
+        self.assertLess(time.time() - started, 30.0)
 
     def test_no_retry_once_content_streamed(self):
         handler, url = self._start("drop_after_two")
@@ -5209,139 +5343,6 @@ class OllamaClientRetryTests(unittest.TestCase):
         self.assertIn("slow or busy", MSG_OLLAMA_SLOW)
         self.assertNotIn("isn't running", MSG_OLLAMA_SLOW)
 
-    def test_probe_reports_up_and_down(self):
-        _, url = self._start("fail_n")
-        self.assertTrue(OllamaClient(url).probe())
-        self.assertFalse(OllamaClient("http://127.0.0.1:9").probe())
-
-
-def _free_port():
-    sock = socket.socket()
-    sock.bind(("127.0.0.1", 0))
-    port = sock.getsockname()[1]
-    sock.close()
-    return port
-
-
-_FAKE_OLLAMA_SCRIPT = """#!/usr/bin/env python3
-import sys
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-
-PORT = {port}
-
-
-class H(BaseHTTPRequestHandler):
-    def log_message(self, *a):
-        pass
-
-    def do_GET(self):
-        body = b'{"models": []}'
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-
-if sys.argv[1:] == ["serve"]:
-    ThreadingHTTPServer(("127.0.0.1", PORT), H).serve_forever()
-"""
-
-_FAKE_OLLAMA_SLEEPER = """#!/usr/bin/env python3
-import time
-
-time.sleep(120)
-"""
-
-
-class OllamaServerManagerTests(unittest.TestCase):
-    """Start Ollama from DUO, with a fake `ollama` on PATH."""
-
-    def setUp(self):
-        self.tmpdir = tempfile.mkdtemp(prefix="duo-ollama-test-")
-        self.managers = []
-
-    def tearDown(self):
-        for manager in self.managers:
-            manager.stop()
-        shutil.rmtree(self.tmpdir, ignore_errors=True)
-
-    def _write_fake_ollama(self, script):
-        path = os.path.join(self.tmpdir, "ollama")
-        with open(path, "w", encoding="utf-8") as fh:
-            fh.write(script)
-        os.chmod(path, 0o755)
-        return path
-
-    def _path_with_tmpdir(self):
-        return mock.patch.dict(
-            os.environ,
-            {"PATH": self.tmpdir + os.pathsep + os.environ["PATH"]})
-
-    def test_start_spawns_and_reports_running(self):
-        port = _free_port()
-        self._write_fake_ollama(
-            _FAKE_OLLAMA_SCRIPT.replace("{port}", str(port)))
-        client = OllamaClient("http://127.0.0.1:%d" % port)
-        manager = OllamaServerManager(client)
-        self.managers.append(manager)
-        with self._path_with_tmpdir():
-            ok, message = manager.start()
-        self.assertTrue(ok)
-        self.assertEqual(message, "Ollama is running.")
-        self.assertTrue(manager.running)
-        self.assertTrue(client.probe())
-
-    def test_stop_ends_only_duo_started_server(self):
-        port = _free_port()
-        self._write_fake_ollama(
-            _FAKE_OLLAMA_SCRIPT.replace("{port}", str(port)))
-        client = OllamaClient("http://127.0.0.1:%d" % port)
-        manager = OllamaServerManager(client)
-        self.managers.append(manager)
-        with self._path_with_tmpdir():
-            ok, _ = manager.start()
-        self.assertTrue(ok)
-        manager.stop()
-        self.assertFalse(manager.running)
-        self.assertFalse(client.probe())
-
-    def test_start_when_already_running_spawns_nothing(self):
-        server, url = start_fake_server()
-        try:
-            manager = OllamaServerManager(OllamaClient(url))
-            self.managers.append(manager)
-            ok, message = manager.start()
-            self.assertTrue(ok)
-            self.assertEqual(message, "Ollama is running.")
-            self.assertFalse(manager.running)
-        finally:
-            server.shutdown()
-            server.server_close()
-
-    def test_start_without_ollama_installed(self):
-        client = OllamaClient("http://127.0.0.1:9")
-        manager = OllamaServerManager(client)
-        self.managers.append(manager)
-        with mock.patch("dual_chat.shutil.which", return_value=None):
-            ok, message = manager.start()
-        self.assertFalse(ok)
-        self.assertEqual(message, MSG_OLLAMA_NOT_INSTALLED)
-
-    def test_start_times_out_when_server_never_answers(self):
-        self._write_fake_ollama(_FAKE_OLLAMA_SLEEPER)
-        port = _free_port()
-        client = OllamaClient("http://127.0.0.1:%d" % port)
-        manager = OllamaServerManager(client)
-        self.managers.append(manager)
-        with self._path_with_tmpdir():
-            ok, message = manager.start(timeout=1)
-        self.assertFalse(ok)
-        self.assertEqual(message, MSG_OLLAMA_START_FAILED)
-
-    def test_stop_without_start_is_a_noop(self):
-        manager = OllamaServerManager(OllamaClient("http://127.0.0.1:9"))
-        manager.stop()  # must not raise
 
 
 class DebugFilenameTests(unittest.TestCase):
@@ -5351,292 +5352,6 @@ class DebugFilenameTests(unittest.TestCase):
                          "duo-debug-report-2026-11-12.txt")
         self.assertTrue(default_debug_filename().startswith(
             "duo-debug-report-"))
-
-
-@unittest.skipUnless(os.environ.get("DUAL_CHAT_GUI_TESTS") == "1",
-                     "GUI tests run with DUAL_CHAT_GUI_TESTS=1")
-class StartOllamaGuiTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        from PySide6.QtWidgets import QApplication
-        cls.app = QApplication.instance() or QApplication([])
-        cls.client = FakeGuiClient()
-
-    def setUp(self):
-        from dual_chat import build_window
-        self.client.reset()
-        self.window = build_window(self.client, logger=TEST_LOGGER)
-        self.window.show()
-        self.state = self.window._dual_chat
-        self._wait_for(lambda: self.state["widgets"]["A"]["picker"].count() == 2)
-
-    def tearDown(self):
-        self.window.close()
-
-    def _wait_for(self, cond, timeout=10.0):
-        from PySide6.QtTest import QTest
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            QTest.qWait(50)
-            if cond():
-                return True
-        return cond()
-
-    def _pick_models(self):
-        self.state["widgets"]["A"]["picker"].setCurrentIndex(0)
-        self.state["widgets"]["B"]["picker"].setCurrentIndex(1)
-        self.app.processEvents()
-
-    def test_start_button_visible_but_disabled_while_ollama_answers(self):
-        # v0.35 (T23): the button is always in the bottom row now --
-        # visible at startup, greyed out while Ollama answers, so it
-        # can never start a second server while one is running.
-        self.state["set_director_collapsed"](False)
-        self.app.processEvents()
-        btn = self.state["start_ollama_btn"]
-        self.assertTrue(btn.isVisible())
-        self.assertFalse(btn.isEnabled())
-
-    def test_start_button_enables_when_models_fail(self):
-        from dual_chat import build_window
-
-        class DownClient:
-            def list_models(self, timeout=5):
-                raise OllamaError(MSG_OLLAMA_DOWN)
-
-            def chat_stream(self, *a, **k):
-                raise OllamaError(MSG_OLLAMA_DOWN)
-
-            def probe(self, timeout=5):
-                return False
-
-            def running_models(self, timeout=5):
-                return {}
-
-        window = build_window(DownClient(), logger=TEST_LOGGER)
-        try:
-            window.show()
-            state = window._dual_chat
-            self.assertTrue(self._wait_for(
-                lambda: state["start_ollama_btn"].isEnabled(),
-                timeout=10))
-        finally:
-            window.close()
-
-    def test_slow_failure_enables_button_and_note(self):
-        from dual_chat import build_window
-
-        class SlowClient(FakeGuiClient):
-            def chat_stream(self, model, messages, on_chunk,
-                            cancel_event, timeout=1800, on_metrics=None,
-                            on_retry=None, options=None):
-                raise OllamaError(MSG_OLLAMA_SLOW)
-
-        window = build_window(SlowClient(), logger=TEST_LOGGER)
-        try:
-            window.show()
-            state = window._dual_chat
-            self.assertTrue(self._wait_for(
-                lambda: state["widgets"]["A"]["picker"].count() == 2))
-            state["widgets"]["A"]["picker"].setCurrentIndex(0)
-            self.app.processEvents()
-            state["composer"].setPlainText("hello")
-            state["send_a"].click()
-            pane = state["widgets"]["A"]["transcript"]
-            self.assertTrue(self._wait_for(
-                lambda: "slow or busy" in pane.toPlainText(), timeout=10))
-            self.assertTrue(state["start_ollama_btn"].isEnabled())
-        finally:
-            window.close()
-
-    def test_slow_relay_stop_has_no_double_period(self):
-        from dual_chat import build_window
-
-        class SlowClient(FakeGuiClient):
-            def chat_stream(self, model, messages, on_chunk,
-                            cancel_event, timeout=1800, on_metrics=None,
-                            on_retry=None, options=None):
-                raise OllamaError(MSG_OLLAMA_SLOW)
-
-        window = build_window(SlowClient(), logger=TEST_LOGGER)
-        try:
-            window.show()
-            state = window._dual_chat
-            self.assertTrue(self._wait_for(
-                lambda: state["widgets"]["A"]["picker"].count() == 2))
-            state["widgets"]["A"]["picker"].setCurrentIndex(0)
-            state["widgets"]["B"]["picker"].setCurrentIndex(1)
-            self.app.processEvents()
-            state["cap_spin"].setValue(2)
-            state["composer"].setPlainText("go")
-            state["relay_btn"].click()
-            self.assertTrue(self._wait_for(
-                lambda: state["relay_status"].text().startswith(
-                    "Relay stopped"), timeout=10))
-            self.assertNotIn("..", state["relay_status"].text())
-            self.assertTrue(
-                state["relay_status"].text().endswith("moment."))
-        finally:
-            window.close()
-
-    def test_model_failure_keeps_button_disabled(self):
-        from dual_chat import build_window
-
-        class BadModelClient(FakeGuiClient):
-            def chat_stream(self, model, messages, on_chunk,
-                            cancel_event, timeout=1800, on_metrics=None,
-                            on_retry=None, options=None):
-                raise OllamaError(MSG_MODEL_FAILED)
-
-        window = build_window(BadModelClient(), logger=TEST_LOGGER)
-        try:
-            window.show()
-            state = window._dual_chat
-            self.assertTrue(self._wait_for(
-                lambda: state["widgets"]["A"]["picker"].count() == 2))
-            state["widgets"]["A"]["picker"].setCurrentIndex(0)
-            self.app.processEvents()
-            state["composer"].setPlainText("hello")
-            state["send_a"].click()
-            pane = state["widgets"]["A"]["transcript"]
-            self.assertTrue(self._wait_for(
-                lambda: "couldn't be loaded" in pane.toPlainText(),
-                timeout=10))
-            self.assertFalse(state["start_ollama_btn"].isEnabled())
-        finally:
-            window.close()
-
-    def test_click_start_when_already_running(self):
-        # The fake client probes True, so the real manager reports
-        # running without spawning anything.
-        self.state["set_ollama_down"](True)
-        self.app.processEvents()
-        self.assertTrue(self.state["start_ollama_btn"].isEnabled())
-        self.window.statusBar().clearMessage()
-        self.state["start_ollama_btn"].click()
-        # The starter reports back, the model list reloads, and the
-        # button greys out again: Ollama answers, so there is
-        # nothing left to start.
-        self.assertTrue(self._wait_for(
-            lambda: "Ollama connected" in
-            self.state["status_label"].text(), timeout=10))
-        self.assertFalse(self.state["start_ollama_btn"].isEnabled())
-        self.assertFalse(self.state["ollama_manager"].running)
-
-    def test_click_start_failure_keeps_button_enabled(self):
-        manager = self.state["ollama_manager"]
-        manager.start = lambda timeout=None: (
-            False, "Ollama didn't start. Try starting it yourself.")
-        self.state["set_director_collapsed"](False)
-        self.state["set_ollama_down"](True)
-        self.app.processEvents()
-        self.state["start_ollama_btn"].click()
-        self.assertTrue(self._wait_for(
-            lambda: "didn't start" in
-            self.state["status_label"].text(), timeout=10))
-        self.assertTrue(self.state["start_ollama_btn"].isVisible())
-        self.assertTrue(self.state["start_ollama_btn"].isEnabled())
-
-    def test_close_stops_duo_started_server(self):
-        manager = self.state["ollama_manager"]
-        recorder = mock.Mock()
-        manager.stop = recorder
-        self.window.close()
-        self.app.processEvents()
-        self.assertTrue(recorder.called)
-
-
-@unittest.skipUnless(os.environ.get("DUAL_CHAT_GUI_TESTS") == "1",
-                     "GUI tests run with DUAL_CHAT_GUI_TESTS=1")
-class StartOllamaPlacementGuiTests(unittest.TestCase):
-    """v0.35 (audit T23): the Start Ollama button lives in the
-    bottom button row now, always visible, enabled only while
-    Ollama is down. Nothing of it is left in the status bar."""
-
-    @classmethod
-    def setUpClass(cls):
-        from PySide6.QtWidgets import QApplication
-        cls.app = QApplication.instance() or QApplication([])
-        cls.client = FakeGuiClient()
-
-    def setUp(self):
-        from dual_chat import build_window
-        self.client.reset()
-        self.window = build_window(self.client, logger=TEST_LOGGER)
-        self.window.show()
-        self.state = self.window._dual_chat
-        self._wait_for(lambda: self.state["widgets"]["A"]["picker"].count() == 2)
-        self._pick_models()
-
-    def tearDown(self):
-        self.window.close()
-        self.app.processEvents()
-
-    def _wait_for(self, cond, timeout=10.0):
-        from PySide6.QtTest import QTest
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            QTest.qWait(50)
-            if cond():
-                return True
-        return cond()
-
-    def _pick_models(self):
-        self.state["widgets"]["A"]["picker"].setCurrentIndex(0)
-        self.state["widgets"]["B"]["picker"].setCurrentIndex(1)
-        self.app.processEvents()
-
-    def test_button_lives_in_the_bottom_button_row(self):
-        btn = self.state["start_ollama_btn"]
-        self.assertIs(btn.parent(), self.state["director"])
-        # The row layout holds the button next to Phone deck and
-        # Check for updates -- the app-level actions.
-        found = False
-        layout = self.state["director"].layout()
-        for i in range(layout.count()):
-            row = layout.itemAt(i).layout()
-            if row is None:
-                continue
-            widgets = [row.itemAt(j).widget()
-                       for j in range(row.count())]
-            texts = [w.text() for w in widgets
-                     if w is not None and hasattr(w, "text")]
-            if "Start Ollama" in texts:
-                found = True
-                self.assertIn("Phone deck", texts)
-                self.assertIn("Check for updates", texts)
-        self.assertTrue(found)
-
-    def test_no_button_left_in_the_status_bar(self):
-        from PySide6 import QtWidgets
-        bar = self.window.statusBar()
-        self.assertEqual(bar.findChildren(QtWidgets.QPushButton), [])
-        # The meter is still there: the status bar keeps its
-        # status message and the system meter, nothing else.
-        self.assertIs(self.state["meter_label"].parent(), bar)
-
-    def test_button_disabled_while_models_loading(self):
-        # Reachability is unknown until the probe lands, so the
-        # button stays off even when Ollama was last down.
-        self.state["set_ollama_down"](True)
-        self.assertTrue(self.state["start_ollama_btn"].isEnabled())
-        self.state["state"]["models_loading"] = True
-        self.state["set_ollama_down"](True)  # re-runs refresh
-        self.assertFalse(self.state["start_ollama_btn"].isEnabled())
-        self.state["state"]["models_loading"] = False
-        self.state["set_ollama_down"](True)
-        self.assertTrue(self.state["start_ollama_btn"].isEnabled())
-
-    def test_button_disabled_while_a_start_is_in_flight(self):
-        # A second click mid-start must not start a second server.
-        self.state["set_ollama_down"](True)
-        self.assertTrue(self.state["start_ollama_btn"].isEnabled())
-        self.state["state"]["ollama_starting"] = True
-        self.state["set_ollama_down"](True)  # re-runs refresh
-        self.assertFalse(self.state["start_ollama_btn"].isEnabled())
-        self.state["state"]["ollama_starting"] = False
-        self.state["set_ollama_down"](True)
-        self.assertTrue(self.state["start_ollama_btn"].isEnabled())
 
 
 @unittest.skipUnless(os.environ.get("DUAL_CHAT_GUI_TESTS") == "1",
@@ -6006,6 +5721,61 @@ class DeckServerTests(unittest.TestCase):
         with self.assertRaises(urllib.error.URLError):
             urllib.request.urlopen(
                 "http://127.0.0.1:%d/" % port, timeout=5)
+
+
+@unittest.skipUnless(os.environ.get("DUAL_CHAT_GUI_TESTS") == "1",
+                     "GUI tests run with DUAL_CHAT_GUI_TESTS=1")
+class NoStartOllamaButtonGuiTests(unittest.TestCase):
+    """v0.49: the Start Ollama button is gone -- removed, not hidden.
+
+    DUO no longer starts Ollama; it stays connected to the one
+    that is running. No button, no state key, no starter anywhere
+    in the window."""
+
+    @classmethod
+    def setUpClass(cls):
+        from PySide6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+        cls.client = FakeGuiClient()
+
+    def setUp(self):
+        from dual_chat import build_window
+        self.window = build_window(self.client, logger=TEST_LOGGER)
+        self.window.show()
+        self.state = self.window._dual_chat
+        self._wait_for(lambda: self.state["widgets"]["A"]["picker"].count() == 2)
+
+    def tearDown(self):
+        self.window.close()
+
+    def _wait_for(self, cond, timeout=10.0):
+        from PySide6.QtTest import QTest
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            QTest.qWait(50)
+            if cond():
+                return True
+        return cond()
+
+    def test_no_start_ollama_button_anywhere(self):
+        # Not in the state dict, and no QPushButton in the whole
+        # window carries the text -- gone, not hidden.
+        from PySide6 import QtWidgets
+        self.assertNotIn("start_ollama_btn", self.state)
+        self.assertNotIn("ollama_manager", self.state)
+        self.assertNotIn("do_start_ollama", self.state)
+        self.assertNotIn("set_ollama_down", self.state)
+        texts = [btn.text() for btn in
+                 self.window.findChildren(QtWidgets.QPushButton)]
+        self.assertNotIn("Start Ollama", texts)
+        for text in texts:
+            self.assertNotIn("Ollama", text)
+
+    def test_button_row_keeps_its_other_buttons(self):
+        # The removal took only the one button: the rest of the
+        # bottom row is still there and visible.
+        for name in ("save_both", "debug_btn", "update_btn"):
+            self.assertTrue(self.state[name].isVisible())
 
 
 @unittest.skipUnless(os.environ.get("DUAL_CHAT_GUI_TESTS") == "1",
@@ -6797,7 +6567,7 @@ class FrontDoorTests(unittest.TestCase):
 
     def test_changelog_covers_every_version(self):
         log = self._read("CHANGELOG.md")
-        for version in ["0.%d" % n for n in range(1, 49)]:
+        for version in ["0.%d" % n for n in range(1, 50)]:
             self.assertIn(version, log)
 
     def test_gitignore_covers_runtime_files(self):
@@ -8894,7 +8664,6 @@ class ModuleSplitTests(unittest.TestCase):
             (dual_chat._Signals, duo_workers._Signals),
             (dual_chat._SignalObject, duo_workers._SignalObject),
             (dual_chat._ModelLoader, duo_workers._ModelLoader),
-            (dual_chat._OllamaStarter, duo_workers._OllamaStarter),
             (dual_chat._UpdateChecker, duo_workers._UpdateChecker),
             (dual_chat._qt, duo_workers._qt),
             (dual_chat._NullLogger, duo_debug._NullLogger),
@@ -11440,7 +11209,7 @@ class DirectorSectionsGuiTests(unittest.TestCase):
         director = self.state["director"]
         self.assertTrue(self.state["composer"].isVisible())
         self.assertTrue(self.state["send_a"].isVisible())
-        self.assertTrue(self.state["start_ollama_btn"].isVisible())
+        self.assertTrue(self.state["save_both"].isVisible())
         for name in ("relay", "pairs", "tasks"):
             toggle = self.state["%s_section_toggle" % name]
             body = self.state["%s_section" % name]
