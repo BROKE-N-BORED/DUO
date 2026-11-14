@@ -154,7 +154,10 @@ bash run.sh
   or task keeps running while the controls are hidden. The relay's
   status lives in a chip above the toggle — a dot and the turn
   count — so you can always see what a relay is doing and stop it,
-  collapsed or not.
+  collapsed or not. Inside the director, the controls live in
+  three sections — Relay, Pairs, Tasks — each with its own header
+  you click to open or close it; Relay starts open, Pairs and
+  Tasks start closed, and your choice is remembered.
 - DUO checks for a newer Release once at startup and says so in
   the status bar when one is out; the "Check for updates" button
   next to Phone deck runs the same check on demand. It never

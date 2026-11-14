@@ -1,7 +1,20 @@
 # DUO changelog
 
 Every version, newest first. v0.1–v0.17 were built on 2026-11-12;
-v0.18–v0.35 on 2026-11-13; v0.36 on 2026-11-14.
+v0.18–v0.35 on 2026-11-13; v0.36–v0.37 on 2026-11-14.
+
+## v0.37 — 2026-11-14
+
+The director's controls live in three collapsible sections now,
+under the message box and the button row, which stay visible:
+Relay, Pairs, and Tasks. Each section has its own header you
+click to open or close it, and DUO remembers your choice. Relay
+starts open, Pairs and Tasks start closed. The relay controls
+sit in two rows instead of one crammed row, so the stop-words
+field keeps a proper width even at the narrowest window size.
+Closing a section never stops running work — a relay running
+with its section closed still shows on the chip above the
+Director toggle.
 
 ## v0.36 — 2026-11-14
 

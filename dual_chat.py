@@ -306,7 +306,7 @@ def make_debug_logger(log_dir=None):
         return _NullLogger()
 
 APP_NAME = "DUO"
-APP_VERSION = "0.36"
+APP_VERSION = "0.37"
 
 # Plain-language messages shown in the panes. No tracebacks in the UI.
 MSG_STOPPED = "Stopped."
@@ -375,6 +375,10 @@ SETTING_ENTER_TO_SEND = "composer/enter_to_send"
 # Director bar (v0.31): whether the director area below the panes
 # is collapsed is remembered the same way.
 SETTING_DIRECTOR_COLLAPSED = "director/collapsed"
+# Director sections (v0.37, R4): each section's collapsed state is
+# remembered the same way. %s is the section key ("relay", "pairs",
+# "tasks"). Relay starts expanded, Pairs and Tasks start collapsed.
+SETTING_SECTION_COLLAPSED = "director/%s_collapsed"
 # Window finish (v0.15): the window's size/position and the pane
 # split are remembered the same way, saved when the window closes.
 SETTING_WINDOW_GEOMETRY = "window/geometry"
@@ -1096,32 +1100,82 @@ def build_window(client=None, logger=None, deck_port=None):
     btn_row.addWidget(start_ollama_btn)
     d_layout.addLayout(btn_row)
 
-    # --- relay row ---------------------------------------------------------
-    relay_row = QtWidgets.QHBoxLayout()
+    # --- director sections (v0.37, R4) -------------------------------
+    # Progressive disclosure: the director's controls live in three
+    # collapsible sections under the send path, each with its own
+    # header toggle in the Director toggle's style. The composer,
+    # the attach row, and the button row above stay always visible
+    # -- that is the core send path. Relay starts expanded (the
+    # relay is the heart of DUO); Pairs and Tasks start collapsed
+    # (set once, used occasionally). Each choice is remembered
+    # between runs. Collapsing a section hides only its controls:
+    # running work keeps going, and nothing ever auto-expands -- a
+    # relay running with its section collapsed still shows on the
+    # chip above the Director toggle.
+    def _make_section(name, key, default_collapsed):
+        toggle = QtWidgets.QPushButton()
+        toggle.setFlat(True)
+        body = QtWidgets.QWidget()
+        body_layout = QtWidgets.QVBoxLayout(body)
+        body_layout.setContentsMargins(0, 0, 0, 0)
+        body_layout.setSpacing(6)
+
+        def _apply(collapsed):
+            body.setVisible(not collapsed)
+            toggle.setText("%s %s" % (
+                name, "\u25b8" if collapsed else "\u25be"))
+
+        def _set_collapsed(collapsed):
+            _apply(collapsed)
+            prefs.setValue(SETTING_SECTION_COLLAPSED % key,
+                           bool(collapsed))
+            prefs.sync()
+
+        toggle.clicked.connect(
+            lambda: _set_collapsed(body.isVisible()))
+        _apply(prefs.value(SETTING_SECTION_COLLAPSED % key,
+                           default_collapsed, type=bool))
+        return toggle, body, body_layout, _set_collapsed
+
+    # --- relay section -------------------------------------------------
+    # The relay controls sit in TWO rows now (audit T24, subsumed
+    # by R4): one row held nine widgets and the stop-phrase field
+    # shrank to a sliver at 900 px. Row one starts the relay, row
+    # two stops it; the stop-phrase field stretches across the
+    # second row. The preset row lives here too -- presets are
+    # relay settings.
+    relay_toggle, relay_body, relay_layout, _set_relay_collapsed = \
+        _make_section("Relay", "relay", False)
+    d_layout.addWidget(relay_toggle)
+    d_layout.addWidget(relay_body)
+    relay_row1 = QtWidgets.QHBoxLayout()
     relay_btn = QtWidgets.QPushButton("Start Relay")
     relay_btn.setEnabled(False)
-    relay_row.addWidget(relay_btn)
-    relay_row.addWidget(QtWidgets.QLabel("Start with:"))
+    relay_row1.addWidget(relay_btn)
+    relay_row1.addWidget(QtWidgets.QLabel("Start with:"))
     start_picker = QtWidgets.QComboBox()
     start_picker.addItems(["A", "B"])
-    relay_row.addWidget(start_picker)
-    relay_row.addWidget(QtWidgets.QLabel("Turns:"))
+    relay_row1.addWidget(start_picker)
+    relay_row1.addWidget(QtWidgets.QLabel("Turns:"))
     cap_spin = QtWidgets.QSpinBox()
     cap_spin.setRange(RELAY_CAP_MIN, RELAY_CAP_MAX)
     cap_spin.setValue(RELAY_CAP_DEFAULT)
-    relay_row.addWidget(cap_spin)
+    relay_row1.addWidget(cap_spin)
     mode_picker = QtWidgets.QComboBox()
     mode_picker.addItems(["Blind", "Aware"])
-    relay_row.addWidget(mode_picker)
-    relay_row.addWidget(QtWidgets.QLabel("Stop on:"))
+    relay_row1.addWidget(mode_picker)
+    relay_row1.addStretch(1)
+    relay_layout.addLayout(relay_row1)
+    relay_row2 = QtWidgets.QHBoxLayout()
+    relay_row2.addWidget(QtWidgets.QLabel("Stop on:"))
     stop_edit = QtWidgets.QLineEdit()
     stop_edit.setPlaceholderText("words, separated by commas")
-    relay_row.addWidget(stop_edit, stretch=1)
+    relay_row2.addWidget(stop_edit, stretch=1)
     agree_check = QtWidgets.QCheckBox("Stop on agreement")
-    relay_row.addWidget(agree_check)
+    relay_row2.addWidget(agree_check)
     review_check = QtWidgets.QCheckBox("Review each hop")
-    relay_row.addWidget(review_check)
-    d_layout.addLayout(relay_row)
+    relay_row2.addWidget(review_check)
+    relay_layout.addLayout(relay_row2)
 
     # --- relay presets -----------------------------------------------------
     # Same layout as the saved-pairs row: a dropdown of what is saved,
@@ -1139,7 +1193,13 @@ def build_window(client=None, logger=None, deck_port=None):
     preset_delete = QtWidgets.QPushButton("Delete preset")
     preset_delete.setEnabled(False)
     preset_row.addWidget(preset_delete)
-    d_layout.addLayout(preset_row)
+    relay_layout.addLayout(preset_row)
+
+    # --- pairs section -------------------------------------------------
+    pairs_toggle, pairs_body, pairs_layout, _set_pairs_collapsed = \
+        _make_section("Pairs", "pairs", True)
+    d_layout.addWidget(pairs_toggle)
+    d_layout.addWidget(pairs_body)
 
     # --- saved pairs -------------------------------------------------------
     pair_row = QtWidgets.QHBoxLayout()
@@ -1155,7 +1215,13 @@ def build_window(client=None, logger=None, deck_port=None):
     pair_delete = QtWidgets.QPushButton("Delete pair")
     pair_delete.setEnabled(False)
     pair_row.addWidget(pair_delete)
-    d_layout.addLayout(pair_row)
+    pairs_layout.addLayout(pair_row)
+
+    # --- tasks section -------------------------------------------------
+    tasks_toggle, tasks_body, tasks_layout, _set_tasks_collapsed = \
+        _make_section("Tasks", "tasks", True)
+    d_layout.addWidget(tasks_toggle)
+    d_layout.addWidget(tasks_body)
 
     # --- task row ---------------------------------------------------------
     # Tasks (Item 6): hand a job to one model, and optionally have the
@@ -1163,7 +1229,7 @@ def build_window(client=None, logger=None, deck_port=None):
     task_edit = QtWidgets.QPlainTextEdit()
     task_edit.setPlaceholderText("Describe a task for one model...")
     task_edit.setFixedHeight(44)
-    d_layout.addWidget(task_edit)
+    tasks_layout.addWidget(task_edit)
 
     task_row = QtWidgets.QHBoxLayout()
     task_row.addWidget(QtWidgets.QLabel("Task:"))
@@ -1191,9 +1257,13 @@ def build_window(client=None, logger=None, deck_port=None):
     task_run.setEnabled(False)
     task_row.addWidget(task_run)
     task_row.addStretch(1)
-    d_layout.addLayout(task_row)
+    tasks_layout.addLayout(task_row)
 
     # --- hop review (shown only while a relay waits on a review) ----------
+    # It stays outside the sections on purpose: a review pause needs
+    # its Forward / Skip / Stop buttons reachable, and the Relay
+    # section might be collapsed. The box only appears while a relay
+    # waits, so it adds no permanent clutter.
     review_frame = QtWidgets.QFrame()
     review_frame.setFrameShape(QtWidgets.QFrame.StyledPanel)
     review_layout = QtWidgets.QVBoxLayout(review_frame)
@@ -3690,6 +3760,15 @@ def build_window(client=None, logger=None, deck_port=None):
         "menu_bar": menu_bar, "menu_actions": menu_actions,
         "director": director, "director_toggle": director_toggle,
         "set_director_collapsed": _set_director_collapsed,
+        "relay_section": relay_body,
+        "relay_section_toggle": relay_toggle,
+        "set_relay_collapsed": _set_relay_collapsed,
+        "pairs_section": pairs_body,
+        "pairs_section_toggle": pairs_toggle,
+        "set_pairs_collapsed": _set_pairs_collapsed,
+        "tasks_section": tasks_body,
+        "tasks_section_toggle": tasks_toggle,
+        "set_tasks_collapsed": _set_tasks_collapsed,
     }
 
     # Closing the window stops a server DUO itself started -- no orphan

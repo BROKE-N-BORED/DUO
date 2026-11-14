@@ -6656,7 +6656,7 @@ class FrontDoorTests(unittest.TestCase):
 
     def test_changelog_covers_every_version(self):
         log = self._read("CHANGELOG.md")
-        for version in ["0.%d" % n for n in range(1, 37)]:
+        for version in ["0.%d" % n for n in range(1, 38)]:
             self.assertIn(version, log)
 
     def test_gitignore_covers_runtime_files(self):
@@ -11071,6 +11071,327 @@ class PersistentStatusGuiTests(unittest.TestCase):
         self.assertEqual(self._note(), "Holding still.")
         self.assertIsNotNone(re.match(
             pattern, self.state["meter_label"].text()))
+
+
+@unittest.skipUnless(os.environ.get("DUAL_CHAT_GUI_TESTS") == "1",
+                     "GUI tests run with DUAL_CHAT_GUI_TESTS=1")
+class DirectorSectionsGuiTests(unittest.TestCase):
+    """v0.37 (redesign R4): the director's controls live in three
+    collapsible sections under the always-visible send path --
+    Relay (expanded by default), Pairs and Tasks (collapsed by
+    default). Each choice is remembered between runs, toggling
+    one section touches only that section, and collapsing never
+    stops running work. The relay controls sit in two rows now
+    (audit T24, subsumed by R4), so the stop-phrase field keeps
+    a sane width at the 900 px minimum window width. The update
+    check is stubbed, as in MenuBarGuiTests, so no test touches
+    the network."""
+
+    @classmethod
+    def setUpClass(cls):
+        from PySide6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+        cls.client = FakeGuiClient()
+
+    def setUp(self):
+        # The section choices are persisted, so clear them (and
+        # the director choice) before every window: each test
+        # starts from the defaults.
+        self._clear_section_settings()
+        from dual_chat import build_window
+        self._patcher = mock.patch(
+            "dual_chat.check_for_update",
+            return_value=("latest", None))
+        self._patcher.start()
+        self.client.reset()
+        self.window = build_window(self.client, logger=TEST_LOGGER)
+        self.window.show()
+        self.state = self.window._dual_chat
+        self._wait_for(lambda: self.state["widgets"]["A"]["picker"].count() == 2)
+        self._pick_models()
+
+    def tearDown(self):
+        self.window.close()
+        self.app.processEvents()
+        self._patcher.stop()
+        self._clear_section_settings()
+
+    def _clear_section_settings(self):
+        from PySide6.QtCore import QSettings
+        from dual_chat import SETTING_DIRECTOR_COLLAPSED
+        from dual_chat import SETTING_SECTION_COLLAPSED
+        settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
+        settings.remove(SETTING_DIRECTOR_COLLAPSED)
+        for key in ("relay", "pairs", "tasks"):
+            settings.remove(SETTING_SECTION_COLLAPSED % key)
+        settings.sync()
+
+    def _wait_for(self, cond, timeout=10.0):
+        from PySide6.QtTest import QTest
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            QTest.qWait(50)
+            if cond():
+                return True
+        return cond()
+
+    def _pick_models(self):
+        self.state["widgets"]["A"]["picker"].setCurrentIndex(0)
+        self.state["widgets"]["B"]["picker"].setCurrentIndex(1)
+        self.app.processEvents()
+
+    def _start_relay(self, seed, cap=10):
+        self.state["start_picker"].setCurrentIndex(0)
+        self.state["cap_spin"].setValue(cap)
+        self.state["mode_picker"].setCurrentIndex(0)
+        self.state["stop_edit"].setText("")
+        self.state["agree_check"].setChecked(False)
+        self.state["composer"].setPlainText(seed)
+        self.app.processEvents()
+        self.state["relay_btn"].click()
+
+    def _wait_for_relay_stopped(self, timeout=15.0):
+        return self._wait_for(lambda: self.state["relay_status"].text()
+                              .startswith("Relay stopped"), timeout=timeout)
+
+    def _run_task(self, worker_index, follow_up_index, text):
+        self.state["task_edit"].setPlainText(text)
+        self.state["task_worker"].setCurrentIndex(worker_index)
+        self.state["task_follow_up"].setCurrentIndex(follow_up_index)
+        self.app.processEvents()
+        self.state["task_run"].click()
+
+    def test_four_zones_exist(self):
+        # The send path is always visible; each section has a
+        # header toggle and a body, all inside the director.
+        from PySide6 import QtWidgets
+        director = self.state["director"]
+        self.assertTrue(self.state["composer"].isVisible())
+        self.assertTrue(self.state["send_a"].isVisible())
+        self.assertTrue(self.state["start_ollama_btn"].isVisible())
+        for name in ("relay", "pairs", "tasks"):
+            toggle = self.state["%s_section_toggle" % name]
+            body = self.state["%s_section" % name]
+            self.assertIsInstance(toggle, QtWidgets.QPushButton)
+            self.assertTrue(toggle.isVisible())
+            self.assertIs(body.parent(), director)
+        self.assertTrue(self.state["relay_btn"].isVisible())
+        self.assertTrue(self.state["review_frame"].isHidden())
+
+    def test_defaults_relay_expanded_pairs_tasks_collapsed(self):
+        self.assertTrue(self.state["relay_section"].isVisible())
+        self.assertEqual(self.state["relay_section_toggle"].text(),
+                         "Relay \u25be")
+        self.assertTrue(self.state["pairs_section"].isHidden())
+        self.assertEqual(self.state["pairs_section_toggle"].text(),
+                         "Pairs \u25b8")
+        self.assertTrue(self.state["tasks_section"].isHidden())
+        self.assertEqual(self.state["tasks_section_toggle"].text(),
+                         "Tasks \u25b8")
+        # The controls follow their section: relay reachable,
+        # pairs and tasks tucked away. (Children of a hidden
+        # section are not visible, but isHidden() only answers
+        # for widgets hidden themselves -- hence not isVisible()
+        # for the controls, isHidden() for the bodies.)
+        self.assertTrue(self.state["relay_btn"].isVisible())
+        self.assertTrue(self.state["preset_combo"].isVisible())
+        self.assertFalse(self.state["pair_combo"].isVisible())
+        self.assertFalse(self.state["task_edit"].isVisible())
+        self.assertFalse(self.state["task_run"].isVisible())
+
+    def test_toggle_hides_only_its_section(self):
+        self.state["relay_section_toggle"].click()
+        self.app.processEvents()
+        self.assertTrue(self.state["relay_section"].isHidden())
+        self.assertEqual(self.state["relay_section_toggle"].text(),
+                         "Relay \u25b8")
+        self.assertFalse(self.state["relay_btn"].isVisible())
+        # Nothing else moved: the send path stays, and the other
+        # sections keep their own states.
+        self.assertTrue(self.state["composer"].isVisible())
+        self.assertTrue(self.state["send_both"].isVisible())
+        self.assertTrue(self.state["pairs_section"].isHidden())
+        self.assertTrue(self.state["tasks_section"].isHidden())
+        self.assertTrue(
+            self.state["pairs_section_toggle"].isVisible())
+        self.assertTrue(
+            self.state["tasks_section_toggle"].isVisible())
+        # Expanding Tasks shows only Tasks.
+        self.state["tasks_section_toggle"].click()
+        self.app.processEvents()
+        self.assertTrue(self.state["tasks_section"].isVisible())
+        self.assertEqual(self.state["tasks_section_toggle"].text(),
+                         "Tasks \u25be")
+        self.assertTrue(self.state["task_edit"].isVisible())
+        self.assertTrue(self.state["relay_section"].isHidden())
+        self.assertTrue(self.state["pairs_section"].isHidden())
+        # And Relay comes back on its own toggle.
+        self.state["relay_section_toggle"].click()
+        self.app.processEvents()
+        self.assertTrue(self.state["relay_section"].isVisible())
+        self.assertTrue(self.state["relay_btn"].isVisible())
+
+    def test_section_states_persist_across_rebuild(self):
+        from dual_chat import build_window
+        self.state["relay_section_toggle"].click()
+        self.state["tasks_section_toggle"].click()
+        self.app.processEvents()
+        self.assertTrue(self.state["relay_section"].isHidden())
+        self.assertTrue(self.state["tasks_section"].isVisible())
+        self.window.close()
+        self.app.processEvents()
+        window2 = build_window(self.client, logger=TEST_LOGGER)
+        try:
+            window2.show()
+            state2 = window2._dual_chat
+            self.assertTrue(self._wait_for(
+                lambda: state2["widgets"]["A"]["picker"].count() == 2))
+            self.assertTrue(state2["relay_section"].isHidden())
+            self.assertEqual(state2["relay_section_toggle"].text(),
+                             "Relay \u25b8")
+            self.assertTrue(state2["tasks_section"].isVisible())
+            self.assertEqual(state2["tasks_section_toggle"].text(),
+                             "Tasks \u25be")
+            self.assertTrue(state2["pairs_section"].isHidden())
+        finally:
+            window2.close()
+
+    def test_relay_controls_sit_in_two_rows(self):
+        # The relay body holds three rows: start row, stop row,
+        # preset row. The start controls and the stop controls
+        # are in different rows, and the stop-phrase field is in
+        # the second row with the two checkboxes.
+        layout = self.state["relay_section"].layout()
+        self.assertEqual(layout.count(), 3)
+        rows = []
+        for i in range(layout.count()):
+            row = layout.itemAt(i).layout()
+            self.assertIsNotNone(row)
+            rows.append([row.itemAt(j).widget()
+                         for j in range(row.count())])
+        self.assertIn(self.state["relay_btn"], rows[0])
+        self.assertIn(self.state["start_picker"], rows[0])
+        self.assertIn(self.state["cap_spin"], rows[0])
+        self.assertIn(self.state["mode_picker"], rows[0])
+        self.assertIn(self.state["stop_edit"], rows[1])
+        self.assertIn(self.state["agree_check"], rows[1])
+        self.assertIn(self.state["review_check"], rows[1])
+        self.assertNotIn(self.state["stop_edit"], rows[0])
+        self.assertIn(self.state["preset_combo"], rows[2])
+
+    def test_stop_phrase_field_wide_at_900px(self):
+        # T24: at the 900 px minimum width the stop-phrase field
+        # used to shrink to a sliver. In its own row it keeps
+        # most of the width; 300 px is a floor with room to
+        # spare (measured 552 px in the sandbox).
+        self.window.resize(900, 680)
+        self.app.processEvents()
+        self.assertEqual(self.window.width(), 900)
+        self.assertGreaterEqual(self.state["stop_edit"].width(), 300)
+        self.assertTrue(self.state["stop_edit"].isVisible())
+        self.assertTrue(self.state["relay_btn"].isVisible())
+        self.assertTrue(self.state["agree_check"].isVisible())
+
+    def test_collapse_relay_mid_relay_keeps_it_running(self):
+        # Slow the fake down so the relay is genuinely mid-flight
+        # when the section collapses. 10 words at 0.2 s each is
+        # ~2 s a turn: slow enough to catch, fast enough that a
+        # 4-turn relay finishes well inside the wait even under
+        # sandbox load.
+        self.client.delay = 0.2
+        self.client.replies = {
+            "fake-a:latest": [" ".join(["word"] * 10)],
+            "fake-b:latest": [" ".join(["word"] * 10)]}
+        self._start_relay("Talk about rain.", cap=4)
+        self.assertTrue(self._wait_for(
+            lambda: self.state["state"].get("relay") is not None))
+        self.state["relay_section_toggle"].click()
+        self.app.processEvents()
+        self.assertTrue(self.state["relay_section"].isHidden())
+        # The chip keeps showing the running relay, and the relay
+        # runs to its cap with the section collapsed.
+        self.assertTrue(self.state["relay_chip"].isVisible())
+        self.assertTrue(self._wait_for_relay_stopped(timeout=30),
+                        "the relay should run to its stop, "
+                        "section collapsed or not")
+        self.assertIn("turn cap reached",
+                      self.state["relay_status"].text())
+        self.assertGreaterEqual(
+            len(self.state["convo"].sides["A"].messages), 2)
+        self.assertGreaterEqual(
+            len(self.state["convo"].sides["B"].messages), 2)
+
+    def test_collapse_tasks_mid_task_keeps_it_running(self):
+        self.client.delay = 0.2
+        self.client.replies = {
+            "fake-a:latest": [" ".join(["draft"] * 10)]}
+        # Tasks starts collapsed: expand it, start the task, then
+        # collapse it mid-task.
+        self.state["tasks_section_toggle"].click()
+        self.app.processEvents()
+        self.assertTrue(self.state["tasks_section"].isVisible())
+        self._run_task(0, 2, "Write a draft.")  # A works, Nothing
+        self.assertTrue(self._wait_for(
+            lambda: self.state["state"].get("task") is not None))
+        self.state["tasks_section_toggle"].click()
+        self.app.processEvents()
+        self.assertTrue(self.state["tasks_section"].isHidden())
+        ok = self._wait_for(lambda: (
+            len(self.state["convo"].sides["A"].messages) >= 2
+            and not self.state["state"]["busy"]), timeout=30)
+        self.assertTrue(ok, "the task should finish with the "
+                        "section collapsed")
+        self.assertIn("draft",
+                      self.state["convo"].sides["A"].messages[-1]
+                      .content)
+
+    def test_director_toggle_still_collapses_everything(self):
+        self.state["tasks_section_toggle"].click()
+        self.app.processEvents()
+        self.assertTrue(self.state["tasks_section"].isVisible())
+        self.state["director_toggle"].click()
+        self.app.processEvents()
+        self.assertTrue(self.state["director"].isHidden())
+        # The toggles and bodies are children of the director:
+        # hidden through their parent, so not isVisible() (their
+        # own isHidden() stays False -- only the director itself
+        # was explicitly hidden).
+        self.assertFalse(
+            self.state["relay_section_toggle"].isVisible())
+        self.assertFalse(
+            self.state["tasks_section_toggle"].isVisible())
+        self.assertFalse(self.state["tasks_section"].isVisible())
+        # Expanding restores each section to its own state.
+        self.state["director_toggle"].click()
+        self.app.processEvents()
+        self.assertTrue(self.state["director"].isVisible())
+        self.assertTrue(self.state["relay_section"].isVisible())
+        self.assertTrue(self.state["tasks_section"].isVisible())
+        self.assertTrue(self.state["pairs_section"].isHidden())
+
+    def test_menu_start_relay_with_section_collapsed(self):
+        self.state["relay_section_toggle"].click()
+        self.app.processEvents()
+        self.assertTrue(self.state["relay_section"].isHidden())
+        # The composer is outside the sections, so the seed goes
+        # in as usual; the Relay menu starts the relay from
+        # outside the director entirely.
+        self.state["start_picker"].setCurrentIndex(0)
+        self.state["cap_spin"].setValue(2)
+        self.state["composer"].setPlainText("Go on.")
+        self.app.processEvents()
+        menu = self.state["menu_actions"]
+        self.assertTrue(menu["start_relay"].isEnabled())
+        menu["start_relay"].trigger()
+        self.assertTrue(self._wait_for(
+            lambda: self.state["state"].get("relay") is not None))
+        # No auto-expand: the section stays collapsed while the
+        # relay runs, and the chip shows it.
+        self.assertTrue(self.state["relay_section"].isHidden())
+        self.assertTrue(self.state["relay_chip"].isVisible())
+        self.assertTrue(self._wait_for_relay_stopped(),
+                        "the relay should run to its stop")
+        self.assertTrue(self.state["relay_section"].isHidden())
 
 
 if __name__ == "__main__":
