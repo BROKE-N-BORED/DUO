@@ -1,7 +1,19 @@
 # DUO changelog
 
 Every version, newest first. v0.1–v0.17 were built on 2026-11-12;
-v0.18–v0.34 on 2026-11-13.
+v0.18–v0.35 on 2026-11-13.
+
+## v0.35 — 2026-11-13
+
+The Start Ollama button moved out of the status bar into the bottom
+button row, next to Phone deck and Check for updates. It used to
+hide there and only appear after a failure, so it was hard to find
+exactly when you needed it — now it is always in the row, and it is
+greyed out while Ollama answers, so it can never start a second
+server while one is already running. When Ollama is down or
+unresponsive the button is ready to press, and it starts Ollama
+from inside DUO exactly as before. The status bar now holds only
+the status message and the CPU/RAM meter.
 
 ## v0.34 — 2026-11-13
 

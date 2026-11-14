@@ -306,7 +306,7 @@ def make_debug_logger(log_dir=None):
         return _NullLogger()
 
 APP_NAME = "DUO"
-APP_VERSION = "0.34"
+APP_VERSION = "0.35"
 
 # Plain-language messages shown in the panes. No tracebacks in the UI.
 MSG_STOPPED = "Stopped."
@@ -1060,7 +1060,7 @@ def build_window(client=None, logger=None, deck_port=None):
     d_layout.addWidget(attach_frame)
 
     btn_row = QtWidgets.QHBoxLayout()
-    # No hint label here: the row holds nine buttons now, and a
+    # No hint label here: the row holds eleven buttons now, and a
     # label gets clipped to a stub ("Send to A, B, or bc", v0.28).
     # The buttons say what they do; the stretch keeps them
     # right-aligned, where they were.
@@ -1085,6 +1085,15 @@ def build_window(client=None, logger=None, deck_port=None):
     btn_row.addWidget(phone_btn)
     update_btn = QtWidgets.QPushButton("Check for updates")
     btn_row.addWidget(update_btn)
+    # Start Ollama (v0.35, T23): it used to hide in the status bar
+    # and only appear after a failure -- now it lives here with the
+    # other app-level actions, always visible, and its enablement
+    # follows whether Ollama last answered (refresh_buttons): on
+    # while Ollama is down, greyed out while it answers, so it can
+    # never start a second server while one is already running.
+    start_ollama_btn = QtWidgets.QPushButton("Start Ollama")
+    start_ollama_btn.setEnabled(False)
+    btn_row.addWidget(start_ollama_btn)
     d_layout.addLayout(btn_row)
 
     # --- relay row ---------------------------------------------------------
@@ -1284,12 +1293,9 @@ def build_window(client=None, logger=None, deck_port=None):
 
     statusbar = window.statusBar()
     statusbar.showMessage("Loading models...")
-    # Start Ollama lives in the status bar, where the Ollama-down note
-    # appears -- and only shows when Ollama is actually down or
-    # unresponsive, so the window stays uncrowded the rest of the time.
-    start_ollama_btn = QtWidgets.QPushButton("Start Ollama")
-    start_ollama_btn.setVisible(False)
-    statusbar.addPermanentWidget(start_ollama_btn)
+    # The status bar holds only the status message and the system
+    # meter (v0.35, T23): the Start Ollama button moved to the
+    # bottom button row, where the actions live.
 
     # System meter (v0.29): the whole machine's CPU % and RAM in the
     # status bar, re-read from /proc once a second. Two small file
@@ -1354,6 +1360,16 @@ def build_window(client=None, logger=None, deck_port=None):
              # disabled with a "Loading models..." placeholder until
              # the list lands or the load fails.
              "models_loading": False,
+             # Whether Ollama last answered (v0.35, T23): the Start
+             # Ollama button is enabled only while this is True --
+             # never clickable into starting a second server while
+             # one answers. False until a probe or a turn says
+             # otherwise.
+             "ollama_down": False,
+             # True while a DUO-started server is still starting:
+             # the button stays disabled until the starter reports
+             # back, so a second click can't start a second server.
+             "ollama_starting": False,
              # Total RAM in bytes, read once at startup for the
              # picker's fit labels (v0.33, U39). None when /proc
              # can't be read: the pickers then show sizes only.
@@ -1665,6 +1681,14 @@ def build_window(client=None, logger=None, deck_port=None):
         relay_btn.setText("Stop Relay" if relay_active else "Start Relay")
         relay_btn.setEnabled(
             relay_active or (not busy and a_ready and b_ready))
+        # Start Ollama (v0.35, T23): enabled only while Ollama is
+        # down -- and off while the model list is loading (its
+        # state is unknown until the probe lands) or while a start
+        # is already in flight.
+        start_ollama_btn.setEnabled(
+            state.get("ollama_down", False)
+            and not state.get("models_loading", False)
+            and not state.get("ollama_starting", False))
         for widget in (start_picker, cap_spin, mode_picker, stop_edit,
                        agree_check, review_check):
             widget.setEnabled(not relay_active)
@@ -1839,10 +1863,13 @@ def build_window(client=None, logger=None, deck_port=None):
             return "%s in RAM" % format_ram(running[model])
         return "not loaded"
 
-    def show_start_ollama(show):
-        """Show the Start Ollama button when Ollama is down or
-        unresponsive, hide it once Ollama is confirmed up again."""
-        start_ollama_btn.setVisible(show)
+    def set_ollama_down(down):
+        """Record whether Ollama last answered (v0.35, T23). The
+        Start Ollama button's enablement follows this in
+        refresh_buttons: on while Ollama is down, greyed out while
+        it answers."""
+        state["ollama_down"] = down
+        refresh_buttons()
 
     def make_job_fn(job_id, model, messages, track_stats=True):
         holder = {"metrics": None, "ram": None}
@@ -2221,12 +2248,12 @@ def build_window(client=None, logger=None, deck_port=None):
             refresh_stats_label(side)
         logger.error("turn failed: side %s, model %s: %s"
                      % (side, convo.sides[side].model, message))
-        # Ollama down or unresponsive: offer the Start Ollama button.
-        # A slow Ollama gets the offer too -- restarting it is the
-        # sensible remedy for both, and the button reports its own
-        # outcome honestly.
+        # Ollama down or unresponsive: enable the Start Ollama
+        # button. A slow Ollama enables it too -- restarting it is
+        # the sensible remedy for both, and the button reports its
+        # own outcome honestly.
         if message in (MSG_OLLAMA_DOWN, MSG_OLLAMA_SLOW):
-            show_start_ollama(True)
+            set_ollama_down(True)
         if state.get("relay") is not None:
             end_relay(message)
         if state.get("task") is not None:
@@ -3344,7 +3371,7 @@ def build_window(client=None, logger=None, deck_port=None):
         else:
             statusbar.showMessage(
                 "Ollama connected but no models found. Pull a model first.")
-        show_start_ollama(False)
+        set_ollama_down(False)
         refresh_buttons()
 
     def on_models_failed(message):
@@ -3355,7 +3382,7 @@ def build_window(client=None, logger=None, deck_port=None):
             widgets[side]["picker"].setPlaceholderText("Pick a model")
         statusbar.showMessage(message)
         if message in (MSG_OLLAMA_DOWN, MSG_OLLAMA_SLOW):
-            show_start_ollama(True)
+            set_ollama_down(True)
         refresh_buttons()
 
     signals.models_loaded.connect(populate_models)
@@ -3401,8 +3428,9 @@ def build_window(client=None, logger=None, deck_port=None):
         """Start Ollama from inside DUO (off the GUI thread -- the
         wait for the probe can take seconds)."""
         logger.action("Start Ollama pressed")
-        start_ollama_btn.setEnabled(False)
+        state["ollama_starting"] = True
         statusbar.showMessage("Starting Ollama...")
+        refresh_buttons()
         starter = _OllamaStarter(ollama_manager, signals)
         starters.append(starter)
         starter.thread.finished.connect(
@@ -3412,14 +3440,14 @@ def build_window(client=None, logger=None, deck_port=None):
     def on_ollama_started(ok, message):
         if not alive():
             return
-        start_ollama_btn.setEnabled(True)
+        state["ollama_starting"] = False
         logger.action("Start Ollama finished: %s" % message)
         statusbar.showMessage(message, 5000)
         if ok:
-            show_start_ollama(False)
+            set_ollama_down(False)
             load_models()
         else:
-            show_start_ollama(True)
+            set_ollama_down(True)
         refresh_buttons()
 
     signals.ollama_started.connect(on_ollama_started)
@@ -3637,7 +3665,7 @@ def build_window(client=None, logger=None, deck_port=None):
         "start_ollama_btn": start_ollama_btn,
         "ollama_manager": ollama_manager,
         "do_start_ollama": do_start_ollama,
-        "show_start_ollama": show_start_ollama,
+        "set_ollama_down": set_ollama_down,
         "send_message": send_message,
         "log_event": log_event,
         "set_side_state": set_side_state, "side_state": side_state,

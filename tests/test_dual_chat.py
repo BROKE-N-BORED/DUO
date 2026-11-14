@@ -3231,6 +3231,13 @@ class Item6GuiTests(unittest.TestCase):
         self._run_task(0, 0, "Write a draft.")
         self.assertTrue(self._wait_for(
             lambda: self.state["state"]["busy"], timeout=5))
+        # Busy goes true at submit, but the runner thread starts
+        # the job a moment later -- wait for the call itself, or
+        # the stop can land before the job starts and no call is
+        # ever made (flaked twice under load at v0.35).
+        self.assertTrue(self._wait_for(
+            lambda: self.client.calls == ["fake-a:latest"],
+            timeout=10))
         self.state["widgets"]["A"]["stop"].click()
         self.assertTrue(self._wait_for(
             lambda: "Task stopped." in
@@ -5255,10 +5262,17 @@ class StartOllamaGuiTests(unittest.TestCase):
         self.state["widgets"]["B"]["picker"].setCurrentIndex(1)
         self.app.processEvents()
 
-    def test_start_button_hidden_by_default(self):
-        self.assertTrue(self.state["start_ollama_btn"].isHidden())
+    def test_start_button_visible_but_disabled_while_ollama_answers(self):
+        # v0.35 (T23): the button is always in the bottom row now --
+        # visible at startup, greyed out while Ollama answers, so it
+        # can never start a second server while one is running.
+        self.state["set_director_collapsed"](False)
+        self.app.processEvents()
+        btn = self.state["start_ollama_btn"]
+        self.assertTrue(btn.isVisible())
+        self.assertFalse(btn.isEnabled())
 
-    def test_start_button_appears_when_models_fail(self):
+    def test_start_button_enables_when_models_fail(self):
         from dual_chat import build_window
 
         class DownClient:
@@ -5279,12 +5293,12 @@ class StartOllamaGuiTests(unittest.TestCase):
             window.show()
             state = window._dual_chat
             self.assertTrue(self._wait_for(
-                lambda: state["start_ollama_btn"].isVisible(),
+                lambda: state["start_ollama_btn"].isEnabled(),
                 timeout=10))
         finally:
             window.close()
 
-    def test_slow_failure_shows_button_and_note(self):
+    def test_slow_failure_enables_button_and_note(self):
         from dual_chat import build_window
 
         class SlowClient(FakeGuiClient):
@@ -5306,7 +5320,7 @@ class StartOllamaGuiTests(unittest.TestCase):
             pane = state["widgets"]["A"]["transcript"]
             self.assertTrue(self._wait_for(
                 lambda: "slow or busy" in pane.toPlainText(), timeout=10))
-            self.assertTrue(state["start_ollama_btn"].isVisible())
+            self.assertTrue(state["start_ollama_btn"].isEnabled())
         finally:
             window.close()
 
@@ -5340,7 +5354,7 @@ class StartOllamaGuiTests(unittest.TestCase):
         finally:
             window.close()
 
-    def test_model_failure_keeps_button_hidden(self):
+    def test_model_failure_keeps_button_disabled(self):
         from dual_chat import build_window
 
         class BadModelClient(FakeGuiClient):
@@ -5363,27 +5377,33 @@ class StartOllamaGuiTests(unittest.TestCase):
             self.assertTrue(self._wait_for(
                 lambda: "couldn't be loaded" in pane.toPlainText(),
                 timeout=10))
-            self.assertTrue(state["start_ollama_btn"].isHidden())
+            self.assertFalse(state["start_ollama_btn"].isEnabled())
         finally:
             window.close()
 
     def test_click_start_when_already_running(self):
         # The fake client probes True, so the real manager reports
         # running without spawning anything.
-        self.state["show_start_ollama"](True)
+        self.state["set_ollama_down"](True)
         self.app.processEvents()
-        self.assertTrue(self.state["start_ollama_btn"].isVisible())
+        self.assertTrue(self.state["start_ollama_btn"].isEnabled())
+        self.window.statusBar().clearMessage()
         self.state["start_ollama_btn"].click()
+        # The starter reports back, the model list reloads, and the
+        # button greys out again: Ollama answers, so there is
+        # nothing left to start.
         self.assertTrue(self._wait_for(
-            lambda: self.state["start_ollama_btn"].isHidden(),
-            timeout=10))
+            lambda: "Ollama connected" in
+            self.window.statusBar().currentMessage(), timeout=10))
+        self.assertFalse(self.state["start_ollama_btn"].isEnabled())
         self.assertFalse(self.state["ollama_manager"].running)
 
-    def test_click_start_failure_keeps_button(self):
+    def test_click_start_failure_keeps_button_enabled(self):
         manager = self.state["ollama_manager"]
         manager.start = lambda timeout=None: (
             False, "Ollama didn't start. Try starting it yourself.")
-        self.state["show_start_ollama"](True)
+        self.state["set_director_collapsed"](False)
+        self.state["set_ollama_down"](True)
         self.app.processEvents()
         self.state["start_ollama_btn"].click()
         self.assertTrue(self._wait_for(
@@ -5399,6 +5419,99 @@ class StartOllamaGuiTests(unittest.TestCase):
         self.window.close()
         self.app.processEvents()
         self.assertTrue(recorder.called)
+
+
+@unittest.skipUnless(os.environ.get("DUAL_CHAT_GUI_TESTS") == "1",
+                     "GUI tests run with DUAL_CHAT_GUI_TESTS=1")
+class StartOllamaPlacementGuiTests(unittest.TestCase):
+    """v0.35 (audit T23): the Start Ollama button lives in the
+    bottom button row now, always visible, enabled only while
+    Ollama is down. Nothing of it is left in the status bar."""
+
+    @classmethod
+    def setUpClass(cls):
+        from PySide6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+        cls.client = FakeGuiClient()
+
+    def setUp(self):
+        from dual_chat import build_window
+        self.client.reset()
+        self.window = build_window(self.client, logger=TEST_LOGGER)
+        self.window.show()
+        self.state = self.window._dual_chat
+        self._wait_for(lambda: self.state["widgets"]["A"]["picker"].count() == 2)
+        self._pick_models()
+
+    def tearDown(self):
+        self.window.close()
+        self.app.processEvents()
+
+    def _wait_for(self, cond, timeout=10.0):
+        from PySide6.QtTest import QTest
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            QTest.qWait(50)
+            if cond():
+                return True
+        return cond()
+
+    def _pick_models(self):
+        self.state["widgets"]["A"]["picker"].setCurrentIndex(0)
+        self.state["widgets"]["B"]["picker"].setCurrentIndex(1)
+        self.app.processEvents()
+
+    def test_button_lives_in_the_bottom_button_row(self):
+        btn = self.state["start_ollama_btn"]
+        self.assertIs(btn.parent(), self.state["director"])
+        # The row layout holds the button next to Phone deck and
+        # Check for updates -- the app-level actions.
+        found = False
+        layout = self.state["director"].layout()
+        for i in range(layout.count()):
+            row = layout.itemAt(i).layout()
+            if row is None:
+                continue
+            widgets = [row.itemAt(j).widget()
+                       for j in range(row.count())]
+            texts = [w.text() for w in widgets
+                     if w is not None and hasattr(w, "text")]
+            if "Start Ollama" in texts:
+                found = True
+                self.assertIn("Phone deck", texts)
+                self.assertIn("Check for updates", texts)
+        self.assertTrue(found)
+
+    def test_no_button_left_in_the_status_bar(self):
+        from PySide6 import QtWidgets
+        bar = self.window.statusBar()
+        self.assertEqual(bar.findChildren(QtWidgets.QPushButton), [])
+        # The meter is still there: the status bar keeps its
+        # status message and the system meter, nothing else.
+        self.assertIs(self.state["meter_label"].parent(), bar)
+
+    def test_button_disabled_while_models_loading(self):
+        # Reachability is unknown until the probe lands, so the
+        # button stays off even when Ollama was last down.
+        self.state["set_ollama_down"](True)
+        self.assertTrue(self.state["start_ollama_btn"].isEnabled())
+        self.state["state"]["models_loading"] = True
+        self.state["set_ollama_down"](True)  # re-runs refresh
+        self.assertFalse(self.state["start_ollama_btn"].isEnabled())
+        self.state["state"]["models_loading"] = False
+        self.state["set_ollama_down"](True)
+        self.assertTrue(self.state["start_ollama_btn"].isEnabled())
+
+    def test_button_disabled_while_a_start_is_in_flight(self):
+        # A second click mid-start must not start a second server.
+        self.state["set_ollama_down"](True)
+        self.assertTrue(self.state["start_ollama_btn"].isEnabled())
+        self.state["state"]["ollama_starting"] = True
+        self.state["set_ollama_down"](True)  # re-runs refresh
+        self.assertFalse(self.state["start_ollama_btn"].isEnabled())
+        self.state["state"]["ollama_starting"] = False
+        self.state["set_ollama_down"](True)
+        self.assertTrue(self.state["start_ollama_btn"].isEnabled())
 
 
 @unittest.skipUnless(os.environ.get("DUAL_CHAT_GUI_TESTS") == "1",
@@ -6543,7 +6656,7 @@ class FrontDoorTests(unittest.TestCase):
 
     def test_changelog_covers_every_version(self):
         log = self._read("CHANGELOG.md")
-        for version in ["0.%d" % n for n in range(1, 35)]:
+        for version in ["0.%d" % n for n in range(1, 36)]:
             self.assertIn(version, log)
 
     def test_gitignore_covers_runtime_files(self):
@@ -10784,6 +10897,12 @@ class RelayChipGuiTests(unittest.TestCase):
         self.assertTrue(self.state["relay_chip_stop"].isVisible())
         self.state["relay_chip_stop"].click()
         self.assertTrue(self._wait_for_relay_stopped())
+        # The chip's end line lands the moment the relay ends, but
+        # busy clears only when the in-flight job's cancel lands a
+        # moment later (the v0.34 drive hit the same shape and waits
+        # for the settled state too): wait for it before asserting.
+        self.assertTrue(self._wait_for(
+            lambda: not self.state["state"]["busy"], timeout=10))
         self.assertIn("stopped by you",
                       self.state["relay_status"].text())
         self.assertIsNone(self.state["state"].get("relay"))
