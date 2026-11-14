@@ -1,7 +1,26 @@
 # DUO changelog
 
 Every version, newest first. v0.1–v0.17 were built on 2026-11-12;
-v0.18–v0.35 on 2026-11-13; v0.36–v0.45 on 2026-11-14.
+v0.18–v0.35 on 2026-11-13; v0.36–v0.46 on 2026-11-14.
+
+## v0.46 — 2026-11-14
+
+The Director toggle springs now instead of snapping. Opening
+it runs 350 ms with an overshoot — the director grows a touch
+past its full height, then settles back, the way a spring
+does — and closing it eases out over 250 ms. The split is
+deliberate: an overshoot on the way down would mean going past
+zero, which is meaningless, so only the opening springs.
+Clicking mid-flight reverses from wherever the director
+actually is; the chevron flips the moment you click, before
+the motion finishes. With "Reduce motion" on, the toggle is
+instant again, like the button dip. The Relay, Pairs, and Tasks
+section toggles stay instant on purpose: this is the Director
+toggle only, the one that moves the whole window layout. A
+probe settled the mechanism before it was built: the
+director's height tracks its maximumHeight exactly, its
+sizeHint stays valid while hidden, and the overshoot lands at
+330 against a full height of 301.
 
 ## v0.45 — 2026-11-14
 

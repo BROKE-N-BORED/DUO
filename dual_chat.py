@@ -209,7 +209,7 @@ from duo_model import (
     RELAY_CAP_MIN, SIDE_COLORS, ChatMessage, ChatSide, Conversation,
     MSG_NO_MODEL, NoModelSelected, RelaySession, SUMMARY_KEEP_LAST,
     SUMMARY_LABEL,)
-from duo_motion import install_motion
+from duo_motion import DirectorSpring, install_motion
 from duo_ollama import (
     CHAT_MAX_ATTEMPTS, CHAT_RETRY_DELAYS, CHAT_TIMEOUT, DEFAULT_OLLAMA_URL,
     MSG_MODEL_FAILED, MSG_OLLAMA_DOWN, MSG_OLLAMA_NOT_INSTALLED,
@@ -252,7 +252,7 @@ from duo_workers import (_ModelLoader, _OllamaStarter, _SignalObject,
 
 
 APP_NAME = "DUO"
-APP_VERSION = "0.45"
+APP_VERSION = "0.46"
 
 # Plain-language messages shown in the panes. No tracebacks in the UI.
 MSG_STOPPED = "Stopped."
@@ -1186,17 +1186,24 @@ def build_window(client=None, logger=None, deck_port=None):
     root.addWidget(director_toggle)
     root.addWidget(director)
 
-    def _set_director_collapsed(collapsed):
-        director.setVisible(not collapsed)
+    # Director spring (v0.46, R8; the animation lives in
+    # duo_motion.py): the click flips the spring's target, not the
+    # director's visibility -- mid-animation it still shows the old
+    # state, so flipping on it would re-collapse, not expand.
+    director_spring = DirectorSpring(director, prefs)
+
+    def _set_director_collapsed(collapsed, instant=False):
         director_toggle.setText(
             "Director \u25b8" if collapsed else "Director \u25be")
         prefs.setValue(SETTING_DIRECTOR_COLLAPSED, bool(collapsed))
         prefs.sync()
+        director_spring.set_collapsed(collapsed, instant=instant)
 
     director_toggle.clicked.connect(
-        lambda: _set_director_collapsed(director.isVisible()))
+        lambda: _set_director_collapsed(
+            not director_spring.target_collapsed))
     if prefs.value(SETTING_DIRECTOR_COLLAPSED, False, type=bool):
-        _set_director_collapsed(True)
+        _set_director_collapsed(True, instant=True)
 
     statusbar = window.statusBar()
     # Status notes (v0.36, T22): a permanent label, not a timed
@@ -3804,6 +3811,7 @@ def build_window(client=None, logger=None, deck_port=None):
         "motion": motion,
         "director": director, "director_toggle": director_toggle,
         "set_director_collapsed": _set_director_collapsed,
+        "director_spring": director_spring,
         "relay_section": relay_body,
         "relay_section_toggle": relay_toggle,
         "set_relay_collapsed": _set_relay_collapsed,
@@ -3881,6 +3889,7 @@ def build_window(client=None, logger=None, deck_port=None):
         for _timer in error_timers.values():
             _timer.stop()
         motion.stop()
+        director_spring.stop()
         logger.action("DUO closed")
         _orig_close_event(event)
 

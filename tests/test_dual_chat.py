@@ -6797,7 +6797,7 @@ class FrontDoorTests(unittest.TestCase):
 
     def test_changelog_covers_every_version(self):
         log = self._read("CHANGELOG.md")
-        for version in ["0.%d" % n for n in range(1, 46)]:
+        for version in ["0.%d" % n for n in range(1, 47)]:
             self.assertIn(version, log)
 
     def test_gitignore_covers_runtime_files(self):
@@ -10511,8 +10511,12 @@ class DirectorCollapseGuiTests(unittest.TestCase):
         pane = self.state["widgets"]["A"]["transcript"]
         before = pane.height()
         self.state["director_toggle"].click()
-        self.app.processEvents()
-        self.assertTrue(self.state["director"].isHidden())
+        # v0.46 (R8): the collapse springs over 250 ms -- the
+        # director hides only when the spring ends, so wait for
+        # the settled state instead of asserting at once.
+        self.assertTrue(self._wait_for(
+            lambda: self.state["director"].isHidden(), timeout=5),
+            "the director should hide once the collapse spring ends")
         self.assertEqual(self.state["director_toggle"].text(),
                          "Director \u25b8")
         self.assertTrue(self.state["director_toggle"].isVisible())
@@ -10523,8 +10527,9 @@ class DirectorCollapseGuiTests(unittest.TestCase):
     def test_expand_restores_director(self):
         toggle = self.state["director_toggle"]
         toggle.click()
-        self.app.processEvents()
-        self.assertTrue(self.state["director"].isHidden())
+        # v0.46 (R8): wait out the collapse spring before expanding.
+        self.assertTrue(self._wait_for(
+            lambda: self.state["director"].isHidden(), timeout=5))
         toggle.click()
         self.app.processEvents()
         self.assertTrue(self.state["director"].isVisible())
@@ -10535,8 +10540,9 @@ class DirectorCollapseGuiTests(unittest.TestCase):
     def test_collapsed_state_persists_across_restart(self):
         from dual_chat import build_window
         self.state["director_toggle"].click()
-        self.app.processEvents()
-        self.assertTrue(self.state["director"].isHidden())
+        # v0.46 (R8): wait out the collapse spring before closing.
+        self.assertTrue(self._wait_for(
+            lambda: self.state["director"].isHidden(), timeout=5))
         self.window.close()
         self.app.processEvents()
         window2 = build_window(self.client, logger=TEST_LOGGER)
@@ -10582,8 +10588,9 @@ class DirectorCollapseGuiTests(unittest.TestCase):
     def test_relay_keeps_running_while_collapsed(self):
         self._start_relay("Talk about rain.", cap=4)
         self.state["director_toggle"].click()
-        self.app.processEvents()
-        self.assertTrue(self.state["director"].isHidden())
+        # v0.46 (R8): wait out the collapse spring.
+        self.assertTrue(self._wait_for(
+            lambda: self.state["director"].isHidden(), timeout=5))
         self.assertTrue(self._wait_for_relay_stopped(),
                         "the relay should run to its stop, collapsed "
                         "or not")
@@ -11097,8 +11104,9 @@ class RelayChipGuiTests(unittest.TestCase):
                          director.findChildren(QtWidgets.QLabel))
         self.assertTrue(chip.isVisible())
         self.state["director_toggle"].click()
-        self.app.processEvents()
-        self.assertTrue(director.isHidden())
+        # v0.46 (R8): wait out the collapse spring.
+        self.assertTrue(self._wait_for(
+            lambda: director.isHidden(), timeout=5))
         self.assertTrue(chip.isVisible())
         self.assertTrue(self.state["relay_status"].isVisible())
         self.assertTrue(self.state["director_toggle"].isVisible())
@@ -11185,8 +11193,9 @@ class RelayChipGuiTests(unittest.TestCase):
         self.client.replies = {"fake-a:latest": [" ".join(["word"] * 100)],
                                "fake-b:latest": ["short"]}
         self.state["director_toggle"].click()
-        self.app.processEvents()
-        self.assertTrue(self.state["director"].isHidden())
+        # v0.46 (R8): wait out the collapse spring.
+        self.assertTrue(self._wait_for(
+            lambda: self.state["director"].isHidden(), timeout=5))
         # The composer is hidden but still takes text; the Relay
         # menu starts the relay from outside the director.
         self.state["start_picker"].setCurrentIndex(0)
@@ -11577,8 +11586,9 @@ class DirectorSectionsGuiTests(unittest.TestCase):
         self.app.processEvents()
         self.assertTrue(self.state["tasks_section"].isVisible())
         self.state["director_toggle"].click()
-        self.app.processEvents()
-        self.assertTrue(self.state["director"].isHidden())
+        # v0.46 (R8): wait out the collapse spring.
+        self.assertTrue(self._wait_for(
+            lambda: self.state["director"].isHidden(), timeout=5))
         # The toggles and bodies are children of the director:
         # hidden through their parent, so not isVisible() (their
         # own isHidden() stays False -- only the director itself
@@ -13189,6 +13199,20 @@ class MotionConstantsTests(unittest.TestCase):
             duo_motion.dot_stylesheet("#a3e635"),
             "background-color: #a3e635; border-radius: 6px;")
 
+    def test_director_spring_constants(self):
+        import duo_motion
+        # Entry 002: the Director toggle springs -- expand
+        # overshoots with OutBack over 350 ms, collapse eases out
+        # with OutCubic over 250 ms. Both under the 400 ms cap.
+        self.assertEqual(duo_motion.DIRECTOR_EXPAND_MS, 350)
+        self.assertEqual(duo_motion.DIRECTOR_COLLAPSE_MS, 250)
+        self.assertEqual(duo_motion.DIRECTOR_SPRING_MAX_MS, 400)
+        self.assertLess(duo_motion.DIRECTOR_EXPAND_MS,
+                        duo_motion.DIRECTOR_SPRING_MAX_MS)
+        self.assertLess(duo_motion.DIRECTOR_COLLAPSE_MS,
+                        duo_motion.DIRECTOR_SPRING_MAX_MS)
+        self.assertEqual(duo_motion.QWIDGETSIZE_MAX, 16777215)
+
 
 @unittest.skipUnless(os.environ.get("DUAL_CHAT_GUI_TESTS") == "1",
                      "GUI tests run with DUAL_CHAT_GUI_TESTS=1")
@@ -13472,6 +13496,252 @@ class MotionGuiTests(unittest.TestCase):
         finally:
             window2.close()
         self.app.processEvents()
+
+
+@unittest.skipUnless(os.environ.get("DUAL_CHAT_GUI_TESTS") == "1",
+                     "GUI tests run with DUAL_CHAT_GUI_TESTS=1")
+class DirectorSpringGuiTests(unittest.TestCase):
+    """v0.46 (redesign R8): the Director toggle springs instead of
+    snapping -- expand runs 350 ms with OutBack (the property
+    overshoots past full height, then settles), collapse runs
+    250 ms with OutCubic, both interruptible from the current
+    height, and instant while reduced motion is on. The update
+    check is stubbed, as in MenuBarGuiTests, so no test touches
+    the network."""
+
+    @classmethod
+    def setUpClass(cls):
+        from PySide6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+        cls.client = FakeGuiClient()
+
+    def setUp(self):
+        # The collapsed choice is persisted, so clear it before
+        # every window: each test starts from the default
+        # (expanded). Reduced motion is forced off too (saved and
+        # restored, the MotionGuiTests pattern) so the spring
+        # always runs unless the test turns it on.
+        self._clear_director_collapsed()
+        from dual_chat import build_window
+        self._patcher = mock.patch(
+            "dual_chat.check_for_update",
+            return_value=("latest", None))
+        self._patcher.start()
+        self.client.reset()
+        self.window = build_window(self.client, logger=TEST_LOGGER)
+        self.window.show()
+        self.state = self.window._dual_chat
+        self._wait_for(lambda: self.state["widgets"]["A"]["picker"].count() == 2)
+        self._pick_models()
+        self._saved_reduced = (
+            self.state["motion"].reduced_motion.value)
+        self.state["motion"].reduced_motion.set(False)
+
+    def tearDown(self):
+        self.state["motion"].reduced_motion.set(self._saved_reduced)
+        self.window.close()
+        self.app.processEvents()
+        self._patcher.stop()
+        self._clear_director_collapsed()
+
+    def _clear_director_collapsed(self):
+        from PySide6.QtCore import QSettings
+        settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
+        settings.remove(SETTING_DIRECTOR_COLLAPSED)
+        settings.sync()
+
+    def _wait_for(self, cond, timeout=10.0):
+        from PySide6.QtTest import QTest
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            QTest.qWait(50)
+            if cond():
+                return True
+        return cond()
+
+    def _pick_models(self):
+        self.state["widgets"]["A"]["picker"].setCurrentIndex(0)
+        self.state["widgets"]["B"]["picker"].setCurrentIndex(1)
+        self.app.processEvents()
+
+    def _spring(self):
+        return self.state["director_spring"]
+
+    def _wait_settled(self, timeout=5.0):
+        return self._wait_for(
+            lambda: not self._spring().is_animating(),
+            timeout=timeout)
+
+    def _sample_while_animating(self):
+        # Sample, then pump: the last sample is taken while the
+        # spring is still running, so the expand's finished
+        # handler (which resets maximumHeight to QWIDGETSIZE_MAX)
+        # can never leak into the samples and fake an overshoot.
+        from PySide6.QtTest import QTest
+        director = self.state["director"]
+        samples = []
+        deadline = time.time() + 5.0
+        while self._spring().is_animating():
+            samples.append((director.maximumHeight(),
+                            director.height()))
+            QTest.qWait(5)
+            self.assertLess(time.time(), deadline,
+                            "the spring should finish within 5 s")
+        return samples
+
+    def test_expand_animates_with_overshoot(self):
+        import duo_motion
+        director = self.state["director"]
+        # The layout's natural height for this window -- not
+        # sizeHint: a short window squeezes the director below
+        # its preferred height (the v0.39 crush), so the settled
+        # height is whatever the layout gives, and the test
+        # measures that before collapsing.
+        expanded_height = director.height()
+        self.assertGreater(expanded_height, 0)
+        # Start from a settled collapse (instant, no spring).
+        self.state["set_director_collapsed"](True, instant=True)
+        self.app.processEvents()
+        self.assertTrue(director.isHidden())
+        target = director.sizeHint().height()
+        self.assertGreater(target, 0)
+        self.state["set_director_collapsed"](False)
+        self.assertTrue(self._spring().is_animating())
+        samples = self._sample_while_animating()
+        heights = [height for _, height in samples]
+        props = [prop for prop, _ in samples]
+        # Through intermediate values, not a jump.
+        self.assertGreaterEqual(len(set(heights)), 3)
+        self.assertLess(min(heights), expanded_height // 2)
+        self.assertEqual(max(heights), expanded_height)
+        # OutBack overshoots the property past the end value (the
+        # widget itself caps at the height the layout gives it, so
+        # the overshoot lives in maximumHeight, not in height).
+        self.assertGreater(max(props), target)
+        # Settled: visible, back at its natural height, cap lifted
+        # again so the director can still grow afterwards.
+        self.assertTrue(self._wait_settled())
+        self.assertTrue(director.isVisible())
+        self.assertEqual(director.height(), expanded_height)
+        self.assertEqual(director.maximumHeight(),
+                         duo_motion.QWIDGETSIZE_MAX)
+
+    def test_collapse_animates_down(self):
+        director = self.state["director"]
+        pane = self.state["widgets"]["A"]["transcript"]
+        before = pane.height()
+        full = director.height()
+        self.assertGreater(full, 0)
+        self.state["set_director_collapsed"](True)
+        self.assertTrue(self._spring().is_animating())
+        samples = self._sample_while_animating()
+        heights = [height for _, height in samples]
+        # Down through intermediate values, not a jump.
+        self.assertGreaterEqual(len(set(heights)), 3)
+        self.assertEqual(heights[0], full)
+        self.assertLess(heights[-1], heights[0])
+        # Settled: hidden, cap at 0, panes took the space.
+        self.assertTrue(self._wait_settled())
+        self.assertTrue(director.isHidden())
+        self.assertEqual(director.maximumHeight(), 0)
+        self.assertGreater(pane.height(), before)
+
+    def test_click_mid_expand_reverses_to_collapse(self):
+        director = self.state["director"]
+        self.state["set_director_collapsed"](True, instant=True)
+        self.app.processEvents()
+        self.state["set_director_collapsed"](False)
+        from PySide6.QtTest import QTest
+        QTest.qWait(50)
+        self.assertTrue(self._spring().is_animating())
+        mid = director.maximumHeight()
+        self.assertGreater(mid, 0)
+        self.state["director_toggle"].click()
+        # The chevron flips at once, while the spring still runs.
+        self.assertEqual(self.state["director_toggle"].text(),
+                         "Director \u25b8")
+        # The collapse starts from the frozen mid-flight height.
+        self.assertEqual(director.maximumHeight(), mid)
+        self.assertTrue(self._wait_settled())
+        self.assertTrue(director.isHidden())
+        self.assertEqual(director.maximumHeight(), 0)
+
+    def test_click_mid_collapse_reverses_to_expand(self):
+        director = self.state["director"]
+        # The layout's natural height for this window (see
+        # test_expand_animates_with_overshoot: a short window
+        # squeezes the director below its sizeHint).
+        expanded_height = director.height()
+        self.state["set_director_collapsed"](True)
+        from PySide6.QtTest import QTest
+        QTest.qWait(50)
+        self.assertTrue(self._spring().is_animating())
+        mid = director.maximumHeight()
+        self.assertGreater(mid, 0)
+        self.state["director_toggle"].click()
+        # The chevron flips at once, while the spring still runs.
+        self.assertEqual(self.state["director_toggle"].text(),
+                         "Director \u25be")
+        # The expand starts from the frozen mid-flight height.
+        self.assertEqual(director.maximumHeight(), mid)
+        self.assertTrue(self._wait_settled())
+        self.assertTrue(director.isVisible())
+        self.assertEqual(director.height(), expanded_height)
+
+    def test_chevron_flips_immediately_on_click(self):
+        toggle = self.state["director_toggle"]
+        toggle.click()
+        # Chevron first, spring still running: the click is
+        # acknowledged at once, the motion follows.
+        self.assertEqual(toggle.text(), "Director \u25b8")
+        self.assertTrue(self._spring().is_animating())
+        self.assertTrue(self._wait_settled())
+        toggle.click()
+        self.assertEqual(toggle.text(), "Director \u25be")
+        self.assertTrue(self._spring().is_animating())
+        self.assertTrue(self._wait_settled())
+
+    def test_reduced_motion_makes_the_toggle_instant(self):
+        import duo_motion
+        director = self.state["director"]
+        self.state["motion"].reduced_motion.set(True)
+        self.state["director_toggle"].click()
+        # No animation at all: hidden at once, cap already 0.
+        self.assertFalse(self._spring().is_animating())
+        self.assertTrue(director.isHidden())
+        self.assertEqual(director.maximumHeight(), 0)
+        self.state["director_toggle"].click()
+        self.assertFalse(self._spring().is_animating())
+        self.assertTrue(director.isVisible())
+        self.assertEqual(director.maximumHeight(),
+                         duo_motion.QWIDGETSIZE_MAX)
+
+    def test_toggle_still_works_after_animation(self):
+        from PySide6.QtCore import QSettings
+        director = self.state["director"]
+        pane = self.state["widgets"]["A"]["transcript"]
+        expanded_height = pane.height()
+        self.state["director_toggle"].click()
+        self.assertTrue(self._wait_settled())
+        self.assertTrue(director.isHidden())
+        settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
+        self.assertTrue(settings.value(
+            SETTING_DIRECTOR_COLLAPSED, False, type=bool))
+        self.assertGreater(pane.height(), expanded_height)
+        self.state["director_toggle"].click()
+        self.assertTrue(self._wait_settled())
+        self.assertTrue(director.isVisible())
+        self.assertFalse(settings.value(
+            SETTING_DIRECTOR_COLLAPSED, False, type=bool))
+        self.assertAlmostEqual(pane.height(), expanded_height,
+                               delta=2)
+        # And once more, so a stuck state after the first cycle
+        # cannot hide: the toggle keeps working.
+        self.state["director_toggle"].click()
+        self.assertTrue(self._wait_settled())
+        self.assertTrue(director.isHidden())
+        self.assertTrue(settings.value(
+            SETTING_DIRECTOR_COLLAPSED, False, type=bool))
 
 
 if __name__ == "__main__":

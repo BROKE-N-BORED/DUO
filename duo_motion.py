@@ -35,6 +35,25 @@ stays under its 4,000-line bound:
   stops; the flash and the focus ring keep working, because they
   are state changes, not motion.
 
+Director spring (v0.46, redesign R8; library entry 002): the
+Director toggle springs instead of snapping. The director
+container's maximumHeight animates -- expand runs 350 ms with
+OutBack (the property overshoots past full height, then settles
+back: the spring feel), collapse runs 250 ms with OutCubic (a
+smooth ease-out; overshooting below zero is meaningless). Both
+under the 400 ms cap, and both interruptible: clicking
+mid-flight reverses from the current height, never waiting for
+the running animation. The chevron flips the moment the toggle
+is clicked (dual_chat.py owns it); the spring only moves the
+height. The layout reflows as the director grows and shrinks,
+so the panes follow the spring -- probed before building
+(probe_spring.py): the widget height tracks maximumHeight
+exactly, sizeHint stays valid while hidden, and OutBack
+overshoots the property to 330 against a full height of 301.
+Reduced motion makes the toggle instant, like the dip. The
+Relay/Pairs/Tasks section toggles stay instant by design: R8 is
+the Director toggle only, the one that moves the whole window.
+
 PySide6 is imported lazily inside the functions (the duo_menu.py /
 duo_workers.py precedent), so this module -- and dual_chat.py,
 which imports it -- still import cleanly on a machine without
@@ -57,6 +76,19 @@ FOCUS_RING_COLOR = "#2563eb"
 FOCUS_RING_TINT = "#e8f0fe"
 # Reduced motion: the QSettings key, default off.
 SETTING_REDUCED_MOTION = "motion/reduced"
+# Director spring (entry 002): the toggle's expand/collapse
+# durations. Expand overshoots with OutBack (the spring feel);
+# collapse eases out with OutCubic (overshooting below zero is
+# meaningless). Both under the 400 ms cap.
+DIRECTOR_EXPAND_MS = 350
+DIRECTOR_COLLAPSE_MS = 250
+DIRECTOR_SPRING_MAX_MS = 400
+# Qt's QWIDGETSIZE_MAX, the default maximum size for a widget:
+# the expanded director goes back to this cap so it can still
+# grow when a section opens or the review frame appears. This
+# PySide6 build does not bind the name, so the value is spelled
+# out (confirmed by probe: a fresh widget reads 16777215).
+QWIDGETSIZE_MAX = 16777215
 
 # The focus ring, one rule per focusable widget class. Only :focus
 # selectors: nothing here touches an unfocused widget, so the
@@ -231,6 +263,143 @@ class CompletionFlash:
     def _clear(self):
         if self._is_idle():
             self._dot.setStyleSheet(dot_stylesheet(self._idle_color))
+
+
+class DirectorSpring:
+    """The Director toggle's spring (entry 002, see the module
+    docstring).
+
+    Animates the director container's maximumHeight: expand runs
+    DIRECTOR_EXPAND_MS with OutBack, collapse runs
+    DIRECTOR_COLLAPSE_MS with OutCubic. Interruptible: starting a
+    new direction mid-flight stops the running animation and
+    starts from the current height. `target_collapsed` is the last
+    requested state -- the toggle flips it, not the director's
+    visibility, because mid-animation the visibility still shows
+    the old state. Settled states: expanded means visible with
+    maximumHeight back at QWIDGETSIZE_MAX (so the director can
+    still grow when a section opens or the review frame appears);
+    collapsed means hidden with maximumHeight 0 (so the next
+    expand starts from 0). The reduced-motion key is read fresh
+    from QSettings on every toggle, so the spring and the menu
+    item can never disagree.
+    """
+
+    def __init__(self, director, prefs):
+        from PySide6 import QtCore
+        self._director = director
+        self._prefs = prefs
+        self._QtCore = QtCore
+        self._anim = None
+        self._target_collapsed = False
+
+    @property
+    def target_collapsed(self):
+        return self._target_collapsed
+
+    def is_animating(self):
+        """True while a spring is still running."""
+        return self._anim is not None
+
+    def set_collapsed(self, collapsed, instant=False):
+        """Move the director toward `collapsed`. The target flips
+        at once; the height follows by spring, or instantly when
+        `instant` is set (startup) or reduced motion is on."""
+        collapsed = bool(collapsed)
+        self._target_collapsed = collapsed
+        self._stop_anim()
+        if instant or self._reduced_motion():
+            self._jump(collapsed)
+        elif collapsed:
+            self._animate_collapse()
+        else:
+            self._animate_expand()
+
+    def stop(self):
+        """Stop any running animation (closing time). The director
+        keeps whatever height it had; the window is going away,
+        and the next open applies the saved state instantly."""
+        self._stop_anim()
+
+    def _reduced_motion(self):
+        return bool(self._prefs.value(
+            SETTING_REDUCED_MOTION, False, type=bool))
+
+    def _stop_anim(self):
+        # stop() freezes the property at its current value --
+        # that is the next animation's start value, so an
+        # interrupted spring reverses from where it actually is.
+        # stop() never emits finished, so the old finished
+        # handler cannot fire afterwards.
+        if self._anim is not None:
+            self._anim.stop()
+            self._anim = None
+
+    def _jump(self, collapsed):
+        if collapsed:
+            self._director.setMaximumHeight(0)
+            self._director.setVisible(False)
+        else:
+            self._director.setMaximumHeight(QWIDGETSIZE_MAX)
+            self._director.setVisible(True)
+
+    def _full_height(self):
+        # sizeHint stays valid while hidden (probed): the layout
+        # still knows the content's preferred height.
+        return self._director.sizeHint().height()
+
+    def _animate_expand(self):
+        director = self._director
+        full = self._full_height()
+        if full <= 0:
+            self._jump(False)
+            return
+        start = director.maximumHeight()
+        if start >= QWIDGETSIZE_MAX:
+            # Already fully expanded (settled): nothing to do.
+            return
+        director.setVisible(True)
+        anim = self._QtCore.QPropertyAnimation(
+            director, b"maximumHeight")
+        anim.setDuration(DIRECTOR_EXPAND_MS)
+        anim.setEasingCurve(self._QtCore.QEasingCurve.Type.OutBack)
+        anim.setStartValue(max(0, start))
+        anim.setEndValue(full)
+        anim.finished.connect(self._on_expand_finished)
+        self._anim = anim
+        anim.start()
+
+    def _on_expand_finished(self):
+        self._anim = None
+        # Back to no cap: the director must still grow when a
+        # section opens or the review frame appears.
+        self._director.setMaximumHeight(QWIDGETSIZE_MAX)
+
+    def _animate_collapse(self):
+        director = self._director
+        full = self._full_height()
+        # Clamp to the full height: mid-expand the property can
+        # overshoot past it (OutBack), but the widget itself never
+        # grows past its sizeHint, so the collapse starts there.
+        start = min(director.maximumHeight(), full)
+        if not director.isVisible() or start <= 0:
+            # Already collapsed (or nothing to shrink): settle.
+            self._jump(True)
+            return
+        anim = self._QtCore.QPropertyAnimation(
+            director, b"maximumHeight")
+        anim.setDuration(DIRECTOR_COLLAPSE_MS)
+        anim.setEasingCurve(self._QtCore.QEasingCurve.Type.OutCubic)
+        anim.setStartValue(start)
+        anim.setEndValue(0)
+        anim.finished.connect(self._on_collapse_finished)
+        self._anim = anim
+        anim.start()
+
+    def _on_collapse_finished(self):
+        self._anim = None
+        self._director.setVisible(False)
+        # maximumHeight stays 0: the next expand starts from 0.
 
 
 class Motion:

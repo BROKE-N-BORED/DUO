@@ -79,9 +79,11 @@ Everything in one app:
 - **One window only** — launching DUO twice does not open a second
   window: the DUO already running comes to the front instead.
 - **Answers back** — buttons dip when pressed, a turn finishing
-  flashes the side's light lime for a moment, and keyboard focus
-  wears a clear blue ring. A \"Reduce motion\" item in the Help
-  menu turns the dip off while keeping the flash and the ring.
+  flashes the side's light lime for a moment, keyboard focus
+  wears a clear blue ring, and the Director toggle springs open
+  and shut instead of snapping. A \"Reduce motion\" item in the
+  Help menu turns the dip and the spring off while keeping the
+  flash and the ring.
 - **Update check** — DUO checks GitHub once at startup and says in
   the status bar when a newer Release is out (silently saying
   nothing when offline), and a "Check for updates" button runs the
