@@ -28,6 +28,8 @@ from dual_chat import (  # noqa: E402
     CHAT_RETRY_DELAYS, CHAT_TIMEOUT, COMPARE_PREFIX,
     CONVERSATION_FORMAT_VERSION, DECK_PAGE_HTML,
     DECK_PORT, ERROR_STATE_HOLD_MS,
+    EXPLAIN_INSTR, EXPLAIN_RELAY_ROW1, EXPLAIN_STOP, EXPLAIN_STYLE,
+    EXPLAIN_TASK, EXPLAIN_TASK_ROW, EXPLAIN_TEMP,
     FIRST_RUN_HEADER, FIRST_RUN_STEP1, FIRST_RUN_STEP2, FIRST_RUN_STEP3,
     FIRST_RUN_TICK, FULL_LOG_MAX_ENTRIES,
     FULL_LOG_TRIMMED_NOTE,
@@ -6099,9 +6101,16 @@ class DeckGuiTests(unittest.TestCase):
         self._pick_models()
         self.assertTrue(
             self._post_send({"text": "Deck hello", "target": "A"})["ok"])
+        # Wait for the history too, not just the transcript text:
+        # the last chunk lands in the transcript before on_done
+        # appends the reply to history, and the fetch below makes
+        # a blocking HTTP call without pumping the event loop --
+        # a reply still sitting in the done signal reads as one
+        # message, not two. (Same shape as the v0.35 Item6 race.)
         self.assertTrue(self._wait_for(lambda: (
             "Reply from fake-a:latest." in
-            self.state["widgets"]["A"]["transcript"].toPlainText()),
+            self.state["widgets"]["A"]["transcript"].toPlainText()
+            and len(self.state["convo"].sides["A"].messages) == 2),
             timeout=15))
         state = self._get_json("/state")
         msgs = state["sides"]["A"]["messages"]
@@ -6772,7 +6781,7 @@ class FrontDoorTests(unittest.TestCase):
 
     def test_changelog_covers_every_version(self):
         log = self._read("CHANGELOG.md")
-        for version in ["0.%d" % n for n in range(1, 42)]:
+        for version in ["0.%d" % n for n in range(1, 43)]:
             self.assertIn(version, log)
 
     def test_gitignore_covers_runtime_files(self):
@@ -8781,7 +8790,8 @@ class ModuleSplitTests(unittest.TestCase):
     MODULES = ("duo_ollama", "duo_stats", "duo_text", "duo_tasks",
                "duo_markdown", "duo_model", "duo_transcript",
                "duo_storage", "duo_runner", "duo_icon", "duo_menu",
-               "duo_deck", "duo_workers")
+               "duo_deck", "duo_workers", "duo_debug",
+               "duo_attachments")
 
     def _tree(self):
         return os.path.dirname(
@@ -8809,6 +8819,8 @@ class ModuleSplitTests(unittest.TestCase):
 
     def test_reexports_are_the_same_objects(self):
         import dual_chat
+        import duo_attachments
+        import duo_debug
         import duo_deck
         import duo_icon
         import duo_markdown
@@ -8863,6 +8875,16 @@ class ModuleSplitTests(unittest.TestCase):
             (dual_chat._OllamaStarter, duo_workers._OllamaStarter),
             (dual_chat._UpdateChecker, duo_workers._UpdateChecker),
             (dual_chat._qt, duo_workers._qt),
+            (dual_chat._NullLogger, duo_debug._NullLogger),
+            (dual_chat.make_debug_logger, duo_debug.make_debug_logger),
+            (dual_chat.AttachmentError, duo_attachments.AttachmentError),
+            (dual_chat.load_attachment, duo_attachments.load_attachment),
+            (dual_chat.build_attached_message,
+             duo_attachments.build_attached_message),
+            (dual_chat.attachment_tag, duo_attachments.attachment_tag),
+            (dual_chat.MAX_ATTACHMENTS, duo_attachments.MAX_ATTACHMENTS),
+            (dual_chat.MAX_ATTACHMENT_BYTES,
+             duo_attachments.MAX_ATTACHMENT_BYTES),
         ]
         for through_dual_chat, original in pairs:
             self.assertIs(through_dual_chat, original, original)
@@ -9156,6 +9178,18 @@ class MessageStructureTests(unittest.TestCase):
                   encoding="utf-8") as fh:
             script = fh.read()
         self.assertIn('"duo_workers.py": 0o100644', script)
+
+    def test_zip_includes_the_debug_module(self):
+        with open(os.path.join(self._tree(), "build_zip.py"),
+                  encoding="utf-8") as fh:
+            script = fh.read()
+        self.assertIn('"duo_debug.py": 0o100644', script)
+
+    def test_zip_includes_the_attachments_module(self):
+        with open(os.path.join(self._tree(), "build_zip.py"),
+                  encoding="utf-8") as fh:
+            script = fh.read()
+        self.assertIn('"duo_attachments.py": 0o100644', script)
 
 class UpdateCheckTests(unittest.TestCase):
     """v0.28 (audit T17): the update check's pure core -- version
@@ -9857,6 +9891,14 @@ class ActivityIndicatorGuiTests(unittest.TestCase):
                 self.assertTrue(self._wait_for(
                     lambda: state["side_state"]["A"] == "error",
                     timeout=10))
+                # Wait for the button, not just the light: the
+                # error state is set in on_failed, but busy only
+                # clears in the on_idle signal queued after it --
+                # a click landing before idle hits a disabled
+                # button and the second send never starts.
+                # (Same shape as the v0.35 Item6 race.)
+                self.assertTrue(self._wait_for(
+                    lambda: state["send_a"].isEnabled(), timeout=10))
                 # A new send right away: the error light gives way
                 # to the new turn, and the hold timer never drags
                 # the side back to anything wrong afterwards.
@@ -11412,12 +11454,15 @@ class DirectorSectionsGuiTests(unittest.TestCase):
     def test_stop_phrase_field_wide_at_900px(self):
         # T24: at the 900 px minimum width the stop-phrase field
         # used to shrink to a sliver. In its own row it keeps
-        # most of the width; 300 px is a floor with room to
-        # spare (measured 552 px in the sandbox).
+        # most of the width. v0.42 (U20) put the stop-phrase
+        # explanation beside the field, so the field narrows to
+        # make room -- the 300 px floor (measured 552 px) is
+        # superseded by 200 px: T24's intent was usable, not a
+        # sliver, and 200 px still shows a stop word.
         self.window.resize(900, 680)
         self.app.processEvents()
         self.assertEqual(self.window.width(), 900)
-        self.assertGreaterEqual(self.state["stop_edit"].width(), 300)
+        self.assertGreaterEqual(self.state["stop_edit"].width(), 200)
         self.assertTrue(self.state["stop_edit"].isVisible())
         self.assertTrue(self.state["relay_btn"].isVisible())
         self.assertTrue(self.state["agree_check"].isVisible())
@@ -11735,6 +11780,47 @@ class FirstRunGuideTests(unittest.TestCase):
                      FIRST_RUN_STEP3,
                      first_run_guide_html(False),
                      first_run_guide_html(True)):
+            self.assertNotIn("\u2014", text)
+
+
+class FieldExplanationTests(unittest.TestCase):
+    """v0.42 (redesign U20): the field explanations' pure core --
+    the pinned words, the 11 px grey style, and the no-em-dash
+    rule. The words are the design: change them here and in the
+    module together, never one without the other."""
+
+    def test_explanation_texts_are_the_pinned_words(self):
+        self.assertEqual(
+            EXPLAIN_TEMP, "Lower is more focused, higher is more "
+                          "creative.")
+        self.assertEqual(
+            EXPLAIN_RELAY_ROW1,
+            "Start with picks which side answers first. "
+            "Turns caps the relay. "
+            "Blind hides that the other side is an AI.")
+        self.assertEqual(
+            EXPLAIN_STOP, "A reply containing one of these stops "
+                          "the relay.")
+        self.assertEqual(
+            EXPLAIN_INSTR, "Sent to this side's model with every "
+                           "message.")
+        self.assertEqual(
+            EXPLAIN_TASK, "Describe the work, then press Run Task.")
+        self.assertEqual(
+            EXPLAIN_TASK_ROW,
+            "Worker picks which side does the task. "
+            "Follow-up picks what the other side does with the "
+            "result. Rounds sets how many times the work passes "
+            "between the sides.")
+
+    def test_explanation_style_is_11px_grey(self):
+        self.assertEqual(EXPLAIN_STYLE,
+                         "font-size: 11px; color: #6b6b6b;")
+
+    def test_no_explanation_has_an_em_dash(self):
+        for text in (EXPLAIN_TEMP, EXPLAIN_RELAY_ROW1, EXPLAIN_STOP,
+                     EXPLAIN_INSTR, EXPLAIN_TASK, EXPLAIN_TASK_ROW,
+                     EXPLAIN_STYLE):
             self.assertNotIn("\u2014", text)
 
 
@@ -12465,6 +12551,150 @@ class PairSettingsGuiTests(unittest.TestCase):
             "Stop on agreement: yes\n"
             "Review each hop: no"))
         self.assertNotIn("\u2014", text)
+
+
+@unittest.skipUnless(os.environ.get("DUAL_CHAT_GUI_TESTS") == "1",
+                     "GUI tests run with DUAL_CHAT_GUI_TESTS=1")
+class FieldExplanationsGuiTests(unittest.TestCase):
+    """v0.42 (redesign U20): every field that needs one explains
+    itself in plain visible words -- beside the field where its
+    row has empty space, underneath where the layout has room
+    (inside sections that start closed). The model picker, the
+    composer, the search boxes, and the pair and preset name
+    fields carry no line: their placeholders (and, for the
+    picker, the size and fit labels) already say what they are
+    for. The update check is stubbed, as in MenuBarGuiTests, so
+    no test touches the network."""
+
+    @classmethod
+    def setUpClass(cls):
+        from PySide6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+        cls.client = FakeGuiClient()
+
+    def setUp(self):
+        # The section choices are persisted, so clear them (and
+        # the director choice) before every window: each test
+        # starts from the defaults.
+        self._clear_section_settings()
+        from dual_chat import build_window
+        self._patcher = mock.patch(
+            "dual_chat.check_for_update",
+            return_value=("latest", None))
+        self._patcher.start()
+        self.client.reset()
+        self.window = build_window(self.client, logger=TEST_LOGGER)
+        self.window.show()
+        self.state = self.window._dual_chat
+        self._wait_for(lambda: self.state["widgets"]["A"]["picker"].count() == 2)
+        self._pick_models()
+
+    def tearDown(self):
+        self.window.close()
+        self.app.processEvents()
+        self._patcher.stop()
+        self._clear_section_settings()
+
+    def _clear_section_settings(self):
+        from PySide6.QtCore import QSettings
+        from dual_chat import SETTING_DIRECTOR_COLLAPSED
+        from dual_chat import SETTING_SECTION_COLLAPSED
+        settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
+        settings.remove(SETTING_DIRECTOR_COLLAPSED)
+        for key in ("relay", "pairs", "tasks"):
+            settings.remove(SETTING_SECTION_COLLAPSED % key)
+        settings.sync()
+
+    def _wait_for(self, cond, timeout=10.0):
+        from PySide6.QtTest import QTest
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            QTest.qWait(50)
+            if cond():
+                return True
+        return cond()
+
+    def _pick_models(self):
+        self.state["widgets"]["A"]["picker"].setCurrentIndex(0)
+        self.state["widgets"]["B"]["picker"].setCurrentIndex(1)
+        self.app.processEvents()
+
+    def test_temperature_explanations_text_style_and_visible(self):
+        for side in ("A", "B"):
+            label = self.state["widgets"][side]["temp_explain"]
+            self.assertEqual(label.text(), EXPLAIN_TEMP)
+            self.assertEqual(label.styleSheet(), EXPLAIN_STYLE)
+            self.assertTrue(label.isVisible())
+            # One line: a wrapped label's size hint wraps the
+            # sentence at ~198 px and the row grows two lines
+            # tall, while the unwrapped sentence is 244 px and
+            # fits the row even at the 900 px minimum width.
+            self.assertFalse(label.wordWrap())
+
+    def test_relay_explanations_text_style_and_visible(self):
+        relay_label = self.state["relay_explain"]
+        self.assertEqual(relay_label.text(), EXPLAIN_RELAY_ROW1)
+        self.assertEqual(relay_label.styleSheet(), EXPLAIN_STYLE)
+        self.assertTrue(relay_label.wordWrap())
+        self.assertTrue(relay_label.isVisible())
+        stop_label = self.state["stop_explain"]
+        self.assertEqual(stop_label.text(), EXPLAIN_STOP)
+        self.assertEqual(stop_label.styleSheet(), EXPLAIN_STYLE)
+        # One line: it shares its row with the stop-phrase field,
+        # and wrapping would push the row taller.
+        self.assertFalse(stop_label.wordWrap())
+        self.assertTrue(stop_label.isVisible())
+
+    def test_instructions_explanations_follow_the_toggle(self):
+        for side in ("A", "B"):
+            widgets = self.state["widgets"][side]
+            label = widgets["instr_explain"]
+            self.assertEqual(label.text(), EXPLAIN_INSTR)
+            self.assertEqual(label.styleSheet(), EXPLAIN_STYLE)
+            # Hidden with the closed editor at default.
+            self.assertFalse(label.isVisible())
+            widgets["instr_toggle"].click()
+            self.app.processEvents()
+            self.assertTrue(widgets["instr_edit"].isVisible())
+            self.assertTrue(label.isVisible())
+            widgets["instr_toggle"].click()
+            self.app.processEvents()
+            self.assertFalse(widgets["instr_edit"].isVisible())
+            self.assertFalse(label.isVisible())
+
+    def test_task_explanations_follow_the_section(self):
+        task_label = self.state["task_explain"]
+        self.assertEqual(task_label.text(), EXPLAIN_TASK)
+        self.assertEqual(task_label.styleSheet(), EXPLAIN_STYLE)
+        row_label = self.state["task_row_explain"]
+        self.assertEqual(row_label.text(), EXPLAIN_TASK_ROW)
+        self.assertEqual(row_label.styleSheet(), EXPLAIN_STYLE)
+        # Hidden with the collapsed Tasks section at default.
+        # (Children of a hidden parent report isHidden() False,
+        # so visibility is what is asserted here.)
+        self.assertFalse(task_label.isVisible())
+        self.assertFalse(row_label.isVisible())
+        self.state["tasks_section_toggle"].click()
+        self.app.processEvents()
+        self.assertTrue(task_label.isVisible())
+        self.assertTrue(row_label.isVisible())
+        self.state["tasks_section_toggle"].click()
+        self.app.processEvents()
+        self.assertFalse(task_label.isVisible())
+        self.assertFalse(row_label.isVisible())
+
+    def test_explanations_visible_at_900px(self):
+        # At the 900 px minimum width the row-1 explanation wraps
+        # taller and the transcript slot shrinks -- acceptable,
+        # and the explanations stay visible; the stop-phrase field
+        # keeps 200 px+ (see the updated T24 test for why 200 is
+        # the floor now).
+        self.window.resize(900, 680)
+        self.app.processEvents()
+        self.assertEqual(self.window.width(), 900)
+        self.assertTrue(self.state["relay_explain"].isVisible())
+        self.assertTrue(self.state["stop_explain"].isVisible())
+        self.assertGreaterEqual(self.state["stop_edit"].width(), 200)
 
 
 if __name__ == "__main__":

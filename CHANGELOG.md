@@ -1,7 +1,26 @@
 # DUO changelog
 
 Every version, newest first. v0.1–v0.17 were built on 2026-11-12;
-v0.18–v0.35 on 2026-11-13; v0.36–v0.41 on 2026-11-14.
+v0.18–v0.35 on 2026-11-13; v0.36–v0.42 on 2026-11-14.
+
+## v0.42 — 2026-11-14
+
+The fields explain themselves now, in plain words next to the
+field — not hidden in tooltips. Temperature reads "Lower is more
+focused, higher is more creative." next to the number. The relay
+rows say what Start with, Turns, and Blind mean, and what a stop
+phrase does. The instructions editor says it is sent to that
+side's model with every message, and the task controls say what
+the worker, the follow-up, and the rounds each do. The labels
+sit beside a field where its row has empty space, and underneath
+where the layout has room — inside sections that start closed —
+so the window stays the same height and the first-run guide
+still fits. The model picker, the composer, the search boxes,
+and the pair and preset name fields carry no explanation line:
+their placeholders (and, for the picker, the size and fit
+labels) already say what they are for. Under the hood, the debug
+logger fallback and the attachment helpers moved into their own
+small modules (duo_debug.py, duo_attachments.py).
 
 ## v0.41 — 2026-11-14
 

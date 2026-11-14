@@ -131,7 +131,10 @@ bash run.sh
   button reloads the list from Ollama. Under the picker is a
   Temperature control (0.0–2.0, default 0.7, which is Ollama's own
   default): lower is more focused, higher is more random. Each side's
-  temperature is remembered between runs.
+  temperature is remembered between runs. The fields explain
+  themselves in plain words next to the control — temperature, the
+  relay rows, the instructions editor, and the task controls all
+  say what they do, right where you look at them.
 - Send to A talks only to the left model. Send to B talks only to the
   right model. Send to Both sends the same message to each side, one
   after the other — A first, then B — so the PC never runs two models

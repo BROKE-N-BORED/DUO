@@ -179,25 +179,23 @@ import shutil  # noqa: F401 -- unused here, but the tests patch
 import sys
 import threading
 
-# Debug log layer: the BNB T21 standard, vendored as debug_log.py next
-# to this file. Logging must never break the app, so a missing module
-# falls back to a do-nothing logger instead of crashing the import.
-try:
-    import debug_log as _debug_log
-except ImportError:  # pragma: no cover - the zip always ships it
-    _debug_log = None
-
 # The code used to live in this one file (5,165 lines). v0.25
 # (audit T14) splits it into focused sibling modules; this file
 # keeps the window and the entry point (the phone deck moved to
 # duo_deck.py in v0.31, the background Qt workers to duo_workers.py
-# in v0.39, the relay session to duo_model.py in v0.40), and
+# in v0.39, the relay session to duo_model.py in v0.40, the debug
+# log fallback to duo_debug.py and the attachments to
+# duo_attachments.py in v0.42), and
 # re-exports the moved names so
 # `from dual_chat import ...` keeps working unchanged -- the
 # tests, the installer, and the deck all import through here.
 # build_window stays a closure in this file: splitting the
 # window itself into a class is a bigger redesign and not this
 # task.
+from duo_attachments import (
+    MAX_ATTACHMENTS, MAX_ATTACHMENT_BYTES, AttachmentError,
+    attachment_tag, build_attached_message, load_attachment,)
+from duo_debug import _NullLogger, _debug_log, make_debug_logger
 from duo_deck import (
     DECK_PAGE_HTML, DECK_PORT, DECK_PORT_ENV, DECK_PORT_TRIES,
     MSG_EMPTY, MSG_PHONE_TARGET, DeckServer, build_deck_state,
@@ -248,71 +246,8 @@ from duo_workers import (_ModelLoader, _OllamaStarter, _SignalObject,
                          _Signals, _UpdateChecker, _qt,)
 
 
-class _NullLogger:
-    """Drop-in for DebugLogger when the module is missing: every call
-    is a no-op, and a report request reports that logging is off."""
-
-    def debug(self, *a, **k):
-        pass
-
-    def info(self, *a, **k):
-        pass
-
-    def warning(self, *a, **k):
-        pass
-
-    def error(self, *a, **k):
-        pass
-
-    def exception(self, *a, **k):
-        pass
-
-    def action(self, *a, **k):
-        pass
-
-    def set_setting(self, *a, **k):
-        pass
-
-    def register_service(self, *a, **k):
-        pass
-
-    def register_dependency(self, *a, **k):
-        pass
-
-    def build_report(self):
-        return "DEBUG REPORT — %s %s\n\nLogging is not available.\n" % (
-            APP_NAME, APP_VERSION)
-
-    def generate_report(self, path=None):
-        if path is None:
-            path = "debug-report-unavailable.txt"
-        with open(path, "w", encoding="utf-8") as fh:
-            fh.write(self.build_report())
-        return path
-
-    def install_crash_handler(self):
-        pass
-
-    def uninstall_crash_handler(self):
-        pass
-
-
-def make_debug_logger(log_dir=None):
-    """A DebugLogger for this app, or a null logger when the vendored
-    module is missing. The log file lives next to the app
-    (duo-debug.log), rotating so it never grows without bound."""
-    if _debug_log is None:
-        return _NullLogger()
-    if log_dir is None:
-        log_dir = os.path.dirname(os.path.abspath(__file__))
-    try:
-        return _debug_log.DebugLogger("duo-debug", APP_VERSION,
-                                      log_dir=log_dir)
-    except OSError:
-        return _NullLogger()
-
 APP_NAME = "DUO"
-APP_VERSION = "0.41"
+APP_VERSION = "0.42"
 
 # Plain-language messages shown in the panes. No tracebacks in the UI.
 MSG_STOPPED = "Stopped."
@@ -418,6 +353,30 @@ FIRST_RUN_STEP2 = "Type a message below and send it to both."
 FIRST_RUN_STEP3 = "Start a relay and watch them talk."
 FIRST_RUN_TICK = "\u2713"  # a checkmark, not a bullet
 
+# Field explanations (v0.42, redesign U20): every field that needs
+# one explains itself in plain visible words -- beside the field
+# where its row has empty space, underneath where the layout has
+# room (inside sections that start closed). Beside, not underneath,
+# everywhere: the default 1100x700 window is full (the v0.39
+# geometry probe: an 87 px transcript slot against a 76 px
+# first-run guide), and a line under every field would clip the
+# guide. The model picker needs none (its placeholder + the guided
+# size/fit entries + its position already say what it is for),
+# and neither do the composer, the search boxes, or the pair and
+# preset name fields (their placeholders cover them).
+EXPLAIN_TEMP = "Lower is more focused, higher is more creative."
+EXPLAIN_RELAY_ROW1 = ("Start with picks which side answers first. "
+                      "Turns caps the relay. "
+                      "Blind hides that the other side is an AI.")
+EXPLAIN_STOP = "A reply containing one of these stops the relay."
+EXPLAIN_INSTR = "Sent to this side's model with every message."
+EXPLAIN_TASK = "Describe the work, then press Run Task."
+EXPLAIN_TASK_ROW = ("Worker picks which side does the task. "
+                    "Follow-up picks what the other side does with "
+                    "the result. Rounds sets how many times the work "
+                    "passes between the sides.")
+EXPLAIN_STYLE = "font-size: 11px; color: #6b6b6b;"
+
 
 def first_run_guide_html(models_picked):
     """The first-run guide as HTML: a bold header and three steps.
@@ -455,59 +414,6 @@ MSG_TASK_NEEDS_FOLLOW_UP = "Pick what the other model does with the result."
 MSG_PAIR_NEEDS_NAME = "Name the pair first."
 MSG_PRESET_NEEDS_NAME = "Name the preset first."
 MSG_REVIEW_EMPTY = "Nothing to forward -- edit the text or skip this hop."
-
-
-# Attachments (Item 5): text files only, each at most 100 KB, at most
-# 5 attached at once. Contents are read at attach time, so a file
-# deleted before the send still goes through.
-MAX_ATTACHMENTS = 5
-MAX_ATTACHMENT_BYTES = 100 * 1024
-
-
-class AttachmentError(Exception):
-    """A plain-language reason a file couldn't be attached."""
-
-
-def load_attachment(path):
-    """Read a file as an attachment: (name, text).
-
-    Raises AttachmentError with a plain message when the file is too
-    big, isn't decodable UTF-8, or can't be read. The size is checked
-    before reading, so a huge file is refused without loading it.
-    """
-    name = os.path.basename(path)
-    try:
-        size = os.path.getsize(path)
-    except OSError:
-        raise AttachmentError("Couldn't read '%s'." % name)
-    if size > MAX_ATTACHMENT_BYTES:
-        raise AttachmentError(
-            "'%s' is over 100 KB, so it wasn't attached." % name)
-    try:
-        with open(path, "r", encoding="utf-8") as fh:
-            text = fh.read()
-    except (OSError, UnicodeDecodeError):
-        raise AttachmentError(
-            "'%s' isn't a text file, so it wasn't attached." % name)
-    return name, text
-
-
-def build_attached_message(files, text):
-    """Prepend file blocks to a typed message.
-
-    files is [(name, contents), ...]. Each file becomes a block
-    "File: <name>\n<contents>"; blocks and the typed message are
-    separated by a blank line. No files -> the message unchanged.
-    """
-    if not files:
-        return text
-    blocks = ["File: %s\n%s" % (name, contents) for name, contents in files]
-    return "\n\n".join(blocks) + "\n\n" + text
-
-
-def attachment_tag(names):
-    """The short transcript tag for attached files."""
-    return "(Attached: %s)" % ", ".join(names)
 
 
 def _open_link_in_browser(url):
@@ -579,6 +485,17 @@ def build_window(client=None, logger=None, deck_port=None):
         # Queued runner signals can land after the window is gone (e.g.
         # closing right as a relay stops). Never touch widgets then.
         return shiboken6.isValid(window)
+
+    def _make_explanation(text, wrap=True):
+        """A field explanation label (v0.42, U20): 11 px grey text in
+        plain words, beside or under the field it explains. Wraps by
+        default; a label that must stay on one line (the stop-phrase
+        explanation, which shares its row with the field) passes
+        wrap=False, and the field absorbs the squeeze."""
+        label = QtWidgets.QLabel(text)
+        label.setStyleSheet(EXPLAIN_STYLE)
+        label.setWordWrap(wrap)
+        return label
 
     central = QtWidgets.QWidget()
     window.setCentralWidget(central)
@@ -686,6 +603,15 @@ def build_window(client=None, logger=None, deck_port=None):
 
         temp_spin.valueChanged.connect(_save_temperature)
         temp_row.addWidget(temp_spin)
+        # Field explanation (v0.42, U20): beside the spinbox, in
+        # the row's empty space -- the row is wide and the control
+        # is narrow, so it costs no height. One line, not wrapped:
+        # a word-wrapped label's size hint wraps the sentence at
+        # ~198 px and the row grows to two lines tall, while the
+        # unwrapped sentence is 244 px and fits the row even at
+        # the 900 px minimum width (probed, not assumed).
+        temp_explain = _make_explanation(EXPLAIN_TEMP, wrap=False)
+        temp_row.addWidget(temp_explain)
         temp_row.addStretch(1)
         layout.addLayout(temp_row)
 
@@ -697,6 +623,13 @@ def build_window(client=None, logger=None, deck_port=None):
         instr_edit.setFixedHeight(44)
         instr_edit.setVisible(False)
         layout.addWidget(instr_edit)
+        # Field explanation (v0.42, U20): under the editor, inside
+        # the collapsible -- hidden with it, so zero cost while
+        # the editor is closed. Toggled with the editor in
+        # make_instr_toggle, below.
+        instr_explain = _make_explanation(EXPLAIN_INSTR)
+        instr_explain.setVisible(False)
+        layout.addWidget(instr_explain)
 
         # Transcript block (v0.38, T20): the transcript and its
         # rows, as the top half of the history splitter -- the
@@ -854,12 +787,14 @@ def build_window(client=None, logger=None, deck_port=None):
             "title": title,
             "picker": picker, "refresh": refresh, "transcript": transcript,
             "temperature": temp_spin,
+            "temp_explain": temp_explain,
             "status": status, "stop": stop, "clear": clear,
             "save": save, "import": import_btn,
             "search_edit": search_edit, "search_count": search_count,
             "search_prev": search_prev, "search_next": search_next,
             "search_matches": [], "search_current": -1,
             "instr_toggle": instr_toggle, "instr_edit": instr_edit,
+            "instr_explain": instr_explain,
             "use_this": use_this, "hist_toggle": hist_toggle,
             "hist_frame": hist_frame, "hist_list": hist_list,
             "hist_split": hist_split,
@@ -1041,13 +976,24 @@ def build_window(client=None, logger=None, deck_port=None):
     mode_picker = QtWidgets.QComboBox()
     mode_picker.addItems(["Blind", "Aware"])
     relay_row1.addWidget(mode_picker)
-    relay_row1.addStretch(1)
+    # Field explanation (v0.42, U20): in the row's empty right
+    # space, taking the stretch's place. It wraps to two lines
+    # there; the row stays about the same height because the
+    # controls are ~28 px tall.
+    relay_explain = _make_explanation(EXPLAIN_RELAY_ROW1)
+    relay_row1.addWidget(relay_explain, stretch=1)
     relay_layout.addLayout(relay_row1)
     relay_row2 = QtWidgets.QHBoxLayout()
     relay_row2.addWidget(QtWidgets.QLabel("Stop on:"))
     stop_edit = QtWidgets.QLineEdit()
     stop_edit.setPlaceholderText("words, separated by commas")
     relay_row2.addWidget(stop_edit, stretch=1)
+    # Field explanation (v0.42, U20): beside the field, on one
+    # line -- the field narrows to make room, and keeps 200 px+
+    # at the 900 px minimum width. T24's intent was usable, not
+    # a sliver, and 200 px still shows a stop word.
+    stop_explain = _make_explanation(EXPLAIN_STOP, wrap=False)
+    relay_row2.addWidget(stop_explain)
     agree_check = QtWidgets.QCheckBox("Stop on agreement")
     relay_row2.addWidget(agree_check)
     review_check = QtWidgets.QCheckBox("Review each hop")
@@ -1107,6 +1053,10 @@ def build_window(client=None, logger=None, deck_port=None):
     task_edit.setPlaceholderText("Describe a task for one model...")
     task_edit.setFixedHeight(44)
     tasks_layout.addWidget(task_edit)
+    # Field explanation (v0.42, U20): under the task box, inside
+    # the collapsed Tasks section -- zero cost at default.
+    task_explain = _make_explanation(EXPLAIN_TASK)
+    tasks_layout.addWidget(task_explain)
 
     task_row = QtWidgets.QHBoxLayout()
     task_row.addWidget(QtWidgets.QLabel("Task:"))
@@ -1135,6 +1085,11 @@ def build_window(client=None, logger=None, deck_port=None):
     task_row.addWidget(task_run)
     task_row.addStretch(1)
     tasks_layout.addLayout(task_row)
+    # Field explanation (v0.42, U20): one combined line under the
+    # task row, inside the collapsed Tasks section -- the three
+    # controls share a row, so one line covers all three.
+    task_row_explain = _make_explanation(EXPLAIN_TASK_ROW)
+    tasks_layout.addWidget(task_row_explain)
 
     # --- hop review (shown only while a relay waits on a review) ----------
     # It stays outside the sections on purpose: a review pause needs
@@ -3091,6 +3046,7 @@ def build_window(client=None, logger=None, deck_port=None):
     def make_instr_toggle(side):
         def toggled(checked):
             widgets[side]["instr_edit"].setVisible(checked)
+            widgets[side]["instr_explain"].setVisible(checked)
             widgets[side]["instr_toggle"].setText(
                 "Instructions ▾" if checked else "Instructions ▸")
         return toggled
@@ -3754,6 +3710,7 @@ def build_window(client=None, logger=None, deck_port=None):
         "relay_btn": relay_btn, "start_picker": start_picker,
         "cap_spin": cap_spin, "mode_picker": mode_picker,
         "stop_edit": stop_edit, "agree_check": agree_check,
+        "relay_explain": relay_explain, "stop_explain": stop_explain,
         "relay_status": relay_status,
         "relay_chip": relay_chip, "relay_dot": relay_dot,
         "relay_chip_stop": relay_chip_stop,
@@ -3785,6 +3742,8 @@ def build_window(client=None, logger=None, deck_port=None):
         "task_edit": task_edit, "task_worker": task_worker,
         "task_follow_up": task_follow_up, "task_rounds": task_rounds,
         "task_run": task_run,
+        "task_explain": task_explain,
+        "task_row_explain": task_row_explain,
         "do_run_task": do_run_task,
         "save_both": save_both, "do_save": do_save,
         "do_save_both": do_save_both,
