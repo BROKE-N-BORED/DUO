@@ -1,7 +1,24 @@
 # DUO changelog
 
 Every version, newest first. v0.1–v0.17 were built on 2026-11-12;
-v0.18–v0.35 on 2026-11-13; v0.36–v0.44 on 2026-11-14.
+v0.18–v0.35 on 2026-11-13; v0.36–v0.45 on 2026-11-14.
+
+## v0.45 — 2026-11-14
+
+The window answers back now. Pressing a button dips it
+slightly, so a press is felt, not just seen. When a turn
+finishes, the side's light flashes lime for a moment — a small
+finish mark on top of the light going back to grey. And
+keyboard focus is visible at last: whichever field or button
+has it wears a clear blue ring, so tabbing through the window
+never leaves you guessing where you are. All three are cheap
+on purpose — the motion is a short geometry shift, nothing
+heavier — and a new \"Reduce motion\" item in the Help menu
+turns the dip off while keeping the flash and the ring, which
+are state changes, not motion. Two probes settled the design
+before it was built: the dip's geometry animation does not
+fight the layout, and the focus stylesheet leaves unfocused
+widgets looking exactly as they did.
 
 ## v0.44 — 2026-11-14
 

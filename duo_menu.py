@@ -144,7 +144,7 @@ def show_how_to_use_dialog(parent):
     make_how_to_use_dialog(parent).exec()
 
 
-def build_menu_bar(window, handlers, version):
+def build_menu_bar(window, handlers, version, reduce_motion=None):
     """Build DUO's menu bar on `window` (a QMainWindow).
 
     `handlers` maps each action name to the callable the matching
@@ -152,6 +152,11 @@ def build_menu_bar(window, handlers, version):
     save_full, save_both, debug_report, quit, start_relay,
     stop_relay, check_updates. About and How to use are the two
     items with no button: they open dialogs.
+
+    `reduce_motion` (optional, v0.45 R7) is (setter, initial): the
+    callable the checkable "Reduce motion" Help item calls with its
+    checked state, and whether it starts checked. When omitted the
+    item is left out.
 
     Returns (menu_bar, actions): the QMenuBar and a dict mapping
     every action name (plus "about" and "how_to_use") to its
@@ -193,6 +198,17 @@ def build_menu_bar(window, handlers, version):
     help_menu = menu_bar.addMenu("Help")
     add(help_menu, "check_updates", "Check for updates",
         handlers["check_updates"])
+    if reduce_motion is not None:
+        # Reduced motion (v0.45, R7): a checkable item, not a
+        # button -- it toggles a setting. The setter takes the
+        # action's checked state (triggered passes it); setChecked
+        # emits toggled, not triggered, so the initial state never
+        # writes the setting back.
+        setter, initial = reduce_motion
+        action = add(help_menu, "reduce_motion", "Reduce motion",
+                     setter)
+        action.setCheckable(True)
+        action.setChecked(initial)
     add(help_menu, "how_to_use", "How to use",
         lambda: show_how_to_use_dialog(window))
     add(help_menu, "about", "About",

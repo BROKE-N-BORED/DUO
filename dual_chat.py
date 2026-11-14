@@ -209,6 +209,7 @@ from duo_model import (
     RELAY_CAP_MIN, SIDE_COLORS, ChatMessage, ChatSide, Conversation,
     MSG_NO_MODEL, NoModelSelected, RelaySession, SUMMARY_KEEP_LAST,
     SUMMARY_LABEL,)
+from duo_motion import install_motion
 from duo_ollama import (
     CHAT_MAX_ATTEMPTS, CHAT_RETRY_DELAYS, CHAT_TIMEOUT, DEFAULT_OLLAMA_URL,
     MSG_MODEL_FAILED, MSG_OLLAMA_DOWN, MSG_OLLAMA_NOT_INSTALLED,
@@ -251,7 +252,7 @@ from duo_workers import (_ModelLoader, _OllamaStarter, _SignalObject,
 
 
 APP_NAME = "DUO"
-APP_VERSION = "0.44"
+APP_VERSION = "0.45"
 
 # Plain-language messages shown in the panes. No tracebacks in the UI.
 MSG_STOPPED = "Stopped."
@@ -2215,6 +2216,9 @@ def build_window(client=None, logger=None, deck_port=None):
         refresh_history_list(side)
         state["active"].discard(side)
         set_side_state(side, "idle")
+        # The turn finished: the dot flashes lime for 200 ms (v0.45,
+        # R7) -- a finish moment, not just the light going grey.
+        motion.flash(side)
         # Stats for this turn (every turn, relay turns included).
         stats = _take_job_stats(job_id, side)
         if stats is not None:
@@ -3698,6 +3702,12 @@ def build_window(client=None, logger=None, deck_port=None):
 
     phone_btn.clicked.connect(show_phone_deck)
 
+    # Micro-interactions (v0.45, R7): the focus ring, the button
+    # dip, the completion flash, and the reduced-motion setting --
+    # all in duo_motion.py, installed here once every button exists.
+    motion = install_motion(window, widgets, side_state,
+                            SIDE_STATES["idle"][0], prefs)
+
     # --- menu bar (v0.30) -------------------------------------------------
     # File / Relay / Help, plus shortcuts for the main actions. Every
     # item calls the same handler as its button -- access, not
@@ -3714,7 +3724,8 @@ def build_window(client=None, logger=None, deck_port=None):
         "start_relay": do_start_relay,
         "stop_relay": stop_relay,
         "check_updates": lambda: run_update_check(manual=True),
-    }, APP_VERSION)
+    }, APP_VERSION, reduce_motion=(motion.reduced_motion.set,
+                                   motion.reduced_motion.value))
 
     window._dual_chat = {  # test hooks (not part of the UI)
         "convo": convo, "runner": runner, "signals": signals,
@@ -3790,6 +3801,7 @@ def build_window(client=None, logger=None, deck_port=None):
         "on_update_checked": on_update_checked,
         "update_checkers": update_checkers,
         "menu_bar": menu_bar, "menu_actions": menu_actions,
+        "motion": motion,
         "director": director, "director_toggle": director_toggle,
         "set_director_collapsed": _set_director_collapsed,
         "relay_section": relay_body,
@@ -3868,6 +3880,7 @@ def build_window(client=None, logger=None, deck_port=None):
         meter_timer.stop()
         for _timer in error_timers.values():
             _timer.stop()
+        motion.stop()
         logger.action("DUO closed")
         _orig_close_event(event)
 

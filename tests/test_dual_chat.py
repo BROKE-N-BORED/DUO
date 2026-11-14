@@ -6797,7 +6797,7 @@ class FrontDoorTests(unittest.TestCase):
 
     def test_changelog_covers_every_version(self):
         log = self._read("CHANGELOG.md")
-        for version in ["0.%d" % n for n in range(1, 45)]:
+        for version in ["0.%d" % n for n in range(1, 46)]:
             self.assertIn(version, log)
 
     def test_gitignore_covers_runtime_files(self):
@@ -8807,7 +8807,7 @@ class ModuleSplitTests(unittest.TestCase):
                "duo_markdown", "duo_model", "duo_transcript",
                "duo_storage", "duo_runner", "duo_icon", "duo_menu",
                "duo_deck", "duo_workers", "duo_debug",
-               "duo_attachments", "duo_single")
+               "duo_attachments", "duo_single", "duo_motion")
 
     def _tree(self):
         return os.path.dirname(
@@ -8842,6 +8842,7 @@ class ModuleSplitTests(unittest.TestCase):
         import duo_markdown
         import duo_menu
         import duo_model
+        import duo_motion
         import duo_ollama
         import duo_runner
         import duo_single
@@ -8854,6 +8855,7 @@ class ModuleSplitTests(unittest.TestCase):
         pairs = [
             (dual_chat.make_app_icon, duo_icon.make_app_icon),
             (dual_chat.build_menu_bar, duo_menu.build_menu_bar),
+            (dual_chat.install_motion, duo_motion.install_motion),
             (dual_chat.DeckServer, duo_deck.DeckServer),
             (dual_chat.build_deck_state, duo_deck.build_deck_state),
             (dual_chat.get_lan_ip, duo_deck.get_lan_ip),
@@ -9221,6 +9223,12 @@ class MessageStructureTests(unittest.TestCase):
                   encoding="utf-8") as fh:
             script = fh.read()
         self.assertIn('"duo_single.py": 0o100644', script)
+
+    def test_zip_includes_the_motion_module(self):
+        with open(os.path.join(self._tree(), "build_zip.py"),
+                  encoding="utf-8") as fh:
+            script = fh.read()
+        self.assertIn('"duo_motion.py": 0o100644', script)
 
 class UpdateCheckTests(unittest.TestCase):
     """v0.28 (audit T17): the update check's pure core -- version
@@ -9757,6 +9765,13 @@ class ActivityIndicatorGuiTests(unittest.TestCase):
     def _assert_side(self, side, state):
         color, text = SIDE_STATES[state]
         self.assertEqual(self._side_state(side), state)
+        if (color == "#8a8a8a" and self._dot_color(side) == "#a3e635"):
+            # The completion flash (v0.45, R7) holds the dot lime
+            # for 200 ms after a turn: the side is idle, the dot
+            # just hasn't settled yet. Wait for the grey, then
+            # assert the color exactly as before.
+            self._wait_for(
+                lambda: self._dot_color(side) == color, timeout=1)
         self.assertEqual(self._dot_color(side), color)
         self.assertEqual(self._activity_text(side), text)
         # The bottom-row status label shows the same words.
@@ -10231,7 +10246,8 @@ class MenuBarGuiTests(unittest.TestCase):
         self.assertEqual(self._item_texts(menus["Relay"]), [
             "Start relay", "Stop relay"])
         self.assertEqual(self._item_texts(menus["Help"]), [
-            "Check for updates", "How to use", "About"])
+            "Check for updates", "Reduce motion", "How to use",
+            "About"])
 
     def test_shortcuts_are_set(self):
         actions = self.state["menu_actions"]
@@ -13114,6 +13130,348 @@ class SingleInstanceGuiTests(unittest.TestCase):
                 first.wait(timeout=10)
             first.stdout.close()
             first.stderr.close()
+
+
+class MotionConstantsTests(unittest.TestCase):
+    """v0.45 (redesign R7): the motion module's constants and the
+    focus-ring stylesheet -- pure, no window needed."""
+
+    def test_dip_constants(self):
+        import duo_motion
+        # Entry 001: the button dips to 0.97 over 150 ms in all --
+        # 75 ms down on press, 75 ms back on release.
+        self.assertEqual(duo_motion.DIP_SCALE, 0.97)
+        self.assertEqual(duo_motion.DIP_PRESS_MS, 75)
+        self.assertEqual(duo_motion.DIP_RELEASE_MS, 75)
+        self.assertEqual(duo_motion.DIP_PRESS_MS
+                         + duo_motion.DIP_RELEASE_MS, 150)
+
+    def test_flash_constants(self):
+        import duo_motion
+        # Entry 008: the finish cue holds under 200 ms -- and it is
+        # lime, not the thinking green, because the dot is already
+        # green while the turn runs.
+        self.assertEqual(duo_motion.COMPLETION_FLASH_COLOR, "#a3e635")
+        self.assertEqual(duo_motion.COMPLETION_FLASH_MS, 200)
+
+    def test_focus_ring_and_setting_constants(self):
+        import duo_motion
+        self.assertEqual(duo_motion.FOCUS_RING_COLOR, "#2563eb")
+        self.assertEqual(duo_motion.FOCUS_RING_TINT, "#e8f0fe")
+        self.assertEqual(duo_motion.SETTING_REDUCED_MOTION,
+                         "motion/reduced")
+
+    def test_focus_ring_stylesheet_covers_every_focusable_class(self):
+        import duo_motion
+        sheet = duo_motion.FOCUS_RING_STYLESHEET
+        for selector in ("QPushButton:focus", "QTextEdit:focus",
+                         "QPlainTextEdit:focus", "QLineEdit:focus",
+                         "QComboBox:focus",
+                         "QSpinBox:focus", "QDoubleSpinBox:focus",
+                         "QListWidget:focus"):
+            self.assertIn(selector, sheet)
+        # Unmistakable, not a 1 px dotted line (entry 023).
+        self.assertIn("border: 2px solid #2563eb", sheet)
+        self.assertIn("background-color: #e8f0fe", sheet)
+
+    def test_focus_ring_stylesheet_only_styles_focused_widgets(self):
+        import duo_motion
+        # Every selector carries :focus: an unfocused widget keeps
+        # its native look exactly (probed: zero differing pixels).
+        for line in duo_motion.FOCUS_RING_STYLESHEET.strip().splitlines():
+            selectors = line.split("{")[0]
+            for selector in selectors.split(","):
+                self.assertIn(":focus", selector.strip())
+
+    def test_dot_stylesheet(self):
+        import duo_motion
+        self.assertEqual(
+            duo_motion.dot_stylesheet("#a3e635"),
+            "background-color: #a3e635; border-radius: 6px;")
+
+
+@unittest.skipUnless(os.environ.get("DUAL_CHAT_GUI_TESTS") == "1",
+                     "GUI tests run with DUAL_CHAT_GUI_TESTS=1")
+class MotionGuiTests(unittest.TestCase):
+    """v0.45 (redesign R7): the button dip, the completion flash,
+    the focus ring, and the reduced-motion setting, in the window.
+    The flash tests patch duo_motion.COMPLETION_FLASH_MS around
+    build_window -- the timer interval is captured at construction,
+    so a stretched window makes the 200 ms cue readable without a
+    timing race (the ERROR_STATE_HOLD_MS pattern)."""
+
+    @classmethod
+    def setUpClass(cls):
+        from PySide6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+        cls.client = FakeGuiClient()
+
+    def setUp(self):
+        self.client.reset()
+        self.window, self.state = self._build_window()
+        self._pick_models(self.state)
+        # The reduced-motion setting is shared QSettings: remember
+        # it and put it back, so a test that toggles it cannot leak
+        # into the next test (or the drive).
+        self._saved_reduced = (
+            self.state["motion"].reduced_motion.value)
+
+    def tearDown(self):
+        self.state["motion"].reduced_motion.set(self._saved_reduced)
+        self.window.close()
+        self.app.processEvents()
+
+    def _wait_for(self, cond, timeout=10.0):
+        from PySide6.QtTest import QTest
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            QTest.qWait(50)
+            if cond():
+                return True
+        return cond()
+
+    def _build_window(self, client=None, flash_ms=None):
+        from dual_chat import build_window
+        client = self.client if client is None else client
+        if flash_ms is None:
+            window = build_window(client, logger=TEST_LOGGER)
+        else:
+            with mock.patch("duo_motion.COMPLETION_FLASH_MS",
+                            flash_ms):
+                window = build_window(client, logger=TEST_LOGGER)
+        window.show()
+        state = window._dual_chat
+        self.assertTrue(self._wait_for(
+            lambda: state["widgets"]["A"]["picker"].count() == 2))
+        return window, state
+
+    def _pick_models(self, state):
+        state["widgets"]["A"]["picker"].setCurrentIndex(0)
+        state["widgets"]["B"]["picker"].setCurrentIndex(1)
+        self.app.processEvents()
+
+    def _dot_color(self, state, side):
+        # The stylesheet carries the color as a hex string.
+        sheet = state["widgets"][side]["activity_dot"].styleSheet()
+        return sheet.split("background-color:")[1].split(";")[0].strip()
+
+    def _send_to_a_and_wait(self, state, text, timeout=15.0):
+        state["composer"].setPlainText(text)
+        state["send_a"].click()
+        return self._wait_for(
+            lambda: not state["state"]["busy"], timeout=timeout)
+
+    def test_press_dips_the_button_and_restores_it(self):
+        from PySide6 import QtCore
+        from PySide6.QtTest import QTest
+        # Refresh is the harmless button: its click only reloads
+        # the model list.
+        button = self.state["widgets"]["A"]["refresh"]
+        rest = button.geometry()
+        QTest.mousePress(button, QtCore.Qt.MouseButton.LeftButton)
+        try:
+            # The dip holds while pressed, so polling catches it
+            # even when the animation's first tick lags.
+            self.assertTrue(self._wait_for(
+                lambda: button.geometry().width() < rest.width(),
+                timeout=2))
+            # Let the 75 ms press animation finish, then the
+            # shrunk rect is exact: 0.97 of the rest size,
+            # centred on the resting rect, not drifted. (A
+            # mid-animation sample can sit 1 px off centre while
+            # the interpolated components round -- the finished
+            # rect is the one to pin.)
+            QTest.qWait(150)
+            mid = button.geometry()
+            self.assertEqual(mid.width(), int(rest.width() * 0.97))
+            self.assertEqual(mid.height(), int(rest.height() * 0.97))
+            self.assertEqual(mid.center(), rest.center())
+        finally:
+            QTest.mouseRelease(button, QtCore.Qt.MouseButton.LeftButton)
+        self.assertTrue(self._wait_for(
+            lambda: button.geometry() == rest, timeout=2))
+
+    def test_disabled_button_does_not_dip(self):
+        from PySide6 import QtCore
+        from PySide6.QtTest import QTest
+        # Empty composer: the sends stay off (v0.43, T21).
+        button = self.state["send_a"]
+        self.assertFalse(button.isEnabled())
+        rest = button.geometry()
+        QTest.mousePress(button, QtCore.Qt.MouseButton.LeftButton)
+        QTest.qWait(150)
+        self.assertEqual(button.geometry(), rest)
+        QTest.mouseRelease(button, QtCore.Qt.MouseButton.LeftButton)
+        QTest.qWait(150)
+        self.assertEqual(button.geometry(), rest)
+
+    def test_no_dip_when_reduced_motion_is_on(self):
+        from PySide6 import QtCore
+        from PySide6.QtTest import QTest
+        motion = self.state["motion"]
+        motion.reduced_motion.set(True)
+        try:
+            button = self.state["widgets"]["A"]["refresh"]
+            rest = button.geometry()
+            QTest.mousePress(button, QtCore.Qt.MouseButton.LeftButton)
+            QTest.qWait(150)
+            self.assertEqual(button.geometry(), rest)
+            QTest.mouseRelease(button,
+                               QtCore.Qt.MouseButton.LeftButton)
+            QTest.qWait(150)
+            self.assertEqual(button.geometry(), rest)
+        finally:
+            motion.reduced_motion.set(False)
+
+    def test_turn_completion_flashes_the_dot_lime(self):
+        # A 2 s flash in this window: the lime is still there to
+        # read after the turn, with no timing race.
+        window, state = self._build_window(flash_ms=2000)
+        try:
+            self._pick_models(state)
+            self.assertTrue(
+                self._send_to_a_and_wait(state, "hello"))
+            self.assertEqual(self._dot_color(state, "A"), "#a3e635")
+            # The words stay "Idle": the flash is the light only,
+            # and the state is idle underneath it.
+            self.assertEqual(
+                state["widgets"]["A"]["activity"].text(), "Idle")
+            self.assertEqual(state["side_state"]["A"], "idle")
+        finally:
+            window.close()
+
+    def test_flash_reverts_to_idle_grey(self):
+        window, state = self._build_window(flash_ms=1000)
+        try:
+            self._pick_models(state)
+            self.assertTrue(
+                self._send_to_a_and_wait(state, "hello"))
+            self.assertEqual(self._dot_color(state, "A"), "#a3e635")
+            self.assertTrue(self._wait_for(
+                lambda: self._dot_color(state, "A") == "#8a8a8a",
+                timeout=5))
+        finally:
+            window.close()
+
+    def test_failed_turn_does_not_flash(self):
+        from dual_chat import build_window
+
+        class FailOnceClient(FakeGuiClient):
+            failed = False
+
+            def chat_stream(self, model, messages, on_chunk,
+                            cancel_event, timeout=1800, on_metrics=None,
+                            on_retry=None, options=None):
+                if not FailOnceClient.failed:
+                    FailOnceClient.failed = True
+                    raise OllamaError(MSG_MODEL_FAILED)
+                return super().chat_stream(
+                    model, messages, on_chunk, cancel_event,
+                    timeout=timeout, on_metrics=on_metrics,
+                    on_retry=on_retry, options=options)
+
+        window, state = self._build_window(client=FailOnceClient())
+        try:
+            self._pick_models(state)
+            state["composer"].setPlainText("first")
+            state["send_a"].click()
+            self.assertTrue(self._wait_for(
+                lambda: state["side_state"]["A"] == "error",
+                timeout=10))
+            # Red, not lime: the error state is already the cue.
+            self.assertEqual(self._dot_color(state, "A"), "#d64545")
+            from PySide6.QtTest import QTest
+            QTest.qWait(400)
+            self.assertEqual(self._dot_color(state, "A"), "#d64545")
+        finally:
+            window.close()
+
+    def test_flash_still_fires_when_reduced_motion_is_on(self):
+        # The flash is a state change, not motion: reduced motion
+        # stops the dip, never the cue.
+        window, state = self._build_window(flash_ms=2000)
+        try:
+            motion = state["motion"]
+            motion.reduced_motion.set(True)
+            try:
+                self._pick_models(state)
+                self.assertTrue(
+                    self._send_to_a_and_wait(state, "hello"))
+                self.assertEqual(
+                    self._dot_color(state, "A"), "#a3e635")
+            finally:
+                motion.reduced_motion.set(False)
+        finally:
+            window.close()
+
+    def test_focus_ring_stylesheet_is_applied(self):
+        import duo_motion
+        self.assertEqual(self.window.styleSheet(),
+                         duo_motion.FOCUS_RING_STYLESHEET)
+
+    def test_focusable_widgets_accept_focus(self):
+        from PySide6 import QtCore
+        no_focus = QtCore.Qt.FocusPolicy.NoFocus
+        widgets = [
+            self.state["composer"], self.state["task_edit"],
+            self.state["widgets"]["A"]["transcript"],
+            self.state["widgets"]["A"]["search_edit"],
+            self.state["widgets"]["A"]["temperature"],
+            self.state["widgets"]["A"]["picker"],
+            self.state["widgets"]["A"]["hist_list"],
+            self.state["widgets"]["A"]["instr_edit"],
+            self.state["send_a"],
+        ]
+        for widget in widgets:
+            self.assertNotEqual(widget.focusPolicy(), no_focus,
+                                widget)
+
+    def test_reduce_motion_menu_action_mirrors_the_setting(self):
+        action = self.state["menu_actions"]["reduce_motion"]
+        self.assertEqual(action.text(), "Reduce motion")
+        self.assertTrue(action.isCheckable())
+        self.assertEqual(
+            action.isChecked(),
+            self.state["motion"].reduced_motion.value)
+
+    def test_reduce_motion_menu_action_toggles_the_setting(self):
+        motion = self.state["motion"]
+        action = self.state["menu_actions"]["reduce_motion"]
+        initial = motion.reduced_motion.value
+        try:
+            action.trigger()
+            self.assertEqual(motion.reduced_motion.value,
+                             not initial)
+            self.assertEqual(action.isChecked(), not initial)
+            action.trigger()
+            self.assertEqual(motion.reduced_motion.value, initial)
+            self.assertEqual(action.isChecked(), initial)
+        finally:
+            motion.reduced_motion.set(initial)
+
+    def test_reduced_motion_persists_across_windows(self):
+        # Toggle on, close (which syncs QSettings), reopen: the
+        # new window reads the setting back, menu tick and all.
+        window1, state1 = self._build_window()
+        try:
+            state1["menu_actions"]["reduce_motion"].trigger()
+            self.assertTrue(
+                state1["motion"].reduced_motion.value)
+        finally:
+            window1.close()
+        self.app.processEvents()
+        window2, state2 = self._build_window()
+        try:
+            self.assertTrue(
+                state2["motion"].reduced_motion.value)
+            self.assertTrue(
+                state2["menu_actions"]["reduce_motion"].isChecked())
+            state2["menu_actions"]["reduce_motion"].trigger()
+            self.assertFalse(
+                state2["motion"].reduced_motion.value)
+        finally:
+            window2.close()
+        self.app.processEvents()
 
 
 if __name__ == "__main__":
