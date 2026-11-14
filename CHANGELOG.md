@@ -1,7 +1,21 @@
 # DUO changelog
 
 Every version, newest first. v0.1–v0.17 were built on 2026-11-12;
-v0.18–v0.35 on 2026-11-13; v0.36–v0.39 on 2026-11-14.
+v0.18–v0.35 on 2026-11-13; v0.36–v0.40 on 2026-11-14.
+
+## v0.40 — 2026-11-14
+
+Each side has its own color now. Model A is blue, Model B is
+purple: the pane titles, the model names in the chat, and the
+history lists all carry the side's color, so you can tell the two
+sides apart at a glance. A relayed message keeps the color of the
+side it came from — when a message from A lands in B's pane, its
+label is blue, so you always know where it came from. The same
+goes for task handoffs. Your own messages stay the plain text
+color, and nothing about the colors is ever saved or exported:
+transcripts and conversation files stay plain text. Under the
+hood, the relay session moved into duo_model.py, next to the
+conversation model it belongs with.
 
 ## v0.39 — 2026-11-14
 

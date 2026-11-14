@@ -191,7 +191,8 @@ except ImportError:  # pragma: no cover - the zip always ships it
 # (audit T14) splits it into focused sibling modules; this file
 # keeps the window and the entry point (the phone deck moved to
 # duo_deck.py in v0.31, the background Qt workers to duo_workers.py
-# in v0.39), and re-exports the moved names so
+# in v0.39, the relay session to duo_model.py in v0.40), and
+# re-exports the moved names so
 # `from dual_chat import ...` keeps working unchanged -- the
 # tests, the installer, and the deck all import through here.
 # build_window stays a closure in this file: splitting the
@@ -205,8 +206,10 @@ from duo_icon import make_app_icon
 from duo_markdown import markdown_to_html
 from duo_menu import build_menu_bar
 from duo_model import (
-    ChatMessage, ChatSide, Conversation, MSG_NO_MODEL, NoModelSelected,
-    SUMMARY_KEEP_LAST, SUMMARY_LABEL,)
+    AGREEMENT_PHRASES, AWARE_TEMPLATE, RELAY_CAP_DEFAULT, RELAY_CAP_MAX,
+    RELAY_CAP_MIN, SIDE_COLORS, ChatMessage, ChatSide, Conversation,
+    MSG_NO_MODEL, NoModelSelected, RelaySession, SUMMARY_KEEP_LAST,
+    SUMMARY_LABEL,)
 from duo_ollama import (
     CHAT_MAX_ATTEMPTS, CHAT_RETRY_DELAYS, CHAT_TIMEOUT, DEFAULT_OLLAMA_URL,
     MSG_MODEL_FAILED, MSG_OLLAMA_DOWN, MSG_OLLAMA_NOT_INSTALLED,
@@ -308,7 +311,7 @@ def make_debug_logger(log_dir=None):
         return _NullLogger()
 
 APP_NAME = "DUO"
-APP_VERSION = "0.39"
+APP_VERSION = "0.40"
 
 # Plain-language messages shown in the panes. No tracebacks in the UI.
 MSG_STOPPED = "Stopped."
@@ -426,14 +429,6 @@ def first_run_guide_html(models_picked):
     return ("<b>%s</b><br>%s<br>2. %s<br>3. %s"
             % (FIRST_RUN_HEADER, step1, FIRST_RUN_STEP2, FIRST_RUN_STEP3))
 
-# Agreement stop: simple case-insensitive substring matching on this
-# fixed list. No LLM judge -- the 2B models are slow enough already.
-AGREEMENT_PHRASES = ("i agree", "agreed", "sounds good", "that works")
-AWARE_TEMPLATE = ("You are talking with another AI assistant (Model %s). "
-                  "It said: %s")
-RELAY_CAP_MIN = 1
-RELAY_CAP_MAX = 50
-RELAY_CAP_DEFAULT = 10
 
 # Chat reliability (v0.10): Code Forge waits 1800s on a chat call and
 
@@ -520,93 +515,6 @@ def _open_link_in_browser(url):
     module level."""
     from PySide6 import QtGui
     QtGui.QDesktopServices.openUrl(url)
-
-
-class RelaySession:
-    """One relay run: config, turn counting, framing, stop checks.
-
-    Pure logic, no Qt -- the GUI drives it from the runner callbacks.
-    A "turn" is one generation. The seed turn is turn 1, so a cap of N
-    means exactly N generations before the relay halts.
-    """
-
-    def __init__(self, start_side, turn_cap=RELAY_CAP_DEFAULT, mode="blind",
-                 stop_phrases=(), stop_on_agreement=False):
-        self.start_side = start_side
-        self.current_side = start_side  # side whose turn is in flight
-        self.hop_from = "you"  # who the current turn is answering
-        self.turn_cap = max(RELAY_CAP_MIN,
-                            min(RELAY_CAP_MAX, int(turn_cap)))
-        self.mode = mode  # "blind" or "aware"
-        self.stop_phrases = list(stop_phrases)
-        self.stop_on_agreement = stop_on_agreement
-        self.turns_done = 0
-        self.active = True
-        self.stop_reason = None
-
-    @staticmethod
-    def other(side):
-        return "B" if side == "A" else "A"
-
-    def frame(self, text, from_side):
-        """The message the other model receives for a relayed reply.
-
-        Blind: the bare reply text, no framing at all -- the model sees
-        only a person talking to it. Aware: framed so the models know
-        they are talking to another AI.
-        """
-        if self.mode == "aware":
-            return AWARE_TEMPLATE % (from_side, text)
-        return text
-
-    def find_stop_phrase(self, text):
-        """The configured stop phrase found in text, or None.
-
-        Case-insensitive whole-word match: a phrase only counts when
-        it is not glued to another word, so "cap" does not stop on
-        "capital".
-        """
-        for phrase in self.stop_phrases:
-            if phrase_matches(phrase, text):
-                return phrase
-        return None
-
-    def find_agreement(self, text):
-        """The agreement phrase found in text, or None.
-
-        Only when stop-on-agreement is enabled. Case-insensitive
-        whole-word match on the fixed AGREEMENT_PHRASES list, so
-        "disagreed" never counts as "agreed".
-        """
-        if not self.stop_on_agreement:
-            return None
-        for phrase in AGREEMENT_PHRASES:
-            if phrase_matches(phrase, text):
-                return phrase
-        return None
-
-    def check_stop(self, reply_text):
-        """Stop reason for this reply, or None to keep relaying.
-
-        Call after incrementing turns_done. A phrase or agreement stop
-        is reported before the cap when they land on the same turn,
-        because it says more about why the relay ended.
-        """
-        phrase = self.find_stop_phrase(reply_text)
-        if phrase is not None:
-            return "phrase %r found" % phrase
-        agreement = self.find_agreement(reply_text)
-        if agreement is not None:
-            return "agreement reached (%r)" % agreement
-        if self.turns_done >= self.turn_cap:
-            return "turn cap reached"
-        return None
-
-    def status_running(self):
-        """Live status line, e.g. "Relay on: turn 3/10, A to B"."""
-        return "Relay on: turn %d/%d, %s to %s" % (
-            self.turns_done + 1, self.turn_cap,
-            self.hop_from, self.current_side)
 
 
 # ---------------------------------------------------------------------------
@@ -730,7 +638,12 @@ def build_window(client=None, logger=None, deck_port=None):
 
         title_row = QtWidgets.QHBoxLayout()
         title = QtWidgets.QLabel("Model " + side)
-        title.setStyleSheet("font-weight: bold; font-size: 14px;")
+        # Pane identity (v0.40, T25): the title carries the side's
+        # color -- blue A, purple B -- so the panes are
+        # distinguishable at a glance. The words stay: color
+        # reinforces the label, never replaces it.
+        title.setStyleSheet("font-weight: bold; font-size: 14px; "
+                            "color: %s;" % SIDE_COLORS[side])
         title_row.addWidget(title, stretch=1)
         instr_toggle = QtWidgets.QPushButton("Instructions ▸")
         instr_toggle.setCheckable(True)
@@ -937,6 +850,7 @@ def build_window(client=None, logger=None, deck_port=None):
         layout.addLayout(bottom)
 
         widgets[side] = {
+            "title": title,
             "picker": picker, "refresh": refresh, "transcript": transcript,
             "temperature": temp_spin,
             "status": status, "stop": stop, "clear": clear,
@@ -960,6 +874,9 @@ def build_window(client=None, logger=None, deck_port=None):
             # replace the streamed plain text with the Markdown
             # rendering; None when no reply is open.
             "reply_body_pos": None,
+            # How long the streaming reply's label is ("model: "),
+            # so on_done can color it when the turn finishes.
+            "reply_label_len": None,
         }
         return frame
 
@@ -1427,6 +1344,29 @@ def build_window(client=None, logger=None, deck_port=None):
     _BOLD_FMT = QtGui.QTextCharFormat()
     _BOLD_FMT.setFontWeight(QtGui.QFont.Weight.Bold)
 
+    def _label_format(color):
+        """A bold label format in the given side color, or plain
+        bold when the color is None. A copy each time: the shared
+        bold format must never pick up a color."""
+        if color is None:
+            return _BOLD_FMT
+        fmt = QtGui.QTextCharFormat(_BOLD_FMT)
+        fmt.setForeground(QtGui.QColor(color))
+        return fmt
+
+    def _label_color(side, msg):
+        """The color for one message's label in this pane (v0.40,
+        T25): the source side's color for a relay/task handoff, the
+        pane's own color for a model reply or the summary entry, and
+        None (default text) for the user's own words. Provenance
+        comes from the message's source_side, never from parsing
+        the label text."""
+        if msg.source_side is not None:
+            return SIDE_COLORS[msg.source_side]
+        if msg.role == "assistant" or msg.label == SUMMARY_LABEL:
+            return SIDE_COLORS[side]
+        return None
+
     def scroll_to_end(transcript):
         bar = transcript.verticalScrollBar()
         bar.setValue(bar.maximum())
@@ -1449,7 +1389,7 @@ def build_window(client=None, logger=None, deck_port=None):
         if not cursor.document().isEmpty():
             cursor.insertText("\n", _PLAIN_FMT)
 
-    def append_message(side, label, text, markdown=False):
+    def append_message(side, label, text, markdown=False, color=None):
         """Append one message block: a blank line separating it from
         the previous block, a bold "label: ", then the text. The live
         path and the re-render path both use this, so the window
@@ -1463,12 +1403,17 @@ def build_window(client=None, logger=None, deck_port=None):
         would land in it as a stray empty item (and swallow the
         NEXT message into the list). insertBlock with a default
         format steps out cleanly; the plain text comes out the
-        same either way."""
+        same either way.
+
+        ``color`` is a side color for the label (v0.40, T25): the
+        pane's color for a model reply, the source side's color for
+        a relay/task handoff. None leaves the label default text
+        color -- the user's own words."""
         t = widgets[side]["transcript"]
         cursor = t.textCursor()
         cursor.movePosition(cursor.MoveOperation.End)
         _block_gap(cursor)
-        cursor.insertText(label + ": ", _BOLD_FMT)
+        cursor.insertText(label + ": ", _label_format(color))
         if markdown:
             cursor.insertHtml(markdown_to_html(text))
             cursor.movePosition(cursor.MoveOperation.End)
@@ -1484,13 +1429,17 @@ def build_window(client=None, logger=None, deck_port=None):
         """Open a streaming reply: the blank-line gap plus the bold
         label, with the body to follow as chunks arrive. Records
         where the body starts, so on_done can replace the streamed
-        plain text with the Markdown rendering."""
+        plain text with the Markdown rendering, and how long the
+        label is, so on_done can color it then too. The label goes
+        in plain bold while the reply streams (v0.24: streaming
+        stays plain); the color lands with the finish re-render."""
         t = widgets[side]["transcript"]
         cursor = t.textCursor()
         cursor.movePosition(cursor.MoveOperation.End)
         _block_gap(cursor)
         cursor.insertText(label + ": ", _BOLD_FMT)
         widgets[side]["reply_body_pos"] = cursor.position()
+        widgets[side]["reply_label_len"] = len(label) + 2
         t.setTextCursor(cursor)
         scroll_to_end(t)
 
@@ -1505,9 +1454,15 @@ def build_window(client=None, logger=None, deck_port=None):
         copy), not the streamed characters, so the pane ends up
         holding exactly what the history holds. A failed or stopped
         turn never reaches this: partial text stays plain. The
-        search is cleared, as for any transcript change."""
+        search is cleared, as for any transcript change. The label
+        takes the pane's color here too (v0.40, T25): it went in
+        plain bold while the reply streamed, and the turn is done
+        now, so the label range just before the body is recolored
+        in the same step."""
         body_pos = widgets[side].get("reply_body_pos")
         widgets[side]["reply_body_pos"] = None
+        label_len = widgets[side].get("reply_label_len")
+        widgets[side]["reply_label_len"] = None
         if body_pos is None:
             return
         t = widgets[side]["transcript"]
@@ -1515,6 +1470,13 @@ def build_window(client=None, logger=None, deck_port=None):
         end = doc.characterCount() - 1
         if body_pos > end:
             return
+        if label_len:
+            label_cursor = QtGui.QTextCursor(doc)
+            label_cursor.setPosition(body_pos - label_len)
+            label_cursor.setPosition(body_pos,
+                                     QtGui.QTextCursor.KeepAnchor)
+            label_cursor.mergeCharFormat(
+                _label_format(SIDE_COLORS[side]))
         cursor = QtGui.QTextCursor(doc)
         cursor.setPosition(body_pos)
         cursor.setPosition(end, QtGui.QTextCursor.KeepAnchor)
@@ -1566,6 +1528,7 @@ def build_window(client=None, logger=None, deck_port=None):
         side_obj = convo.sides[side]
         widgets[side]["transcript"].clear()
         widgets[side]["reply_body_pos"] = None
+        widgets[side]["reply_label_len"] = None
         # The clear takes the first-run guide with it, if it was
         # showing (v0.39, R5); the refresh at the end puts it back
         # when the pane is still empty on a first run.
@@ -1574,7 +1537,8 @@ def build_window(client=None, logger=None, deck_port=None):
             markdown = (msg.role == "assistant"
                         or msg.label == SUMMARY_LABEL)
             append_message(side, msg.label, msg.display_text(),
-                           markdown=markdown)
+                           markdown=markdown,
+                           color=_label_color(side, msg))
         scroll_to_end(widgets[side]["transcript"])
         # A rebuild drops the highlights with the old document, so
         # the search state goes too (empty histories never reach
@@ -1718,7 +1682,12 @@ def build_window(client=None, logger=None, deck_port=None):
         _jump_to_search_match(side)
 
     def refresh_history_list(side):
-        """Rebuild a pane's history-editor list from its history."""
+        """Rebuild a pane's history-editor list from its history.
+
+        Each item carries its color (v0.40, T25): the pane's own
+        color for its own entries, the source side's color for a
+        relay/task handoff -- the same provenance rule as the
+        transcript labels, applied per item."""
         lst = widgets[side]["hist_list"]
         lst.blockSignals(True)
         lst.clear()
@@ -1728,6 +1697,11 @@ def build_window(client=None, logger=None, deck_port=None):
             if len(text) > 70:
                 text = text[:67] + "..."
             lst.addItem("%s: %s" % (msg.label, text))
+            color = (SIDE_COLORS[msg.source_side]
+                     if msg.source_side is not None
+                     else SIDE_COLORS[side])
+            lst.item(lst.count() - 1).setForeground(
+                QtGui.QColor(color))
         lst.blockSignals(False)
         refresh_history_buttons(side)
 
@@ -2135,9 +2109,11 @@ def build_window(client=None, logger=None, deck_port=None):
         """
         next_side = RelaySession.other(from_side)
         convo.sides[next_side].add_user(
-            framed, label="You [relay from Model %s]" % from_side)
+            framed, label="You [relay from Model %s]" % from_side,
+            source_side=from_side)
         append_message(next_side,
-                       "You [relay from Model %s]" % from_side, framed)
+                       "You [relay from Model %s]" % from_side, framed,
+                       color=SIDE_COLORS[from_side])
         log_event(next_side, "You [relay from Model %s]" % from_side,
                   framed)
         refresh_history_list(next_side)
@@ -2185,8 +2161,9 @@ def build_window(client=None, logger=None, deck_port=None):
         note = session.handoff_note_next(from_side)
         convo.sides[next_side].add_user(
             framed, label="You [task handoff]",
-            display=note)
-        append_message(next_side, "You [task handoff]", note)
+            display=note, source_side=from_side)
+        append_message(next_side, "You [task handoff]", note,
+                       color=SIDE_COLORS[from_side])
         log_event(next_side, "You [task handoff]", note)
         refresh_history_list(next_side)
         session.phase = "followup"
@@ -2326,6 +2303,7 @@ def build_window(client=None, logger=None, deck_port=None):
             return
         finish_reply(side)
         widgets[side]["reply_body_pos"] = None
+        widgets[side]["reply_label_len"] = None
         append_note(side, "(%s)" % message)
         state["active"].discard(side)
         # Red for a few seconds, so the failure is seen, then idle
@@ -2366,6 +2344,7 @@ def build_window(client=None, logger=None, deck_port=None):
             return
         finish_reply(side)
         widgets[side]["reply_body_pos"] = None
+        widgets[side]["reply_label_len"] = None
         append_note(side, "(%s)" % MSG_STOPPED)
         state["active"].discard(side)
         state["queued"].discard(side)
@@ -3402,6 +3381,7 @@ def build_window(client=None, logger=None, deck_port=None):
             convo.sides[side].clear()
             widgets[side]["transcript"].clear()
             widgets[side]["reply_body_pos"] = None
+            widgets[side]["reply_label_len"] = None
             widgets[side]["guide_shown"] = False
             clear_search(side)
             # A cleared conversation restarts: that side's entries

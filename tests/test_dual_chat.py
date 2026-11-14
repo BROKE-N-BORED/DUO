@@ -45,6 +45,7 @@ from dual_chat import (  # noqa: E402
     SETTING_HIST_SPLITTER_STATE,
     SETTING_SPLITTER_STATE, SETTING_TEMPERATURE,
     SETTING_WINDOW_GEOMETRY,
+    SIDE_COLORS,
     SIDE_STATES,
     TASK_CONTINUE_TEMPLATE, TASK_FOLLOW_UPS, TASK_REVIEW_TEMPLATE,
     TASK_REVISE_TEMPLATE, TASK_ROUNDS_DEFAULT, TASK_ROUNDS_MAX,
@@ -6671,7 +6672,7 @@ class FrontDoorTests(unittest.TestCase):
 
     def test_changelog_covers_every_version(self):
         log = self._read("CHANGELOG.md")
-        for version in ["0.%d" % n for n in range(1, 40)]:
+        for version in ["0.%d" % n for n in range(1, 41)]:
             self.assertIn(version, log)
 
     def test_gitignore_covers_runtime_files(self):
@@ -8732,6 +8733,7 @@ class ModuleSplitTests(unittest.TestCase):
             (dual_chat.ChatSide, duo_model.ChatSide),
             (dual_chat.ChatMessage, duo_model.ChatMessage),
             (dual_chat.Conversation, duo_model.Conversation),
+            (dual_chat.RelaySession, duo_model.RelaySession),
             (dual_chat.NoModelSelected, duo_model.NoModelSelected),
             (dual_chat.OllamaClient, duo_ollama.OllamaClient),
             (dual_chat.OllamaError, duo_ollama.OllamaError),
@@ -11862,6 +11864,311 @@ class FirstRunGuiTests(unittest.TestCase):
                 "side %s: search row at %d covers the guide, "
                 "which ends at %.1f" % (side, search_top,
                                         guide_bottom))
+
+
+class PaneIdentityTests(unittest.TestCase):
+    """v0.40 (audit T25): pane identity and relay provenance, the
+    pure core -- the side colors, the source_side field, and the
+    promise that color is display-only and never saved."""
+
+    def test_side_colors_are_valid_distinct_hex(self):
+        self.assertEqual(set(SIDE_COLORS), {"A", "B"})
+        for side, color in SIDE_COLORS.items():
+            self.assertRegex(color, r"^#[0-9a-f]{6}$", side)
+        self.assertNotEqual(SIDE_COLORS["A"], SIDE_COLORS["B"])
+
+    def test_side_colors_differ_from_the_activity_palette(self):
+        # The identity colors must never be mistaken for a state
+        # light: green thinking, amber waiting, red failed, grey
+        # idle are all different colors.
+        activity = {color for color, _words in SIDE_STATES.values()}
+        for side, color in SIDE_COLORS.items():
+            self.assertNotIn(color, activity, side)
+
+    def test_source_side_defaults_to_none(self):
+        msg = ChatMessage("user", "hello", "You")
+        self.assertIsNone(msg.source_side)
+        side = ChatSide("B")
+        side.add_user("hello")
+        self.assertIsNone(side.messages[0].source_side)
+        side.add_user("hop", label="You [relay from Model A]",
+                      source_side="A")
+        self.assertEqual(side.messages[1].source_side, "A")
+
+    def test_source_side_is_never_serialized(self):
+        # A handoff message carries source_side in memory, but the
+        # saved file is still the v0.17 shape: role, content, label,
+        # display -- no new key.
+        convo = Conversation()
+        convo.sides["B"].model = "fake-b:latest"
+        convo.sides["B"].add_user(
+            "apple pie", label="You [relay from Model A]",
+            source_side="A")
+        data = conversation_to_data(convo, [])
+        self.assertEqual(data["sides"]["B"]["entries"], [
+            {"role": "user", "content": "apple pie",
+             "label": "You [relay from Model A]", "display": None}])
+
+    def test_old_format_file_loads_with_no_source_side(self):
+        # A file written by hand in the v0.17 shape loads with
+        # source_side None on every message: old conversations
+        # render in the pane colors, never a source color.
+        data = {
+            "version": 1,
+            "sides": {
+                "A": {"model": "fake-a:latest", "instruction": "",
+                      "entries": [
+                          {"role": "user", "content": "hi",
+                           "label": "You", "display": None},
+                          {"role": "user", "content": "apple pie",
+                           "label": "You [relay from Model B]",
+                           "display": None},
+                          {"role": "assistant", "content": "hello",
+                           "label": "fake-a:latest", "display": None},
+                      ]},
+                "B": {"model": None, "instruction": "", "entries": []},
+            },
+            "log": [],
+        }
+        convo, _log = data_to_conversation(data)
+        for msg in convo.sides["A"].messages:
+            self.assertIsNone(msg.source_side, msg.label)
+
+    def test_deck_page_carries_both_side_colors(self):
+        # The phone deck's side headers use the same two colors as
+        # the window, interpolated from the one source of truth.
+        for color in SIDE_COLORS.values():
+            self.assertIn(color, DECK_PAGE_HTML)
+        self.assertNotIn("__SIDE_COLOR", DECK_PAGE_HTML)
+
+
+@unittest.skipUnless(os.environ.get("DUAL_CHAT_GUI_TESTS") == "1",
+                     "GUI tests run with DUAL_CHAT_GUI_TESTS=1")
+class PaneIdentityGuiTests(unittest.TestCase):
+    """v0.40 (audit T25): the colors on screen -- pane titles, the
+    transcript labels (model replies in the pane's color, relay and
+    task handoffs in the source side's color, the user's own words
+    uncolored), the history editor items, and the re-render path.
+    Exports stay plain text."""
+
+    @classmethod
+    def setUpClass(cls):
+        from PySide6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+        cls.client = FakeGuiClient()
+
+    def setUp(self):
+        from dual_chat import build_window
+        self.client.reset()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.window = build_window(self.client, logger=TEST_LOGGER)
+        self.window.show()
+        self.state = self.window._dual_chat
+        self._wait_for(lambda: self.state["widgets"]["A"]["picker"].count() == 2)
+        self._pick_models()
+
+    def tearDown(self):
+        self.window.close()
+        self.app.processEvents()
+        self.tmp.cleanup()
+
+    def _wait_for(self, cond, timeout=10.0):
+        from PySide6.QtTest import QTest
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            QTest.qWait(50)
+            if cond():
+                return True
+        return cond()
+
+    def _pick_models(self):
+        self.state["widgets"]["A"]["picker"].setCurrentIndex(0)
+        self.state["widgets"]["B"]["picker"].setCurrentIndex(1)
+        self.app.processEvents()
+
+    def _label_color(self, side, label_text):
+        """The foreground color of the first ``label_text`` in one
+        pane's transcript, as a hex name -- or None when the label
+        carries no color at all (the user's own words)."""
+        from PySide6.QtGui import QTextCursor, QTextFormat
+        doc = self.state["widgets"][side]["transcript"].document()
+        cursor = doc.find(label_text)
+        self.assertFalse(cursor.isNull(), label_text)
+        probe = QTextCursor(doc)
+        probe.setPosition(cursor.selectionStart())
+        fmt = probe.charFormat()
+        if not fmt.hasProperty(QTextFormat.Property.ForegroundBrush):
+            return None
+        return fmt.foreground().color().name()
+
+    def _send_to_a_and_wait(self, text):
+        self.state["composer"].setPlainText(text)
+        self.state["send_a"].click()
+        return self._wait_for(lambda: (
+            len(self.state["convo"].sides["A"].messages) >= 2
+            and not self.state["state"]["busy"]), timeout=15)
+
+    def _start_relay(self, seed, cap=2):
+        self.state["start_picker"].setCurrentIndex(0)  # start with A
+        self.state["cap_spin"].setValue(cap)
+        self.state["mode_picker"].setCurrentIndex(0)  # Blind
+        self.state["composer"].setPlainText(seed)
+        self.app.processEvents()
+        self.state["relay_btn"].click()
+
+    def _wait_for_relay_stopped(self, timeout=15.0):
+        return self._wait_for(lambda: self.state["relay_status"].text()
+                              .startswith("Relay stopped"), timeout=timeout)
+
+    def _open_history(self, side):
+        w = self.state["widgets"][side]
+        if not w["hist_toggle"].isChecked():
+            w["hist_toggle"].click()
+        self.app.processEvents()
+
+    def _save_dialog(self, path):
+        from PySide6 import QtWidgets
+        return mock.patch.object(
+            QtWidgets.QFileDialog, "getSaveFileName",
+            return_value=(path, "Text files (*.txt)"))
+
+    def test_pane_titles_carry_the_side_colors(self):
+        for side in ("A", "B"):
+            title = self.state["widgets"][side]["title"]
+            self.assertEqual(title.text(), "Model " + side)
+            self.assertIn("color: %s" % SIDE_COLORS[side],
+                          title.styleSheet())
+
+    def test_assistant_label_takes_the_pane_color(self):
+        self.assertTrue(self._send_to_a_and_wait("Hello, A."))
+        self.assertEqual(
+            self._label_color("A", "fake-a:latest:"),
+            SIDE_COLORS["A"])
+        # And B's reply is purple, not blue.
+        self.state["composer"].setPlainText("Hello, B.")
+        self.state["send_b"].click()
+        self.assertTrue(self._wait_for(lambda: (
+            len(self.state["convo"].sides["B"].messages) >= 2
+            and not self.state["state"]["busy"]), timeout=15))
+        self.assertEqual(
+            self._label_color("B", "fake-b:latest:"),
+            SIDE_COLORS["B"])
+
+    def test_user_label_stays_default_color(self):
+        self.assertTrue(self._send_to_a_and_wait("Hello, A."))
+        self.assertIsNone(self._label_color("A", "You:"))
+
+    def test_relay_handoff_label_takes_the_source_color(self):
+        self.client.replies = {"fake-a:latest": ["apple pie"],
+                               "fake-b:latest": ["banana split"]}
+        self._start_relay("Talk about fruit.", cap=2)
+        self.assertTrue(self._wait_for_relay_stopped())
+        # The hop from A lands in B's pane wearing A's blue.
+        self.assertEqual(
+            self._label_color("B", "You [relay from Model A]:"),
+            SIDE_COLORS["A"])
+        # Each side's own reply wears its own color.
+        self.assertEqual(
+            self._label_color("A", "fake-a:latest:"),
+            SIDE_COLORS["A"])
+        self.assertEqual(
+            self._label_color("B", "fake-b:latest:"),
+            SIDE_COLORS["B"])
+        # The seed is the user's own words: uncolored.
+        self.assertIsNone(self._label_color("A", "You:"))
+        # The provenance lives on the message, not in the text.
+        hop = self.state["convo"].sides["B"].messages[0]
+        self.assertEqual(hop.source_side, "A")
+
+    def test_task_handoff_label_takes_the_source_color(self):
+        # A works, B reviews: the handoff lands in B wearing A's blue.
+        self.state["task_edit"].setPlainText("Write a draft.")
+        self.state["task_worker"].setCurrentIndex(0)  # Model A
+        self.state["task_follow_up"].setCurrentIndex(0)  # Review it
+        self.app.processEvents()
+        self.state["task_run"].click()
+        self.assertTrue(self._wait_for(
+            lambda: (not self.state["state"]["busy"]
+                     and self.state["state"]["task"] is None),
+            timeout=20))
+        self.assertEqual(
+            self._label_color("B", "You [task handoff]:"),
+            SIDE_COLORS["A"])
+        hop = self.state["convo"].sides["B"].messages[0]
+        self.assertEqual(hop.source_side, "A")
+
+    def test_history_items_carry_pane_and_source_colors(self):
+        self.client.replies = {"fake-a:latest": ["apple pie"],
+                               "fake-b:latest": ["banana split"]}
+        self._start_relay("Talk about fruit.", cap=2)
+        self.assertTrue(self._wait_for_relay_stopped())
+        # A's own entries wear A's blue, seed included.
+        lst_a = self.state["widgets"]["A"]["hist_list"]
+        self.assertEqual(lst_a.count(), 2)
+        for row in range(2):
+            self.assertEqual(
+                lst_a.item(row).foreground().color().name(),
+                SIDE_COLORS["A"])
+        # B's handoff wears A's blue; B's own reply wears B's purple.
+        lst_b = self.state["widgets"]["B"]["hist_list"]
+        self.assertEqual(lst_b.count(), 2)
+        self.assertEqual(
+            lst_b.item(0).foreground().color().name(), SIDE_COLORS["A"])
+        self.assertEqual(
+            lst_b.item(1).foreground().color().name(), SIDE_COLORS["B"])
+
+    def test_re_render_keeps_the_handoff_color(self):
+        # A reorder rebuilds the transcript from the messages: the
+        # handoff must come back wearing the source color, from the
+        # message's source_side -- not from the live append path.
+        self.client.replies = {"fake-a:latest": ["apple pie"],
+                               "fake-b:latest": ["banana split"]}
+        self._start_relay("Talk about fruit.", cap=2)
+        self.assertTrue(self._wait_for_relay_stopped())
+        self._open_history("B")
+        lst = self.state["widgets"]["B"]["hist_list"]
+        lst.setCurrentRow(1)  # B's reply, below the handoff
+        self.app.processEvents()
+        self.assertTrue(self.state["widgets"]["B"]["hist_up"].isEnabled())
+        self.state["widgets"]["B"]["hist_up"].click()
+        self.app.processEvents()
+        self.assertEqual(
+            self._label_color("B", "You [relay from Model A]:"),
+            SIDE_COLORS["A"])
+        self.assertEqual(
+            self._label_color("B", "fake-b:latest:"),
+            SIDE_COLORS["B"])
+
+    def test_summary_entry_takes_the_pane_color(self):
+        self.client.replies = {"fake-a:latest": [
+            "alpha one", "alpha two", "alpha three",
+            "They discussed fruit and picked apple pie."]}
+        self.assertTrue(self._send_to_a_and_wait("first message"))
+        self.assertTrue(self._send_to_a_and_wait("second message"))
+        self.assertTrue(self._send_to_a_and_wait("third message"))
+        convo = self.state["convo"]
+        self.assertEqual(len(convo.sides["A"].messages), 6)
+        self.state["widgets"]["A"]["summarize"].click()
+        ok = self._wait_for(lambda: (
+            len(convo.sides["A"].messages) == 5
+            and convo.sides["A"].messages[0].label == SUMMARY_LABEL
+            and not self.state["state"]["busy"]), timeout=15)
+        self.assertTrue(ok, "history should fold into summary + last 4")
+        self.assertEqual(
+            self._label_color("A", SUMMARY_LABEL + ":"),
+            SIDE_COLORS["A"])
+
+    def test_export_has_no_color_markup(self):
+        self.assertTrue(self._send_to_a_and_wait("Hello, A."))
+        path = os.path.join(self.tmp.name, "side-a.txt")
+        with self._save_dialog(path):
+            self.state["widgets"]["A"]["save"].click()
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+        for color in SIDE_COLORS.values():
+            self.assertNotIn(color, text)
+        self.assertNotIn("color:", text)
+        self.assertIn("fake-a:latest:", text)
 
 
 if __name__ == "__main__":

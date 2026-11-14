@@ -47,7 +47,10 @@ Everything in one app:
   line, with the sender's name in bold, so a long reply never runs
   into the next message. Model replies render their Markdown —
   bold, code, headers, lists, links — while your own messages stay
-  exactly as typed.
+  exactly as typed. Each side has its own color — Model A is blue,
+  Model B is purple — on the pane titles and the model names, and a
+  relayed message keeps the color of the side it came from, so you
+  always know where it came from.
 - **First run** — the first time you open DUO, each pane shows
   three steps that teach the loop: pick a model for each side,
   send a message to both, start a relay. Step 1 gets a checkmark

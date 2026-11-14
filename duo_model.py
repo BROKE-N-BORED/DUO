@@ -10,9 +10,15 @@ In v0.26 (audit T15) the three parallel arrays (history, labels,
 display) became one list of ChatMessage objects: each message
 carries its role, content, label, and short display text together,
 so the three can never drift out of sync.
+
+In v0.40 (audit T25) the relay session (RelaySession, with its
+stop/cap constants) moved here from dual_chat.py: it is pure
+session logic, no Qt, and it belongs with the conversation model.
 """
 
 from dataclasses import dataclass
+
+from duo_text import phrase_matches
 
 
 MSG_NO_MODEL = "Pick a model for {side} first."
@@ -22,6 +28,17 @@ SUMMARY_KEEP_LAST = 4
 
 
 SUMMARY_LABEL = "Summary of earlier messages"
+
+
+# Pane identity (v0.40, audit T25): each side's color. Blue for A,
+# purple for B -- readable on the light theme, distinct from each
+# other and from the activity palette (green thinking, amber
+# waiting, red failed, grey idle). The window's pane titles and
+# transcript labels use these, and the phone deck's side headers
+# use the same two. Color is always redundant with text -- the
+# "Model A" / "Model B" labels stay -- so it reinforces identity,
+# never carries it alone.
+SIDE_COLORS = {"A": "#2563eb", "B": "#7c3aed"}
 
 
 class NoModelSelected(Exception):
@@ -46,12 +63,18 @@ class ChatMessage:
     of the content (used when a message carries attached files, so
     the transcript stays readable). None means show the content
     as-is.
+    ``source_side`` is the side a relayed or handed-off message came
+    from ("A" / "B"), so the window can show it in the source side's
+    color. None for the user's own words and for model replies.
+    Display-only: it is never saved -- old conversation files load
+    with None, and the JSON format is unchanged.
     """
 
     role: str
     content: str
     label: str
     display: str = None
+    source_side: str = None
 
     def display_text(self):
         """What the window shows for this message: the short display
@@ -82,9 +105,9 @@ class ChatSide:
         display text when one is set, else the full content."""
         return self.messages[index].display_text()
 
-    def add_user(self, text, label="You", display=None):
+    def add_user(self, text, label="You", display=None, source_side=None):
         self.messages.append(
-            ChatMessage("user", text, label, display))
+            ChatMessage("user", text, label, display, source_side))
         return label
 
     def add_assistant(self, text, label=None):
@@ -165,3 +188,102 @@ class Conversation:
             if self.sides[side].model is None:
                 raise NoModelSelected("Model " + side)
         return [self.sides[s] for s in wanted]
+
+
+# Agreement stop: simple case-insensitive substring matching on this
+# fixed list. No LLM judge -- the 2B models are slow enough already.
+AGREEMENT_PHRASES = ("i agree", "agreed", "sounds good", "that works")
+AWARE_TEMPLATE = ("You are talking with another AI assistant (Model %s). "
+                  "It said: %s")
+RELAY_CAP_MIN = 1
+RELAY_CAP_MAX = 50
+RELAY_CAP_DEFAULT = 10
+
+
+class RelaySession:
+    """One relay run: config, turn counting, framing, stop checks.
+
+    Pure logic, no Qt -- the GUI drives it from the runner callbacks.
+    A "turn" is one generation. The seed turn is turn 1, so a cap of N
+    means exactly N generations before the relay halts.
+    """
+
+    def __init__(self, start_side, turn_cap=RELAY_CAP_DEFAULT, mode="blind",
+                 stop_phrases=(), stop_on_agreement=False):
+        self.start_side = start_side
+        self.current_side = start_side  # side whose turn is in flight
+        self.hop_from = "you"  # who the current turn is answering
+        self.turn_cap = max(RELAY_CAP_MIN,
+                            min(RELAY_CAP_MAX, int(turn_cap)))
+        self.mode = mode  # "blind" or "aware"
+        self.stop_phrases = list(stop_phrases)
+        self.stop_on_agreement = stop_on_agreement
+        self.turns_done = 0
+        self.active = True
+        self.stop_reason = None
+
+    @staticmethod
+    def other(side):
+        return "B" if side == "A" else "A"
+
+    def frame(self, text, from_side):
+        """The message the other model receives for a relayed reply.
+
+        Blind: the bare reply text, no framing at all -- the model sees
+        only a person talking to it. Aware: framed so the models know
+        they are talking to another AI.
+        """
+        if self.mode == "aware":
+            return AWARE_TEMPLATE % (from_side, text)
+        return text
+
+    def find_stop_phrase(self, text):
+        """The configured stop phrase found in text, or None.
+
+        Case-insensitive whole-word match: a phrase only counts when
+        it is not glued to another word, so "cap" does not stop on
+        "capital".
+        """
+        for phrase in self.stop_phrases:
+            if phrase_matches(phrase, text):
+                return phrase
+        return None
+
+    def find_agreement(self, text):
+        """The agreement phrase found in text, or None.
+
+        Only when stop-on-agreement is enabled. Case-insensitive
+        whole-word match on the fixed AGREEMENT_PHRASES list, so
+        "disagreed" never counts as "agreed".
+        """
+        if not self.stop_on_agreement:
+            return None
+        for phrase in AGREEMENT_PHRASES:
+            if phrase_matches(phrase, text):
+                return phrase
+        return None
+
+    def check_stop(self, reply_text):
+        """Stop reason for this reply, or None to keep relaying.
+
+        Call after incrementing turns_done. A phrase or agreement stop
+        is reported before the cap when they land on the same turn,
+        because it says more about why the relay ended.
+        """
+        phrase = self.find_stop_phrase(reply_text)
+        if phrase is not None:
+            return "phrase %r found" % phrase
+        agreement = self.find_agreement(reply_text)
+        if agreement is not None:
+            return "agreement reached (%r)" % agreement
+        if self.turns_done >= self.turn_cap:
+            return "turn cap reached"
+        return None
+
+    def status_running(self):
+        """Live status line, e.g. "Relay on: turn 3/10, A to B"."""
+        return "Relay on: turn %d/%d, %s to %s" % (
+            self.turns_done + 1, self.turn_cap,
+            self.hop_from, self.current_side)
+
+

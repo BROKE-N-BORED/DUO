@@ -16,6 +16,7 @@ import socket
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from duo_model import SIDE_COLORS
 from duo_transcript import default_full_filename
 
 # QR codes for the phone deck: Nayuki's QR Code generator (MIT),
@@ -96,7 +97,7 @@ def build_deck_state(convo, state):
     }
 
 
-DECK_PAGE_HTML = """<!DOCTYPE html>
+DECK_PAGE_HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -149,6 +150,7 @@ body { margin: 0; padding: 12px; background: #1c1c1e; color: #f2f2f7;
 <div id="foot"><a id="export" href="/transcript">Export transcript</a></div>
 <script>
 var bigSide = "A";
+var SIDE_COLORS = {"A": "__SIDE_COLOR_A__", "B": "__SIDE_COLOR_B__"};
 var lastState = "";
 var target = "";
 function show(el, msgs) {
@@ -178,8 +180,10 @@ function render(state) {
   var small = state.sides[smallSide];
   document.getElementById("big-name").textContent =
     "Model " + bigSide + (big.model ? " (" + big.model + ")" : "");
+  document.getElementById("big-name").style.color = SIDE_COLORS[bigSide];
   document.getElementById("small-name").textContent =
     "Model " + smallSide + (small.model ? " (" + small.model + ")" : "");
+  document.getElementById("small-name").style.color = SIDE_COLORS[smallSide];
   document.getElementById("big-thinking").textContent =
     (active === bigSide) ? "thinking..." : "";
   document.getElementById("relay").textContent = state.relay || "";
@@ -229,6 +233,15 @@ setInterval(poll, 2000);
 </body>
 </html>
 """
+
+
+# Pane identity (v0.40, T25): the deck's side headers use the same
+# two colors as the window. The colors live in duo_model.SIDE_COLORS
+# (the single source of truth) and are interpolated into the served
+# page here, so the page carries the real hex values.
+DECK_PAGE_HTML = (DECK_PAGE_HTML_TEMPLATE
+                  .replace("__SIDE_COLOR_A__", SIDE_COLORS["A"])
+                  .replace("__SIDE_COLOR_B__", SIDE_COLORS["B"]))
 
 
 class _DeckRequestHandler(BaseHTTPRequestHandler):
