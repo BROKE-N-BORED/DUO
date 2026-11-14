@@ -1,7 +1,22 @@
 # DUO changelog
 
 Every version, newest first. v0.1–v0.17 were built on 2026-11-12;
-v0.18–v0.35 on 2026-11-13; v0.36–v0.47 on 2026-11-14.
+v0.18–v0.35 on 2026-11-13; v0.36–v0.48 on 2026-11-14.
+
+## v0.48 — 2026-11-14
+
+A Big text preset, in the Help menu next to "Reduce motion":
+one tap makes all of DUO's text bigger right away, no restart,
+and DUO remembers the choice. The app's text grows by 2 points
+everywhere — the chat, the composer, the buttons, the menus —
+and the small labels grow with it, so the stats, the activity
+words, and the explanations underneath the fields get bigger
+too, and the pane titles stay headers. On a first run DUO asks
+once, "DUO can make its text bigger. Turn on Big text?", with
+Yes and No and No as the default — it never asks again after
+that, either way. The How to Use index says where the preset
+lives. Housekeeping: the preset lives in duo_accessibility.py,
+so dual_chat.py stays under its line bound.
 
 ## v0.47 — 2026-11-14
 

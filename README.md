@@ -83,7 +83,8 @@ Everything in one app:
   wears a clear blue ring, and the Director toggle springs open
   and shut instead of snapping. A \"Reduce motion\" item in the
   Help menu turns the dip and the spring off while keeping the
-  flash and the ring.
+  flash and the ring. A \"Big text\" item in the same menu makes
+  all of DUO's text bigger right away, and DUO remembers it.
 - **Update check** — DUO checks GitHub once at startup and says in
   the status bar when a newer Release is out (silently saying
   nothing when offline), and a "Check for updates" button runs the

@@ -6797,7 +6797,7 @@ class FrontDoorTests(unittest.TestCase):
 
     def test_changelog_covers_every_version(self):
         log = self._read("CHANGELOG.md")
-        for version in ["0.%d" % n for n in range(1, 48)]:
+        for version in ["0.%d" % n for n in range(1, 49)]:
             self.assertIn(version, log)
 
     def test_gitignore_covers_runtime_files(self):
@@ -8808,7 +8808,7 @@ class ModuleSplitTests(unittest.TestCase):
                "duo_storage", "duo_runner", "duo_icon", "duo_menu",
                "duo_deck", "duo_workers", "duo_debug",
                "duo_attachments", "duo_single", "duo_motion",
-               "duo_constants", "duo_sparkline")
+               "duo_constants", "duo_sparkline", "duo_accessibility")
 
     def _tree(self):
         return os.path.dirname(
@@ -9262,6 +9262,12 @@ class MessageStructureTests(unittest.TestCase):
                   encoding="utf-8") as fh:
             script = fh.read()
         self.assertIn('"duo_sparkline.py": 0o100644', script)
+
+    def test_zip_includes_the_accessibility_module(self):
+        with open(os.path.join(self._tree(), "build_zip.py"),
+                  encoding="utf-8") as fh:
+            script = fh.read()
+        self.assertIn('"duo_accessibility.py": 0o100644', script)
 
 class UpdateCheckTests(unittest.TestCase):
     """v0.28 (audit T17): the update check's pure core -- version
@@ -10128,7 +10134,7 @@ class MenuBarTextTests(unittest.TestCase):
                          duo_menu.about_text(APP_VERSION))
         self.assertNotIn("\u2014", duo_menu.how_to_use_text())
 
-    def test_how_to_use_index_has_the_nine_sections(self):
+    def test_how_to_use_index_has_the_ten_sections(self):
         import duo_menu
         headings = [heading for heading, _ in
                     duo_menu.HOW_TO_USE_SECTIONS]
@@ -10137,7 +10143,7 @@ class MenuBarTextTests(unittest.TestCase):
             "Tasks", "Attaching files",
             "Transcripts and conversations",
             "Saved pairs and relay presets", "The phone deck",
-            "The update check"])
+            "The update check", "Bigger text"])
         for _heading, body in duo_menu.HOW_TO_USE_SECTIONS:
             self.assertTrue(body.strip())
 
@@ -10279,8 +10285,8 @@ class MenuBarGuiTests(unittest.TestCase):
         self.assertEqual(self._item_texts(menus["Relay"]), [
             "Start relay", "Stop relay"])
         self.assertEqual(self._item_texts(menus["Help"]), [
-            "Check for updates", "Reduce motion", "How to use",
-            "About"])
+            "Check for updates", "Reduce motion", "Big text",
+            "How to use", "About"])
 
     def test_shortcuts_are_set(self):
         actions = self.state["menu_actions"]
@@ -13311,6 +13317,57 @@ class SparklineTests(unittest.TestCase):
         self.assertEqual(points[1][1], 23)
 
 
+class AccessibilityTests(unittest.TestCase):
+    """v0.48 (redesign R10): the Big text preset's constants and
+    label stylesheets -- the pure part, no window needed."""
+
+    def test_constants(self):
+        import duo_accessibility
+        self.assertEqual(duo_accessibility.SETTING_BIG_TEXT,
+                         "accessibility/big_text")
+        self.assertEqual(duo_accessibility.SETTING_BIG_TEXT_OFFERED,
+                         "accessibility/big_text_offered")
+        self.assertEqual(duo_accessibility.BIG_TEXT_FONT_DELTA_PT, 2)
+        self.assertEqual(duo_accessibility.SMALL_LABEL_NORMAL_PX, 11)
+        self.assertEqual(duo_accessibility.SMALL_LABEL_BIG_PX, 14)
+        self.assertEqual(duo_accessibility.TITLE_NORMAL_PX, 14)
+        self.assertEqual(duo_accessibility.TITLE_BIG_PX, 16)
+        self.assertEqual(duo_accessibility.BIG_TEXT_OFFER_TITLE,
+                         "Big text")
+        self.assertEqual(
+            duo_accessibility.BIG_TEXT_OFFER_TEXT,
+            "DUO can make its text bigger. Turn on Big text?")
+        self.assertNotIn("\u2014",
+                         duo_accessibility.BIG_TEXT_OFFER_TEXT)
+
+    def test_small_label_style(self):
+        import duo_accessibility
+        self.assertEqual(duo_accessibility.small_label_style(False),
+                         "font-size: 11px;")
+        self.assertEqual(duo_accessibility.small_label_style(True),
+                         "font-size: 14px;")
+
+    def test_explanation_style(self):
+        import duo_accessibility
+        import duo_constants
+        # At normal size this is EXPLAIN_STYLE exactly -- the
+        # preset must not restyle the explanations to anything
+        # other than what the window builds them with.
+        self.assertEqual(duo_accessibility.explanation_style(False),
+                         duo_constants.EXPLAIN_STYLE)
+        self.assertEqual(duo_accessibility.explanation_style(True),
+                         "font-size: 14px; color: #6b6b6b;")
+
+    def test_title_style(self):
+        import duo_accessibility
+        self.assertEqual(
+            duo_accessibility.title_style(False, "#2563eb"),
+            "font-weight: bold; font-size: 14px; color: #2563eb;")
+        self.assertEqual(
+            duo_accessibility.title_style(True, "#7c3aed"),
+            "font-weight: bold; font-size: 16px; color: #7c3aed;")
+
+
 @unittest.skipUnless(os.environ.get("DUAL_CHAT_GUI_TESTS") == "1",
                      "GUI tests run with DUAL_CHAT_GUI_TESTS=1")
 class MotionGuiTests(unittest.TestCase):
@@ -13968,6 +14025,337 @@ class SparklineGuiTests(unittest.TestCase):
             self.assertEqual(samples[-1], 20.0)
         finally:
             motion.reduced_motion.set(False)
+
+
+class AccessibilityGuiTests(unittest.TestCase):
+    """v0.48 (redesign R10): the Big text preset in the window --
+    the font grows by 2 pt, every self-sized label is re-styled,
+    the menu item mirrors the setting, and the first-boot offer
+    appears exactly once with No as the default.
+
+    The app font is process-global and the setting is shared
+    QSettings, so setUp normalizes Big text to off and tearDown
+    restores both the setting and the offered flag: a test that
+    toggles the preset must not leak a big font into the next
+    test (the v0.39 geometry test needs the normal sizes) or
+    into the drive."""
+
+    @classmethod
+    def setUpClass(cls):
+        from PySide6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+        cls.client = FakeGuiClient()
+
+    def setUp(self):
+        import duo_accessibility
+        self.client.reset()
+        self.window, self.state = self._build_window()
+        self._pick_models(self.state)
+        self._saved_big = self.state["big_text"].value
+        self._saved_offered = bool(self.state["prefs"].value(
+            duo_accessibility.SETTING_BIG_TEXT_OFFERED,
+            False, type=bool))
+        if self._saved_big:
+            self.state["big_text"].set(False)
+
+    def tearDown(self):
+        import duo_accessibility
+        self.state["big_text"].set(self._saved_big)
+        self.state["prefs"].setValue(
+            duo_accessibility.SETTING_BIG_TEXT_OFFERED,
+            self._saved_offered)
+        self.window.close()
+        self.app.processEvents()
+
+    def _wait_for(self, cond, timeout=10.0):
+        from PySide6.QtTest import QTest
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            QTest.qWait(50)
+            if cond():
+                return True
+        return cond()
+
+    def _build_window(self, client=None):
+        from dual_chat import build_window
+        client = self.client if client is None else client
+        window = build_window(client, logger=TEST_LOGGER)
+        window.show()
+        state = window._dual_chat
+        self.assertTrue(self._wait_for(
+            lambda: state["widgets"]["A"]["picker"].count() == 2))
+        return window, state
+
+    def _pick_models(self, state):
+        state["widgets"]["A"]["picker"].setCurrentIndex(0)
+        state["widgets"]["B"]["picker"].setCurrentIndex(1)
+        self.app.processEvents()
+
+    def _label_sizes(self, state, size_px):
+        # Every self-sized label, per side and global, carries the
+        # given size; the explanations keep their grey; the titles
+        # keep their bold and their side color.
+        import duo_model
+        widgets = state["widgets"]
+        for side in ("A", "B"):
+            for key in ("stats", "activity", "session_tokens"):
+                self.assertIn("font-size: %dpx;" % size_px,
+                              widgets[side][key].styleSheet(), key)
+            for key in ("temp_explain", "instr_explain"):
+                sheet = widgets[side][key].styleSheet()
+                self.assertIn("font-size: %dpx;" % size_px, sheet,
+                              key)
+                self.assertIn("color: #6b6b6b;", sheet, key)
+            title = widgets[side]["title"].styleSheet()
+            self.assertIn("font-weight: bold;", title, side)
+            self.assertIn("color: %s;" % duo_model.SIDE_COLORS[side],
+                          title, side)
+        for key in ("attach_note", "relay_status", "meter_label"):
+            self.assertIn("font-size: %dpx;" % size_px,
+                          state[key].styleSheet(), key)
+        for key in ("relay_explain", "stop_explain", "task_explain",
+                    "task_row_explain"):
+            sheet = state[key].styleSheet()
+            self.assertIn("font-size: %dpx;" % size_px, sheet, key)
+            self.assertIn("color: #6b6b6b;", sheet, key)
+
+    def _title_sizes(self, state, size_px):
+        for side in ("A", "B"):
+            self.assertIn("font-size: %dpx;" % size_px,
+                          state["widgets"][side]["title"].styleSheet(),
+                          side)
+
+    def test_big_text_on_grows_the_font_and_the_labels(self):
+        from PySide6.QtWidgets import QApplication
+        big_text = self.state["big_text"]
+        base_pt = QApplication.font().pointSize()
+        composer = self.state["composer"]
+        transcript = self.state["widgets"]["A"]["transcript"]
+        before_metrics = transcript.fontMetrics().height()
+        try:
+            big_text.set(True)
+            self.app.processEvents()
+            self.assertEqual(QApplication.font().pointSize(),
+                             base_pt + 2)
+            self.assertEqual(composer.font().pointSize(),
+                             base_pt + 2)
+            self.assertGreater(transcript.fontMetrics().height(),
+                               before_metrics)
+            self._label_sizes(self.state, 14)
+            self._title_sizes(self.state, 16)
+            sheet = self.window.styleSheet()
+            self.assertIn("* { font-size: %dpt; }" % (base_pt + 2),
+                          sheet)
+            # The focus ring survives: the font rule is composed
+            # with it, not written over it.
+            self.assertIn("QPushButton:focus", sheet)
+        finally:
+            big_text.set(False)
+
+    def test_big_text_off_restores_exactly(self):
+        from PySide6.QtWidgets import QApplication
+        import duo_motion
+        big_text = self.state["big_text"]
+        base_pt = QApplication.font().pointSize()
+        composer = self.state["composer"]
+        try:
+            big_text.set(True)
+            self.app.processEvents()
+            big_text.set(False)
+            self.app.processEvents()
+            self.assertEqual(QApplication.font().pointSize(), base_pt)
+            self.assertEqual(composer.font().pointSize(), base_pt)
+            self._label_sizes(self.state, 11)
+            self._title_sizes(self.state, 14)
+            # Off restores the focus-ring stylesheet exactly --
+            # no font rule left behind.
+            self.assertEqual(self.window.styleSheet(),
+                             duo_motion.FOCUS_RING_STYLESHEET)
+        finally:
+            big_text.set(False)
+
+    def test_big_text_menu_action_mirrors_the_setting(self):
+        action = self.state["menu_actions"]["big_text"]
+        self.assertEqual(action.text(), "Big text")
+        self.assertTrue(action.isCheckable())
+        self.assertEqual(action.isChecked(),
+                         self.state["big_text"].value)
+
+    def test_big_text_menu_action_toggles_the_setting(self):
+        big_text = self.state["big_text"]
+        action = self.state["menu_actions"]["big_text"]
+        initial = big_text.value
+        try:
+            action.trigger()
+            self.assertEqual(big_text.value, not initial)
+            self.assertEqual(action.isChecked(), not initial)
+            action.trigger()
+            self.assertEqual(big_text.value, initial)
+            self.assertEqual(action.isChecked(), initial)
+        finally:
+            big_text.set(initial)
+
+    def test_big_text_persists_across_windows(self):
+        # Toggle on, close (which syncs QSettings), reopen: the
+        # new window reads the setting back, menu tick and all.
+        window1, state1 = self._build_window()
+        try:
+            state1["menu_actions"]["big_text"].trigger()
+            self.assertTrue(state1["big_text"].value)
+        finally:
+            window1.close()
+        self.app.processEvents()
+        window2, state2 = self._build_window()
+        try:
+            self.assertTrue(state2["big_text"].value)
+            self.assertTrue(
+                state2["menu_actions"]["big_text"].isChecked())
+            self.assertEqual(
+                state2["composer"].font().pointSize(),
+                self.app.font().pointSize())
+            state2["menu_actions"]["big_text"].trigger()
+            self.assertFalse(state2["big_text"].value)
+        finally:
+            window2.close()
+        self.app.processEvents()
+
+    def _clear_offered(self):
+        import duo_accessibility
+        self.state["prefs"].setValue(
+            duo_accessibility.SETTING_BIG_TEXT_OFFERED, False)
+
+    def test_offer_yes_turns_big_text_on(self):
+        from PySide6.QtWidgets import QApplication
+        import duo_accessibility
+        big_text = self.state["big_text"]
+        base_pt = QApplication.font().pointSize()
+        self._clear_offered()
+        try:
+            with _answer_yes() as asked:
+                self.assertTrue(big_text.offer(self.window))
+            self.assertEqual(asked.call_count, 1)
+            self.assertEqual(asked.call_args.args[1],
+                             duo_accessibility.BIG_TEXT_OFFER_TITLE)
+            self.assertEqual(asked.call_args.args[2],
+                             duo_accessibility.BIG_TEXT_OFFER_TEXT)
+            self.assertTrue(big_text.value)
+            self.assertEqual(QApplication.font().pointSize(),
+                             base_pt + 2)
+            self.assertTrue(bool(self.state["prefs"].value(
+                duo_accessibility.SETTING_BIG_TEXT_OFFERED,
+                False, type=bool)))
+        finally:
+            big_text.set(False)
+
+    def test_offer_no_leaves_big_text_off(self):
+        from PySide6.QtWidgets import QApplication
+        import duo_accessibility
+        big_text = self.state["big_text"]
+        base_pt = QApplication.font().pointSize()
+        self._clear_offered()
+        with _answer_no():
+            self.assertTrue(big_text.offer(self.window))
+        self.assertFalse(big_text.value)
+        self.assertEqual(QApplication.font().pointSize(), base_pt)
+        self.assertTrue(bool(self.state["prefs"].value(
+            duo_accessibility.SETTING_BIG_TEXT_OFFERED,
+            False, type=bool)))
+
+    def test_offer_never_appears_twice(self):
+        big_text = self.state["big_text"]
+        self._clear_offered()
+        with _answer_no() as asked:
+            self.assertTrue(big_text.offer(self.window))
+            # Already offered: no dialog the second time.
+            self.assertFalse(big_text.offer(self.window))
+            self.assertEqual(asked.call_count, 1)
+
+    def test_offer_escape_leaves_big_text_off(self):
+        from PySide6 import QtCore, QtTest, QtWidgets
+        import duo_accessibility
+        big_text = self.state["big_text"]
+        self._clear_offered()
+        seen = []
+
+        def press_escape():
+            dialog = QtWidgets.QApplication.activeModalWidget()
+            seen.append(dialog is not None)
+            if dialog is not None:
+                QtTest.QTest.keyClick(dialog, QtCore.Qt.Key_Escape)
+
+        def force_close():
+            # Safety net: never leave a modal dialog open if the
+            # Escape keypress did not land.
+            dialog = QtWidgets.QApplication.activeModalWidget()
+            if dialog is not None:
+                dialog.reject()
+
+        escape_timer = QtCore.QTimer()
+        escape_timer.setSingleShot(True)
+        escape_timer.timeout.connect(press_escape)
+        safety_timer = QtCore.QTimer()
+        safety_timer.setSingleShot(True)
+        safety_timer.timeout.connect(force_close)
+        try:
+            escape_timer.start(200)
+            safety_timer.start(5000)
+            self.assertTrue(big_text.offer(self.window))
+        finally:
+            escape_timer.stop()
+            safety_timer.stop()
+            self.app.processEvents()
+        self.assertEqual(seen, [True],
+                         "the offer dialog should have appeared")
+        self.assertFalse(big_text.value)
+        self.assertTrue(bool(self.state["prefs"].value(
+            duo_accessibility.SETTING_BIG_TEXT_OFFERED,
+            False, type=bool)))
+
+    def test_offer_default_button_is_no(self):
+        from PySide6 import QtCore, QtWidgets
+        from PySide6.QtWidgets import QMessageBox
+        import duo_accessibility
+        big_text = self.state["big_text"]
+        self._clear_offered()
+        seen = []
+
+        def check_default_and_click_no():
+            dialog = QtWidgets.QApplication.activeModalWidget()
+            seen.append(dialog is not None)
+            if dialog is not None:
+                no_button = dialog.button(
+                    QMessageBox.StandardButton.No)
+                seen.append(dialog.defaultButton() is no_button)
+                no_button.click()
+
+        def force_close():
+            # Safety net: never leave a modal dialog open if the
+            # click did not land.
+            dialog = QtWidgets.QApplication.activeModalWidget()
+            if dialog is not None:
+                dialog.reject()
+
+        check_timer = QtCore.QTimer()
+        check_timer.setSingleShot(True)
+        check_timer.timeout.connect(check_default_and_click_no)
+        safety_timer = QtCore.QTimer()
+        safety_timer.setSingleShot(True)
+        safety_timer.timeout.connect(force_close)
+        try:
+            check_timer.start(200)
+            safety_timer.start(5000)
+            self.assertTrue(big_text.offer(self.window))
+        finally:
+            check_timer.stop()
+            safety_timer.stop()
+            self.app.processEvents()
+        self.assertEqual(seen, [True, True],
+                         "the offer dialog should have appeared "
+                         "with No as its default button")
+        self.assertFalse(big_text.value)
+        self.assertTrue(bool(self.state["prefs"].value(
+            duo_accessibility.SETTING_BIG_TEXT_OFFERED,
+            False, type=bool)))
 
 
 if __name__ == "__main__":

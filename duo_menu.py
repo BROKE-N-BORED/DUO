@@ -110,6 +110,9 @@ HOW_TO_USE_SECTIONS = (
      "runs the same check whenever you like. DUO never downloads "
      "or installs anything. You download a new version from "
      "GitHub yourself."),
+    ("Bigger text",
+     "Big text in the Help menu makes all of DUO's text bigger. "
+     "It works right away, and DUO remembers your choice."),
 )
 
 
@@ -144,7 +147,8 @@ def show_how_to_use_dialog(parent):
     make_how_to_use_dialog(parent).exec()
 
 
-def build_menu_bar(window, handlers, version, reduce_motion=None):
+def build_menu_bar(window, handlers, version, reduce_motion=None,
+                   big_text=None):
     """Build DUO's menu bar on `window` (a QMainWindow).
 
     `handlers` maps each action name to the callable the matching
@@ -157,6 +161,9 @@ def build_menu_bar(window, handlers, version, reduce_motion=None):
     callable the checkable "Reduce motion" Help item calls with its
     checked state, and whether it starts checked. When omitted the
     item is left out.
+
+    `big_text` (optional, v0.48 R10) is the same shape for the
+    checkable "Big text" Help item.
 
     Returns (menu_bar, actions): the QMenuBar and a dict mapping
     every action name (plus "about" and "how_to_use") to its
@@ -207,6 +214,15 @@ def build_menu_bar(window, handlers, version, reduce_motion=None):
         setter, initial = reduce_motion
         action = add(help_menu, "reduce_motion", "Reduce motion",
                      setter)
+        action.setCheckable(True)
+        action.setChecked(initial)
+    if big_text is not None:
+        # Big text (v0.48, R10): the same checkable-item shape as
+        # Reduce motion -- it toggles a setting, and setChecked
+        # emits toggled, not triggered, so the initial state never
+        # writes the setting back.
+        setter, initial = big_text
+        action = add(help_menu, "big_text", "Big text", setter)
         action.setCheckable(True)
         action.setChecked(initial)
     add(help_menu, "how_to_use", "How to use",

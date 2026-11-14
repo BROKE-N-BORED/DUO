@@ -195,6 +195,9 @@ import time
 # build_window stays a closure in this file: splitting the
 # window itself into a class is a bigger redesign and not this
 # task.
+from duo_accessibility import (
+    explanation_style, install_accessibility, small_label_style,
+    title_style,)
 from duo_attachments import (
     MAX_ATTACHMENTS, MAX_ATTACHMENT_BYTES, AttachmentError,
     attachment_tag, build_attached_message, load_attachment,)
@@ -276,7 +279,7 @@ from duo_workers import (_ModelLoader, _OllamaStarter, _SignalObject,
 
 
 APP_NAME = "DUO"
-APP_VERSION = "0.47"
+APP_VERSION = "0.48"
 
 
 
@@ -3640,6 +3643,34 @@ def build_window(client=None, logger=None, deck_port=None):
     motion = install_motion(window, widgets, side_state,
                             SIDE_STATES["idle"][0], prefs)
 
+    # Accessibility (v0.48, R10): the Big text preset -- the app
+    # font grows by 2 pt, the window stylesheet gains a font-size
+    # rule, and every label that sets its own size is re-styled,
+    # so the text gets bigger everywhere at once. The self-sized
+    # labels are collected here, once every widget exists, as
+    # (label, style_builder) pairs; the title builder closes over
+    # the side's color (the default arg pins it per side -- the
+    # loop variable alone would bind late).
+    small_labels = (
+        [(widgets[side][key], small_label_style)
+         for side in ("A", "B")
+         for key in ("stats", "activity", "session_tokens")]
+        + [(widgets[side][key], explanation_style)
+           for side in ("A", "B")
+           for key in ("temp_explain", "instr_explain")]
+        + [(attach_note, small_label_style),
+           (relay_status, small_label_style),
+           (meter_label, small_label_style),
+           (relay_explain, explanation_style),
+           (stop_explain, explanation_style),
+           (task_explain, explanation_style),
+           (task_row_explain, explanation_style)]
+        + [(widgets[side]["title"],
+            lambda big, color=SIDE_COLORS[side]:
+            title_style(big, color))
+           for side in ("A", "B")])
+    big_text = install_accessibility(window, small_labels, prefs)
+
     # --- menu bar (v0.30) -------------------------------------------------
     # File / Relay / Help, plus shortcuts for the main actions. Every
     # item calls the same handler as its button -- access, not
@@ -3657,7 +3688,8 @@ def build_window(client=None, logger=None, deck_port=None):
         "stop_relay": stop_relay,
         "check_updates": lambda: run_update_check(manual=True),
     }, APP_VERSION, reduce_motion=(motion.reduced_motion.set,
-                                   motion.reduced_motion.value))
+                                   motion.reduced_motion.value),
+       big_text=(big_text.set, big_text.value))
 
     window._dual_chat = {  # test hooks (not part of the UI)
         "convo": convo, "runner": runner, "signals": signals,
@@ -3733,7 +3765,7 @@ def build_window(client=None, logger=None, deck_port=None):
         "on_update_checked": on_update_checked,
         "update_checkers": update_checkers,
         "menu_bar": menu_bar, "menu_actions": menu_actions,
-        "motion": motion,
+        "motion": motion, "big_text": big_text, "prefs": prefs,
         "director": director, "director_toggle": director_toggle,
         "set_director_collapsed": _set_director_collapsed,
         "director_spring": director_spring,
@@ -3919,6 +3951,15 @@ def main(argv=None):
         lambda: (window.show(), window.raise_(),
                  window.activateWindow()))
     window.show()
+    # First-boot offer (v0.48, R10): on a first run, offer Big
+    # text once -- the offer itself records that it was made, so
+    # it never appears again. A Yes turns the preset on without
+    # going through the menu, so the menu item is synced from the
+    # setting afterwards (the menu only tracks clicks itself).
+    if not window._dual_chat["state"]["first_run_done"]:
+        window._dual_chat["big_text"].offer(window)
+        window._dual_chat["menu_actions"]["big_text"].setChecked(
+            window._dual_chat["big_text"].value)
     return app.exec()
 
 
