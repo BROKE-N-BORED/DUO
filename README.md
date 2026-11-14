@@ -254,7 +254,11 @@ bash run.sh
   has run; "n/a" when Ollama doesn't report a number. Underneath,
   each pane keeps a running session total ("Session: 42 out /
   128 in") across every generation since the app started; Clear
-  never resets it.
+  never resets it. Beside the session total, a small sparkline
+  graphs the live tokens-per-second rate while a side generates,
+  keeping the last 30 seconds of generation across turns; it
+  resets with the stats on Clear, conversation load, import, or
+  a model change.
 - Activity lights: each pane has a small colored light and small
   words under its stats line saying what that side is doing right
   now — grey Idle, amber while it waits (queued, waiting for

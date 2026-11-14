@@ -8,11 +8,12 @@ import os
 import zipfile
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
-OUT = os.path.join(os.path.dirname(ROOT), "duo-v0.46.zip")
+OUT = os.path.join(os.path.dirname(ROOT), "duo-v0.47.zip")
 
 FILES = {
     "dual_chat.py": 0o100644,
     "duo_attachments.py": 0o100644,
+    "duo_constants.py": 0o100644,
     "duo_debug.py": 0o100644,
     "duo_ollama.py": 0o100644,
     "duo_stats.py": 0o100644,
@@ -27,6 +28,7 @@ FILES = {
     "duo_storage.py": 0o100644,
     "duo_runner.py": 0o100644,
     "duo_single.py": 0o100644,
+    "duo_sparkline.py": 0o100644,
     "duo_icon.py": 0o100644,
     "duo_workers.py": 0o100644,
     "debug_log.py": 0o100644,

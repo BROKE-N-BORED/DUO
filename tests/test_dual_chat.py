@@ -6797,7 +6797,7 @@ class FrontDoorTests(unittest.TestCase):
 
     def test_changelog_covers_every_version(self):
         log = self._read("CHANGELOG.md")
-        for version in ["0.%d" % n for n in range(1, 47)]:
+        for version in ["0.%d" % n for n in range(1, 48)]:
             self.assertIn(version, log)
 
     def test_gitignore_covers_runtime_files(self):
@@ -8807,7 +8807,8 @@ class ModuleSplitTests(unittest.TestCase):
                "duo_markdown", "duo_model", "duo_transcript",
                "duo_storage", "duo_runner", "duo_icon", "duo_menu",
                "duo_deck", "duo_workers", "duo_debug",
-               "duo_attachments", "duo_single", "duo_motion")
+               "duo_attachments", "duo_single", "duo_motion",
+               "duo_constants", "duo_sparkline")
 
     def _tree(self):
         return os.path.dirname(
@@ -8836,6 +8837,7 @@ class ModuleSplitTests(unittest.TestCase):
     def test_reexports_are_the_same_objects(self):
         import dual_chat
         import duo_attachments
+        import duo_constants
         import duo_debug
         import duo_deck
         import duo_icon
@@ -8846,6 +8848,7 @@ class ModuleSplitTests(unittest.TestCase):
         import duo_ollama
         import duo_runner
         import duo_single
+        import duo_sparkline
         import duo_stats
         import duo_storage
         import duo_tasks
@@ -8912,6 +8915,24 @@ class ModuleSplitTests(unittest.TestCase):
              duo_single.SINGLE_INSTANCE_NAME),
             (dual_chat.SINGLE_INSTANCE_ENV,
              duo_single.SINGLE_INSTANCE_ENV),
+            (dual_chat.SIDE_STATES, duo_constants.SIDE_STATES),
+            (dual_chat.ERROR_STATE_HOLD_MS,
+             duo_constants.ERROR_STATE_HOLD_MS),
+            (dual_chat.first_run_guide_html,
+             duo_constants.first_run_guide_html),
+            (dual_chat.EXPLAIN_TEMP, duo_constants.EXPLAIN_TEMP),
+            (dual_chat.MSG_UPDATE_LATEST,
+             duo_constants.MSG_UPDATE_LATEST),
+            (dual_chat.SETTING_ENTER_TO_SEND,
+             duo_constants.SETTING_ENTER_TO_SEND),
+            (dual_chat.TEMPERATURE_DEFAULT,
+             duo_constants.TEMPERATURE_DEFAULT),
+            (dual_chat.HISTORY_BUDGET_CHARS,
+             duo_constants.HISTORY_BUDGET_CHARS),
+            (dual_chat.Sparkline, duo_sparkline.Sparkline),
+            (dual_chat.live_rate, duo_sparkline.live_rate),
+            (dual_chat.SPARKLINE_SAMPLE_MS,
+             duo_sparkline.SPARKLINE_SAMPLE_MS),
         ]
         for through_dual_chat, original in pairs:
             self.assertIs(through_dual_chat, original, original)
@@ -9229,6 +9250,18 @@ class MessageStructureTests(unittest.TestCase):
                   encoding="utf-8") as fh:
             script = fh.read()
         self.assertIn('"duo_motion.py": 0o100644', script)
+
+    def test_zip_includes_the_constants_module(self):
+        with open(os.path.join(self._tree(), "build_zip.py"),
+                  encoding="utf-8") as fh:
+            script = fh.read()
+        self.assertIn('"duo_constants.py": 0o100644', script)
+
+    def test_zip_includes_the_sparkline_module(self):
+        with open(os.path.join(self._tree(), "build_zip.py"),
+                  encoding="utf-8") as fh:
+            script = fh.read()
+        self.assertIn('"duo_sparkline.py": 0o100644', script)
 
 class UpdateCheckTests(unittest.TestCase):
     """v0.28 (audit T17): the update check's pure core -- version
@@ -13214,6 +13247,70 @@ class MotionConstantsTests(unittest.TestCase):
         self.assertEqual(duo_motion.QWIDGETSIZE_MAX, 16777215)
 
 
+class SparklineTests(unittest.TestCase):
+    """v0.47 (redesign R9): the sparkline's pure core -- the live
+    rate, the rolling window, and the point mapping. No Qt here:
+    the widget itself is covered by SparklineGuiTests."""
+
+    def test_constants(self):
+        import duo_sparkline
+        self.assertEqual(duo_sparkline.SPARKLINE_SAMPLE_MS, 500)
+        self.assertEqual(duo_sparkline.SPARKLINE_MAX_SAMPLES, 60)
+        self.assertEqual(duo_sparkline.SPARKLINE_MIN_SCALE, 1.0)
+        self.assertEqual(duo_sparkline.SPARKLINE_WIDTH, 120)
+        self.assertEqual(duo_sparkline.SPARKLINE_HEIGHT, 24)
+        self.assertEqual(duo_sparkline.CHARS_PER_TOKEN, 4)
+
+    def test_live_rate_divides_chars_by_four_and_seconds(self):
+        import duo_sparkline
+        self.assertEqual(duo_sparkline.live_rate(200, 2.0), 25.0)
+
+    def test_live_rate_needs_elapsed_time(self):
+        import duo_sparkline
+        self.assertIsNone(duo_sparkline.live_rate(200, 0))
+        self.assertIsNone(duo_sparkline.live_rate(200, -1.0))
+        self.assertIsNone(duo_sparkline.live_rate(200, None))
+        self.assertIsNone(duo_sparkline.live_rate("x", 2.0))
+
+    def test_trim_keeps_the_newest_sixty(self):
+        import duo_sparkline
+        samples = list(range(65))
+        duo_sparkline.trim_samples(samples)
+        self.assertEqual(len(samples), 60)
+        self.assertEqual(samples[0], 5)
+        self.assertEqual(samples[-1], 64)
+
+    def test_points_empty_draws_nothing(self):
+        import duo_sparkline
+        self.assertEqual(duo_sparkline.sparkline_points([]), [])
+
+    def test_points_max_sample_maps_to_the_top(self):
+        import duo_sparkline
+        points = duo_sparkline.sparkline_points([2.0, 10.0, 5.0])
+        self.assertEqual(points[1][1], 0)
+        self.assertGreater(points[0][1], 0)
+        self.assertGreater(points[2][1], 0)
+
+    def test_points_newest_sample_sits_at_the_right_edge(self):
+        import duo_sparkline
+        points = duo_sparkline.sparkline_points(
+            [1.0, 2.0, 3.0], width=120, height=24)
+        self.assertEqual(points[-1][0], 119)
+        self.assertLess(points[0][0], points[-1][0])
+
+    def test_points_scale_never_drops_below_one(self):
+        import duo_sparkline
+        # All samples under 1 tok/s: the top of the scale is 1.0,
+        # so 0.5 sits halfway down, not at the top.
+        points = duo_sparkline.sparkline_points([0.5])
+        self.assertAlmostEqual(points[0][1], (24 - 1) * 0.5)
+
+    def test_points_zero_maps_to_the_bottom(self):
+        import duo_sparkline
+        points = duo_sparkline.sparkline_points([10.0, 0.0])
+        self.assertEqual(points[1][1], 23)
+
+
 @unittest.skipUnless(os.environ.get("DUAL_CHAT_GUI_TESTS") == "1",
                      "GUI tests run with DUAL_CHAT_GUI_TESTS=1")
 class MotionGuiTests(unittest.TestCase):
@@ -13742,6 +13839,135 @@ class DirectorSpringGuiTests(unittest.TestCase):
         self.assertTrue(director.isHidden())
         self.assertTrue(settings.value(
             SETTING_DIRECTOR_COLLAPSED, False, type=bool))
+
+
+@unittest.skipUnless(os.environ.get("DUAL_CHAT_GUI_TESTS") == "1",
+                     "GUI tests run with DUAL_CHAT_GUI_TESTS=1")
+class SparklineGuiTests(unittest.TestCase):
+    """v0.47 (redesign R9): the live tok/s sparkline in the window
+    -- one per pane, on the activity row, in the side's color.
+    Samples come from the 500 ms timer while a side generates;
+    the final sample is the turn's tok/s from the done chunk."""
+
+    @classmethod
+    def setUpClass(cls):
+        from PySide6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+        cls.client = FakeGuiClient()
+
+    def setUp(self):
+        self.client.reset()
+        self.window, self.state = self._build_window()
+        self._pick_models(self.state)
+        # The reduced-motion setting is shared QSettings: remember
+        # it and put it back, so a test that toggles it cannot leak
+        # into the next test (or the drive).
+        self._saved_reduced = (
+            self.state["motion"].reduced_motion.value)
+
+    def tearDown(self):
+        self.state["motion"].reduced_motion.set(self._saved_reduced)
+        self.window.close()
+        self.app.processEvents()
+
+    def _wait_for(self, cond, timeout=10.0):
+        from PySide6.QtTest import QTest
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            QTest.qWait(50)
+            if cond():
+                return True
+        return cond()
+
+    def _build_window(self):
+        from dual_chat import build_window
+        window = build_window(self.client, logger=TEST_LOGGER)
+        window.show()
+        state = window._dual_chat
+        self.assertTrue(self._wait_for(
+            lambda: state["widgets"]["A"]["picker"].count() == 2))
+        return window, state
+
+    def _pick_models(self, state):
+        state["widgets"]["A"]["picker"].setCurrentIndex(0)
+        state["widgets"]["B"]["picker"].setCurrentIndex(1)
+        self.app.processEvents()
+
+    def _send_to_a_and_wait(self, state, text, timeout=15.0):
+        state["composer"].setPlainText(text)
+        state["send_a"].click()
+        return self._wait_for(
+            lambda: not state["state"]["busy"], timeout=timeout)
+
+    def test_sparkline_exists_per_pane_in_side_color(self):
+        from dual_chat import SIDE_COLORS
+        for side in ("A", "B"):
+            sparkline = self.state["widgets"][side]["sparkline"]
+            self.assertEqual(sparkline.color, SIDE_COLORS[side])
+            self.assertEqual(sparkline.widget.width(), 120)
+            self.assertEqual(sparkline.widget.height(), 24)
+            self.assertEqual(sparkline.samples(), [])
+
+    def test_empty_sparkline_paints_blank_without_crashing(self):
+        sparkline = self.state["widgets"]["A"]["sparkline"]
+        pixmap = sparkline.widget.grab()
+        self.assertFalse(pixmap.isNull())
+        self.assertEqual(sparkline.samples(), [])
+
+    def test_samples_grow_during_a_slow_turn_and_stop_after(self):
+        # 15 words at 0.3 s each: a ~4.5 s turn, long enough for
+        # several 500 ms timer ticks before it ends.
+        self.client.delay = 0.3
+        self.client.replies["fake-a:latest"] = [
+            "one two three four five six seven eight nine ten "
+            "eleven twelve thirteen fourteen fifteen"]
+        sparkline = self.state["widgets"]["A"]["sparkline"]
+        self.assertEqual(sparkline.samples(), [])
+        self.state["composer"].setPlainText("go slow")
+        self.state["send_a"].click()
+        # Mid-turn, the timer has sampled the live rate.
+        self.assertTrue(self._wait_for(
+            lambda: len(sparkline.samples()) >= 2, timeout=10))
+        self.assertTrue(self._wait_for(
+            lambda: not self.state["state"]["busy"], timeout=15))
+        count = len(sparkline.samples())
+        self.assertGreater(count, 0)
+        # After the turn the timer is stopped: no more samples.
+        from PySide6.QtTest import QTest
+        QTest.qWait(1200)
+        self.assertEqual(len(sparkline.samples()), count)
+
+    def test_final_sample_is_the_turn_tok_per_sec(self):
+        # The fake's default metrics: 10 eval tokens in 0.5 s.
+        self.assertTrue(self._send_to_a_and_wait(self.state,
+                                                 "hello"))
+        samples = self.state["widgets"]["A"]["sparkline"].samples()
+        self.assertGreaterEqual(len(samples), 1)
+        self.assertEqual(samples[-1], 20.0)
+
+    def test_clear_resets_the_sparkline(self):
+        self.assertTrue(self._send_to_a_and_wait(self.state,
+                                                 "hello"))
+        sparkline = self.state["widgets"]["A"]["sparkline"]
+        self.assertGreater(len(sparkline.samples()), 0)
+        with _answer_yes():
+            self.state["widgets"]["A"]["clear"].click()
+        self.assertEqual(sparkline.samples(), [])
+
+    def test_reduced_motion_does_not_stop_updates(self):
+        # The sparkline is data, not decoration: reduced motion
+        # stops the dip and the spring, never the measurement.
+        motion = self.state["motion"]
+        motion.reduced_motion.set(True)
+        try:
+            self.assertTrue(self._send_to_a_and_wait(self.state,
+                                                     "hello"))
+            samples = (
+                self.state["widgets"]["A"]["sparkline"].samples())
+            self.assertGreaterEqual(len(samples), 1)
+            self.assertEqual(samples[-1], 20.0)
+        finally:
+            motion.reduced_motion.set(False)
 
 
 if __name__ == "__main__":

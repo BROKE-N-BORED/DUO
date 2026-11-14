@@ -178,6 +178,7 @@ import shutil  # noqa: F401 -- unused here, but the tests patch
 # duo_ollama; shutil is one shared module, so the patch lands).
 import sys
 import threading
+import time
 
 # The code used to live in this one file (5,165 lines). v0.25
 # (audit T14) splits it into focused sibling modules; this file
@@ -185,8 +186,9 @@ import threading
 # duo_deck.py in v0.31, the background Qt workers to duo_workers.py
 # in v0.39, the relay session to duo_model.py in v0.40, the debug
 # log fallback to duo_debug.py and the attachments to
-# duo_attachments.py in v0.42, and the single-instance socket to
-# duo_single.py in v0.44), and
+# duo_attachments.py in v0.42, the single-instance socket to
+# duo_single.py in v0.44, and the window constants to
+# duo_constants.py in v0.47), and
 # re-exports the moved names so
 # `from dual_chat import ...` keeps working unchanged -- the
 # tests, the installer, and the deck all import through here.
@@ -196,6 +198,27 @@ import threading
 from duo_attachments import (
     MAX_ATTACHMENTS, MAX_ATTACHMENT_BYTES, AttachmentError,
     attachment_tag, build_attached_message, load_attachment,)
+from duo_constants import (
+    MSG_STOPPED, MSG_RELAY_NEEDS_BOTH, MSG_RELAY_STOPPED_BY_YOU,
+    MSG_PHONE_BUSY, MSG_PHONE_RELAY, MSG_PHONE_TASK,
+    MSG_UPDATE_AVAILABLE, MSG_UPDATE_LATEST, MSG_UPDATE_FAILED,
+    MSG_PYSIDE6_MISSING, SIDE_STATES, ERROR_STATE_HOLD_MS,
+    RELAY_CHIP_STATES, METER_REFRESH_MS, SETTINGS_ORG, SETTINGS_APP,
+    SETTING_ENTER_TO_SEND, SETTING_DIRECTOR_COLLAPSED,
+    SETTING_SECTION_COLLAPSED, SETTING_WINDOW_GEOMETRY,
+    SETTING_SPLITTER_STATE, SETTING_HIST_SPLITTER_STATE,
+    HIST_TRANSCRIPT_MIN_HEIGHT, HIST_EDITOR_MIN_HEIGHT,
+    HIST_EDITOR_DEFAULT_HEIGHT, SETTING_TEMPERATURE,
+    TEMPERATURE_DEFAULT, TEMPERATURE_MIN, TEMPERATURE_MAX,
+    SETTING_FIRST_RUN_DONE, FIRST_RUN_HEADER, FIRST_RUN_STEP1,
+    FIRST_RUN_STEP2, FIRST_RUN_STEP3, FIRST_RUN_TICK, EXPLAIN_TEMP,
+    EXPLAIN_RELAY_ROW1, EXPLAIN_STOP, EXPLAIN_INSTR, EXPLAIN_TASK,
+    EXPLAIN_TASK_ROW, EXPLAIN_STYLE, first_run_guide_html,
+    HISTORY_BUDGET_CHARS, SUMMARIZE_PROMPT, COMPARE_PREFIX,
+    MSG_TASK_EMPTY, MSG_TASK_NEEDS_WORKER, MSG_TASK_NEEDS_FOLLOW_UP,
+    MSG_PAIR_NEEDS_NAME, MSG_PRESET_NEEDS_NAME, MSG_REVIEW_EMPTY,
+    _open_link_in_browser,
+)
 from duo_debug import _NullLogger, _debug_log, make_debug_logger
 from duo_deck import (
     DECK_PAGE_HTML, DECK_PORT, DECK_PORT_ENV, DECK_PORT_TRIES,
@@ -222,6 +245,7 @@ from duo_runner import SerialRunner
 from duo_single import (SINGLE_INSTANCE_ENV, SINGLE_INSTANCE_NAME,
                         SingleInstance, notify_existing,
                         single_instance_name,)
+from duo_sparkline import (SPARKLINE_SAMPLE_MS, Sparkline, live_rate,)
 from duo_stats import (
     MODEL_FIT_RESERVE_BYTES, STATS_EMPTY_LINE, compute_turn_stats,
     cpu_percent_between, format_model_entry, format_ram,
@@ -252,181 +276,8 @@ from duo_workers import (_ModelLoader, _OllamaStarter, _SignalObject,
 
 
 APP_NAME = "DUO"
-APP_VERSION = "0.46"
+APP_VERSION = "0.47"
 
-# Plain-language messages shown in the panes. No tracebacks in the UI.
-MSG_STOPPED = "Stopped."
-MSG_RELAY_NEEDS_BOTH = "Pick a model for both sides to start a relay."
-MSG_RELAY_STOPPED_BY_YOU = "stopped by you"
-MSG_PHONE_BUSY = "DUO is busy right now. Wait for the current turn to finish, then send again."
-MSG_PHONE_RELAY = "A relay is running. Stop the relay before sending from your phone."
-MSG_PHONE_TASK = "A task is running. Wait for it to finish, then send again."
-# Update check (v0.28): the note when a newer Release is out
-# ("DUO 0.29 is out ..."), what a manual check says when this copy
-# is current, and what it says when the check itself failed. The
-# automatic startup check only ever shows the first one -- when
-# this copy is current or the check fails, it stays silent.
-MSG_UPDATE_AVAILABLE = "DUO %s is out. See the Releases page on GitHub."
-MSG_UPDATE_LATEST = "You're on the latest version."
-MSG_UPDATE_FAILED = "Couldn't check for updates. Are you online?"
-MSG_PYSIDE6_MISSING = (
-    "DUO needs PySide6 to open its window, and it isn't installed.\n"
-    "Run the installer first:\n"
-    "\n"
-    "    bash install.sh\n"
-    "\n"
-    "Then start DUO again with:\n"
-    "\n"
-    "    bash run.sh\n")
-
-# Per-side activity states (v0.29): state name -> (light color,
-# words). One setter (set_side_state, in build_window) sets the
-# light and the words together, so they can never disagree. Grey
-# is idle; amber is waiting -- queued behind the other side, a job
-# started but no reply yet, or a relay hop parked for review;
-# green is working -- a reply streaming, or a summarize turn; red
-# is a failed turn, held a few seconds so it is seen, then idle.
-SIDE_STATES = {
-    "idle": ("#8a8a8a", "Idle"),
-    "waiting": ("#e8a33d", "Waiting for Ollama…"),
-    "thinking": ("#2fbf5a", "Thinking…"),
-    "summarizing": ("#2fbf5a", "Summarizing…"),
-    "queued": ("#e8a33d", "Queued…"),
-    "review": ("#e8a33d", "Waiting for you to review…"),
-    "error": ("#d64545", "Something went wrong"),
-}
-# How long the red light holds after a failed turn (ms) before the
-# side goes back to idle. A new job starting first overrides it.
-ERROR_STATE_HOLD_MS = 5000
-# Relay chip (v0.34, redesign R3): the relay's status dot and words.
-# The same palette as the activity lights, so the colors mean the
-# same thing everywhere: grey idle, green working, amber waiting on
-# you. The text is None where it comes from the relay session --
-# the running turn counts, the review pause, and the end reason.
-RELAY_CHIP_STATES = {
-    "idle": ("#8a8a8a", "Relay off"),
-    "running": ("#2fbf5a", None),
-    "review": ("#e8a33d", None),
-    "ended": ("#8a8a8a", None),
-}
-# System meter (v0.29): how often the status bar re-reads /proc.
-METER_REFRESH_MS = 1000
-
-# Persisted preferences (QSettings): the "Enter to send" tickbox is
-# remembered between runs. Explicit org/app names so the setting
-# lands in the same place no matter how the app was launched.
-SETTINGS_ORG = "BrokeNBored"
-SETTINGS_APP = "DUO"
-SETTING_ENTER_TO_SEND = "composer/enter_to_send"
-# Director bar (v0.31): whether the director area below the panes
-# is collapsed is remembered the same way.
-SETTING_DIRECTOR_COLLAPSED = "director/collapsed"
-# Director sections (v0.37, R4): each section's collapsed state is
-# remembered the same way. %s is the section key ("relay", "pairs",
-# "tasks"). Relay starts expanded, Pairs and Tasks start collapsed.
-SETTING_SECTION_COLLAPSED = "director/%s_collapsed"
-# Window finish (v0.15): the window's size/position and the pane
-# split are remembered the same way, saved when the window closes.
-SETTING_WINDOW_GEOMETRY = "window/geometry"
-SETTING_SPLITTER_STATE = "window/splitter"
-# History editor (v0.38, T20): each pane's transcript/history split
-# is remembered the same way. %s is the side ("A"/"B").
-SETTING_HIST_SPLITTER_STATE = "history_splitter/%s"
-# History editor floors (v0.38, T20): the divider can never crush
-# the transcript below 100 px or the editor below 60 px; the editor
-# opens at 110 px, the height it had when it was fixed.
-HIST_TRANSCRIPT_MIN_HEIGHT = 100
-HIST_EDITOR_MIN_HEIGHT = 60
-HIST_EDITOR_DEFAULT_HEIGHT = 110
-# Model parameters (v0.19): each side's temperature is remembered
-# per side the same way. %s is the side ("A"/"B").
-SETTING_TEMPERATURE = "temperature/%s"
-TEMPERATURE_DEFAULT = 0.7  # Ollama's own default, made visible.
-TEMPERATURE_MIN = 0.0
-TEMPERATURE_MAX = 2.0
-# First-run guide (v0.39, redesign R5): the flag remembers that the
-# user has used the app (first send, relay, task, opened
-# conversation, or import). While it is unset and both panes are
-# empty, each transcript shows the guide instead of "No messages
-# yet." -- three steps that teach the loop. A step ticks only when
-# honestly done (library entry 020): step 1 ticks once both models
-# are picked.
-SETTING_FIRST_RUN_DONE = "first_run/done"
-FIRST_RUN_HEADER = "New here? Here's the loop:"
-FIRST_RUN_STEP1 = "Pick a model for each side above."
-FIRST_RUN_STEP2 = "Type a message below and send it to both."
-FIRST_RUN_STEP3 = "Start a relay and watch them talk."
-FIRST_RUN_TICK = "\u2713"  # a checkmark, not a bullet
-
-# Field explanations (v0.42, redesign U20): every field that needs
-# one explains itself in plain visible words -- beside the field
-# where its row has empty space, underneath where the layout has
-# room (inside sections that start closed). Beside, not underneath,
-# everywhere: the default 1100x700 window is full (the v0.39
-# geometry probe: an 87 px transcript slot against a 76 px
-# first-run guide), and a line under every field would clip the
-# guide. The model picker needs none (its placeholder + the guided
-# size/fit entries + its position already say what it is for),
-# and neither do the composer, the search boxes, or the pair and
-# preset name fields (their placeholders cover them).
-EXPLAIN_TEMP = "Lower is more focused, higher is more creative."
-EXPLAIN_RELAY_ROW1 = ("Start with picks which side answers first. "
-                      "Turns caps the relay. "
-                      "Blind hides that the other side is an AI.")
-EXPLAIN_STOP = "A reply containing one of these stops the relay."
-EXPLAIN_INSTR = "Sent to this side's model with every message."
-EXPLAIN_TASK = "Describe the work, then press Run Task."
-EXPLAIN_TASK_ROW = ("Worker picks which side does the task. "
-                    "Follow-up picks what the other side does with "
-                    "the result. Rounds sets how many times the work "
-                    "passes between the sides.")
-EXPLAIN_STYLE = "font-size: 11px; color: #6b6b6b;"
-
-
-def first_run_guide_html(models_picked):
-    """The first-run guide as HTML: a bold header and three steps.
-
-    Step 1 shows a checkmark instead of its number once both models
-    are picked. Read back as plain text, the document is exactly the
-    four lines: header, then the three steps."""
-    step1 = ("%s %s" % (FIRST_RUN_TICK, FIRST_RUN_STEP1)
-             if models_picked else "1. %s" % FIRST_RUN_STEP1)
-    return ("<b>%s</b><br>%s<br>2. %s<br>3. %s"
-            % (FIRST_RUN_HEADER, step1, FIRST_RUN_STEP2, FIRST_RUN_STEP3))
-
-
-# Chat reliability (v0.10): Code Forge waits 1800s on a chat call and
-
-# Summarize (Item 4): when a side's history passes this many characters
-# the pane nudges the user to summarize. Summarizing keeps the last
-# SUMMARY_KEEP_LAST entries verbatim and replaces everything older
-# with one summary entry, written by that side's own model.
-HISTORY_BUDGET_CHARS = 12000
-SUMMARIZE_PROMPT = (
-    "Summarize our conversation so far in a few short sentences, in "
-    "the third person, covering the main topics and any decisions. "
-    "Keep it brief -- it will replace the earlier messages as context.")
-
-# Compare mode: the picked reply is sent to the other side as a user
-# message with this prefix, so the conversation continues from it.
-COMPARE_PREFIX = "You picked this answer: %s"
-
-# Tasks (Item 6): rounds of delegation. The worker gets the bare
-MSG_TASK_EMPTY = "Describe the task first."
-MSG_TASK_NEEDS_WORKER = "Pick which model does the task."
-MSG_TASK_NEEDS_FOLLOW_UP = "Pick what the other model does with the result."
-
-MSG_PAIR_NEEDS_NAME = "Name the pair first."
-MSG_PRESET_NEEDS_NAME = "Name the preset first."
-MSG_REVIEW_EMPTY = "Nothing to forward -- edit the text or skip this hop."
-
-
-def _open_link_in_browser(url):
-    """Open a link clicked in a transcript pane in the default
-    browser. The import is lazy: Qt lives in build_window, not at
-    module level."""
-    from PySide6 import QtGui
-    QtGui.QDesktopServices.openUrl(url)
 
 
 # ---------------------------------------------------------------------------
@@ -706,6 +557,12 @@ def build_window(client=None, logger=None, deck_port=None):
         activity_label.setStyleSheet("font-size: 11px;")
         activity_row.addWidget(activity_label)
         activity_row.addStretch(1)
+        # Sparkline (v0.47, R9): the live tok/s graph -- one per
+        # pane, in the side's color, on the activity row where the
+        # space is free. Zero height cost: it sits beside the
+        # session total, not under it.
+        sparkline = Sparkline(SIDE_COLORS[side])
+        activity_row.addWidget(sparkline.widget)
         # Session token total: every token this side has generated
         # or been prompted with since the app started. Clear never
         # resets it -- only restarting the app does.
@@ -808,6 +665,7 @@ def build_window(client=None, logger=None, deck_port=None):
             "guide_shown": False,
             "stats": stats, "session_tokens": session_tokens,
             "activity_dot": activity_dot, "activity": activity_label,
+            "sparkline": sparkline,
             "nudge": nudge, "summarize": summarize_btn,
             "reply_open": False,
             # Document position where the streaming reply's body
@@ -1879,6 +1737,42 @@ def build_window(client=None, logger=None, deck_port=None):
         _timer.timeout.connect(_make_error_clear(_side))
         error_timers[_side] = _timer
 
+    # Sparkline sampling (v0.47, R9): one 500 ms timer per side,
+    # running only while that side generates. The probe tracks the
+    # turn in progress -- characters streamed so far and when the
+    # first token landed -- and each tick samples the live rate
+    # into the side's sparkline. The timers are parented to the
+    # window and stopped on close, like the error timers.
+    spark_probe = {"A": {"chars": 0, "t0": None},
+                   "B": {"chars": 0, "t0": None}}
+
+    def _make_spark_tick(side):
+        def tick():
+            probe = spark_probe[side]
+            if (side not in state["active"]
+                    or probe["t0"] is None):
+                return
+            rate = live_rate(probe["chars"],
+                             time.monotonic() - probe["t0"])
+            if rate is not None:
+                widgets[side]["sparkline"].add_sample(rate)
+        return tick
+
+    spark_timers = {}
+    for _side in ("A", "B"):
+        _timer = QtCore.QTimer(window)
+        _timer.setInterval(SPARKLINE_SAMPLE_MS)
+        _timer.timeout.connect(_make_spark_tick(_side))
+        spark_timers[_side] = _timer
+
+    def _stop_sparkline(side):
+        """Stop a side's sampling timer and clear its probe: the
+        turn is over (done, failed, or stopped). The samples stay
+        -- they are the recent history, not the turn's."""
+        spark_timers[side].stop()
+        spark_probe[side]["chars"] = 0
+        spark_probe[side]["t0"] = None
+
     def refresh_stats_label(side):
         widgets[side]["stats"].setText(
             format_stats_line(state["stats"][side]))
@@ -2025,6 +1919,16 @@ def build_window(client=None, logger=None, deck_port=None):
         # amber "Waiting for Ollama…" becomes green "Thinking…".
         if side_state[side] == "waiting":
             set_side_state(side, "thinking")
+            # ...and the sparkline starts sampling: the first
+            # token's arrival time anchors the live rate. Only
+            # while this side is still the active turn -- a chunk
+            # that lands after a stop must not restart it.
+            if side in state["active"]:
+                spark_probe[side]["chars"] = len(text)
+                spark_probe[side]["t0"] = time.monotonic()
+                spark_timers[side].start()
+        elif spark_probe[side]["t0"] is not None:
+            spark_probe[side]["chars"] += len(text)
         append_text(side, text)
 
     def finish_reply(side):
@@ -2222,6 +2126,7 @@ def build_window(client=None, logger=None, deck_port=None):
         log_event(side, label, text)
         refresh_history_list(side)
         state["active"].discard(side)
+        _stop_sparkline(side)
         set_side_state(side, "idle")
         # The turn finished: the dot flashes lime for 200 ms (v0.45,
         # R7) -- a finish moment, not just the light going grey.
@@ -2231,6 +2136,12 @@ def build_window(client=None, logger=None, deck_port=None):
         if stats is not None:
             state["stats"][side] = stats
             refresh_stats_label(side)
+            # ...and the sparkline's final sample is the turn's
+            # official tok/s -- the same number the stats line
+            # shows, from the done chunk, never estimated.
+            if stats["tok_per_sec"] is not None:
+                widgets[side]["sparkline"].add_sample(
+                    stats["tok_per_sec"])
             logger.info(
                 "turn done: side %s, model %s, %d chars, %s"
                 % (side, convo.sides[side].model, len(text),
@@ -2268,6 +2179,7 @@ def build_window(client=None, logger=None, deck_port=None):
         if not alive():
             return
         side, is_summary = _job_side(job_id)
+        _stop_sparkline(side)
         if is_summary:
             state["summarizing"] = None
             # A failed summarize contributes nothing -- no counts,
@@ -2312,6 +2224,7 @@ def build_window(client=None, logger=None, deck_port=None):
         # A stopped turn contributes nothing -- no stats, no counts.
         job_stats.pop(job_id, None)
         side, is_summary = _job_side(job_id)
+        _stop_sparkline(side)
         if is_summary:
             # No button cancels a summarize turn, but stay safe if one
             # ever does: the history is simply left as it was.
@@ -2542,6 +2455,9 @@ def build_window(client=None, logger=None, deck_port=None):
         state["compare_round"] = False
         state["stats"][side] = None
         refresh_stats_label(side)
+        # ...and the sparkline restarts with the stats (v0.47, R9):
+        # its samples described the old conversation's turns.
+        widgets[side]["sparkline"].clear()
         set_side_state(side, "idle")
         refresh_buttons()
         set_status_message(
@@ -2625,6 +2541,10 @@ def build_window(client=None, logger=None, deck_port=None):
             # The loaded conversation has no turn stats yet.
             state["stats"][side] = None
             refresh_stats_label(side)
+            # ...and no sparkline history either: the samples are
+            # live measurement, not conversation content, so the
+            # file cannot restore them (v0.47, R9).
+            widgets[side]["sparkline"].clear()
             set_side_state(side, "idle")
         state["full_log"] = list(new_log)
         # The loaded log is complete by definition -- it came from
@@ -3400,6 +3320,8 @@ def build_window(client=None, logger=None, deck_port=None):
             # ...and its last turn's stats no longer describe anything.
             state["stats"][side] = None
             refresh_stats_label(side)
+            # ...and its sparkline restarts too (v0.47, R9).
+            widgets[side]["sparkline"].clear()
             set_side_state(side, "idle")
             refresh_buttons()
             # An emptied pane on a first run shows the guide again
@@ -3436,6 +3358,9 @@ def build_window(client=None, logger=None, deck_port=None):
             # A different model makes the last turn's stats stale.
             state["stats"][side] = None
             refresh_stats_label(side)
+            # ...and its sparkline: the old samples described the
+            # old model's rate (v0.47, R9).
+            widgets[side]["sparkline"].clear()
             refresh_buttons()
             # The first-run guide's step 1 ticks once both models
             # are picked (v0.39, R5) -- refresh both panes, since
@@ -3881,12 +3806,15 @@ def build_window(client=None, logger=None, deck_port=None):
         if deck_server is not None:
             deck_server.stop()
         ollama_manager.stop()
-        # The meter timer and the error-light timers are parented to
-        # the window, but close() only hides a top-level window --
-        # the timers would keep firing into it. Stop them here so
-        # nothing keeps working after DUO is gone.
+        # The meter timer, the error-light timers, and the
+        # sparkline timers are parented to the window, but close()
+        # only hides a top-level window -- the timers would keep
+        # firing into it. Stop them here so nothing keeps working
+        # after DUO is gone.
         meter_timer.stop()
         for _timer in error_timers.values():
+            _timer.stop()
+        for _timer in spark_timers.values():
             _timer.stop()
         motion.stop()
         director_spring.stop()

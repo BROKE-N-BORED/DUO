@@ -1,7 +1,30 @@
 # DUO changelog
 
 Every version, newest first. v0.1–v0.17 were built on 2026-11-12;
-v0.18–v0.35 on 2026-11-13; v0.36–v0.46 on 2026-11-14.
+v0.18–v0.35 on 2026-11-13; v0.36–v0.47 on 2026-11-14.
+
+## v0.47 — 2026-11-14
+
+Each pane has a live tok/s sparkline now — a small graph on
+the activity row, in the side's color, between the activity
+label and the session total, so it costs no height at all. It
+samples the live rate every half second while a side
+generates, and keeps the last 60 samples — the last 30
+seconds of generation — across turns, so you can see how the
+rate moved during a turn and across them, not just one number
+at the end. When the side is idle the graph freezes on its
+recent history. The last sample of a turn is the turn's
+official tok/s, the same number the stats line shows, from the
+done chunk. The mid-turn samples are estimated from the
+characters streamed so far (four characters per token), because
+Ollama's stream carries no token count until the done chunk —
+they shape the graph only; the stats line's counts stay exact.
+The sparkline resets whenever the pane's stats reset: Clear,
+loading a conversation, import, or picking a different model.
+It keeps updating with "Reduce motion" on — it is data, not
+decoration. Housekeeping: the module-level constants moved
+into duo_constants.py, and the sparkline lives in
+duo_sparkline.py, so dual_chat.py stays under its line bound.
 
 ## v0.46 — 2026-11-14
 
