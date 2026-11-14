@@ -30,7 +30,8 @@ from dual_chat import (  # noqa: E402
     DECK_PORT, ERROR_STATE_HOLD_MS, FULL_LOG_MAX_ENTRIES,
     FULL_LOG_TRIMMED_NOTE,
     MAX_ATTACHMENTS,
-    MAX_ATTACHMENT_BYTES, MSG_EMPTY, MSG_MODEL_FAILED, MSG_OLLAMA_DOWN,
+    MAX_ATTACHMENT_BYTES, MODEL_FIT_RESERVE_BYTES, MSG_EMPTY,
+    MSG_MODEL_FAILED, MSG_OLLAMA_DOWN,
     MSG_OLLAMA_NOT_INSTALLED, MSG_OLLAMA_SLOW, MSG_OLLAMA_START_FAILED,
     MSG_PHONE_BUSY, MSG_PHONE_RELAY, MSG_PHONE_TARGET,
     MSG_UPDATE_AVAILABLE, MSG_UPDATE_FAILED, MSG_UPDATE_LATEST,
@@ -59,7 +60,8 @@ from dual_chat import (  # noqa: E402
     default_full_filename, default_side_filename, delete_pair,
     delete_preset,
     format_both_transcript,
-    format_full_transcript, format_ram, format_session_line,
+    format_full_transcript, format_model_entry, format_ram,
+    format_session_line,
     format_side_transcript,
     format_stats_line, format_system_meter, get_lan_ip,
     is_valid_preset, load_attachment,
@@ -67,12 +69,13 @@ from dual_chat import (  # noqa: E402
     load_side_transcript_file,
     make_debug_logger,
     markdown_to_html,
+    model_fits,
     pairs_path, parse_cpu_times, parse_meminfo,
     parse_ollama_list_output, parse_ps_payload,
     parse_side_transcript, parse_stop_phrases, parse_tags_payload,
-    parse_version, phrase_matches,
+    parse_tags_sizes, parse_version, phrase_matches,
     presets_file_corrupt, presets_path,
-    read_system_meter,
+    read_system_meter, read_total_ram,
     render_qr_pixmap,
     sanitize_filename_part,
     save_conversation_file, save_pair, save_preset,
@@ -93,6 +96,9 @@ TEST_LOGGER = make_debug_logger(log_dir=_TEST_LOG_DIR)
 
 class FakeOllamaHandler(BaseHTTPRequestHandler):
     models = ["fake-a:latest", "fake-b:latest"]
+    # model -> size in bytes, as /api/tags reports it.
+    model_sizes = {"fake-a:latest": 1100000000,
+                   "fake-b:latest": 8500000000}
     # model -> list of streamed chunks
     replies = {
         "fake-a:latest": ["Hello ", "from A."],
@@ -116,7 +122,9 @@ class FakeOllamaHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/api/tags":
-            self._send_json({"models": [{"name": n} for n in self.models]})
+            self._send_json({"models": [
+                {"name": n, "size": self.model_sizes.get(n)}
+                for n in self.models]})
         elif self.path == "/api/ps":
             self._send_json({"models": [
                 {"name": "fake-a:latest", "size": 1900000000},
@@ -182,6 +190,103 @@ class ParseTagsTests(unittest.TestCase):
         self.assertEqual(parse_tags_payload({}), [])
         self.assertEqual(parse_tags_payload({"models": []}), [])
         self.assertEqual(parse_tags_payload({"models": [{"size": 1}]}), [])
+
+
+class ParseTagsSizesTests(unittest.TestCase):
+    """v0.33 (redesign R2): /api/tags also reports each model's size,
+    which the picker shows next to the name."""
+
+    def test_names_and_sizes_sorted(self):
+        payload = {"models": [{"name": "b:2b", "size": 2000},
+                              {"name": "a:2b", "size": 1000}]}
+        self.assertEqual(parse_tags_sizes(payload),
+                         [("a:2b", 1000), ("b:2b", 2000)])
+
+    def test_missing_or_bad_size_is_none(self):
+        payload = {"models": [{"name": "a:2b"},
+                              {"name": "b:2b", "size": "huge"},
+                              {"name": "c:2b", "size": 1000}]}
+        self.assertEqual(parse_tags_sizes(payload),
+                         [("a:2b", None), ("b:2b", None),
+                          ("c:2b", 1000)])
+
+    def test_empty_and_missing(self):
+        self.assertEqual(parse_tags_sizes({}), [])
+        self.assertEqual(parse_tags_sizes({"models": []}), [])
+        self.assertEqual(parse_tags_sizes({"models": [{"size": 1}]}), [])
+
+
+class ModelFitTests(unittest.TestCase):
+    """v0.33 (redesign R2, U39): the picker's fit rule -- a model
+    fits when its size leaves the 2 GB reserve untouched."""
+
+    TOTAL_8GB = 8_000_000_000
+
+    def test_reserve_is_two_gigabytes(self):
+        self.assertEqual(MODEL_FIT_RESERVE_BYTES, 2_000_000_000)
+
+    def test_fit_boundary_is_inclusive(self):
+        # 8 GB total minus the 2 GB reserve: exactly 6 GB fits,
+        # one byte over does not.
+        self.assertTrue(model_fits(6_000_000_000, self.TOTAL_8GB))
+        self.assertFalse(model_fits(6_000_000_001, self.TOTAL_8GB))
+
+    def test_fit_small_and_huge(self):
+        self.assertTrue(model_fits(1_100_000_000, self.TOTAL_8GB))
+        self.assertFalse(model_fits(8_500_000_000, self.TOTAL_8GB))
+
+    def test_fit_unknown_total_or_size_is_none(self):
+        self.assertIsNone(model_fits(1_100_000_000, None))
+        self.assertIsNone(model_fits(None, self.TOTAL_8GB))
+        self.assertIsNone(model_fits(None, None))
+
+    def test_entry_shows_size_and_fit(self):
+        self.assertEqual(
+            format_model_entry("lfm3:1.7b", 1_100_000_000,
+                               self.TOTAL_8GB),
+            "lfm3:1.7b - 1.1 GB - fits this PC")
+        self.assertEqual(
+            format_model_entry("big-model:13b", 8_000_000_000,
+                               self.TOTAL_8GB),
+            "big-model:13b - 8.0 GB - too big for this PC")
+
+    def test_entry_under_one_gigabyte_shows_mb(self):
+        self.assertEqual(
+            format_model_entry("tiny:1b", 850_000_000, self.TOTAL_8GB),
+            "tiny:1b - 850 MB - fits this PC")
+
+    def test_entry_without_total_shows_size_only(self):
+        self.assertEqual(
+            format_model_entry("lfm3:1.7b", 1_100_000_000, None),
+            "lfm3:1.7b - 1.1 GB")
+
+    def test_entry_without_size_shows_bare_name(self):
+        self.assertEqual(
+            format_model_entry("lfm3:1.7b", None, self.TOTAL_8GB),
+            "lfm3:1.7b")
+
+    def test_read_total_ram_from_meminfo_file(self):
+        with tempfile.NamedTemporaryFile(
+                "w", suffix=".txt", delete=False) as fh:
+            fh.write("MemTotal:       8023252 kB\n"
+                     "MemFree:        1234567 kB\n"
+                     "MemAvailable:   6543210 kB\n")
+            path = fh.name
+        try:
+            self.assertEqual(read_total_ram(path), 8023252 * 1024)
+        finally:
+            os.unlink(path)
+
+    def test_read_total_ram_unreadable_is_none(self):
+        self.assertIsNone(read_total_ram("/nonexistent/meminfo"))
+        with tempfile.NamedTemporaryFile(
+                "w", suffix=".txt", delete=False) as fh:
+            fh.write("nothing useful here\n")
+            path = fh.name
+        try:
+            self.assertIsNone(read_total_ram(path))
+        finally:
+            os.unlink(path)
 
 
 class ParseOllamaListTests(unittest.TestCase):
@@ -660,6 +765,14 @@ class OllamaClientTests(unittest.TestCase):
         client = OllamaClient(self.url)
         self.assertEqual(client.list_models(), ["fake-a:latest", "fake-b:latest"])
 
+    def test_list_models_with_sizes(self):
+        # v0.33 (redesign R2): sizes ride along with the names.
+        client = OllamaClient(self.url)
+        self.assertEqual(
+            client.list_models_with_sizes(),
+            [("fake-a:latest", 1100000000),
+             ("fake-b:latest", 8500000000)])
+
     def test_chat_stream_collects_chunks(self):
         client = OllamaClient(self.url)
         seen = []
@@ -788,6 +901,13 @@ class FakeGuiClient:
         self.max_active = 0
         self._active = 0
         self.delay = 0.02  # seconds slept per word (raise to slow a turn)
+        # v0.33: model -> size in bytes for list_models_with_sizes.
+        # fake-a fits an 8 GB PC, fake-b does not.
+        self.model_sizes = {"fake-a:latest": 1100000000,
+                            "fake-b:latest": 8500000000}
+        # v0.33: seconds list_models_with_sizes sleeps before
+        # answering (raise to catch the loading state mid-load).
+        self.list_delay = 0.0
         self.lock = threading.Lock()
 
     def reset(self):
@@ -802,9 +922,18 @@ class FakeGuiClient:
             self.max_active = 0
             self._active = 0
             self.delay = 0.02
+            self.model_sizes = {"fake-a:latest": 1100000000,
+                                "fake-b:latest": 8500000000}
+            self.list_delay = 0.0
 
     def list_models(self, timeout=5):
         return ["fake-a:latest", "fake-b:latest"]
+
+    def list_models_with_sizes(self, timeout=5):
+        if self.list_delay:
+            time.sleep(self.list_delay)
+        return sorted((name, self.model_sizes.get(name))
+                      for name in self.list_models())
 
     def probe(self, timeout=5):
         return True
@@ -6414,7 +6543,7 @@ class FrontDoorTests(unittest.TestCase):
 
     def test_changelog_covers_every_version(self):
         log = self._read("CHANGELOG.md")
-        for version in ["0.%d" % n for n in range(1, 33)]:
+        for version in ["0.%d" % n for n in range(1, 34)]:
             self.assertIn(version, log)
 
     def test_gitignore_covers_runtime_files(self):
@@ -8066,7 +8195,9 @@ class TranscriptImportGuiTests(unittest.TestCase):
             self.state["widgets"]["A"]["import"].click()
         self.app.processEvents()
         picker = self.state["widgets"]["A"]["picker"]
-        self.assertEqual(picker.currentText(), "fake-a:latest")
+        # The plain model name is the item data (v0.33); the visible
+        # text carries size and fit too.
+        self.assertEqual(picker.currentData(), "fake-a:latest")
         self.assertEqual(self.state["convo"].sides["A"].model,
                          "fake-a:latest")
 
@@ -10323,6 +10454,187 @@ class ClearConfirmGuiTests(unittest.TestCase):
         self.app.processEvents()
         self.assertEqual(asked.call_count, 0)
         self.assertEqual(self.state["convo"].sides["A"].messages, [])
+
+
+@unittest.skipUnless(os.environ.get("DUAL_CHAT_GUI_TESTS") == "1",
+                     "GUI tests run with DUAL_CHAT_GUI_TESTS=1")
+class GuidedPickerGuiTests(unittest.TestCase):
+    """v0.33 (redesign R2, U39): the picker shows each model's size
+    and whether it fits this PC; the plain name stays the data, so
+    pairs, conversations, sends and relay all keep plain names."""
+
+    TOTAL_8GB = 8_000_000_000
+
+    @classmethod
+    def setUpClass(cls):
+        from PySide6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+        cls.client = FakeGuiClient()
+
+    def setUp(self):
+        from dual_chat import build_window
+        self._patcher = mock.patch(
+            "dual_chat.check_for_update",
+            return_value=("latest", None))
+        self._patcher.start()
+        # Pairs go to a temp file so tests never touch the real one.
+        self.tmp = tempfile.TemporaryDirectory()
+        self.pairs_file = os.path.join(self.tmp.name, "duo-pairs.json")
+        self._env = mock.patch.dict(
+            os.environ, {"DUAL_CHAT_PAIRS_FILE": self.pairs_file})
+        self._env.start()
+        self.client.reset()
+        self.window = build_window(self.client, logger=TEST_LOGGER)
+        self.window.show()
+        self.state = self.window._dual_chat
+        self._wait_for(lambda: self.state["widgets"]["A"]["picker"].count() == 2)
+
+    def tearDown(self):
+        self.window.close()
+        self.app.processEvents()
+        self._patcher.stop()
+        self._env.stop()
+        self.tmp.cleanup()
+
+    def _wait_for(self, cond, timeout=10.0):
+        from PySide6.QtTest import QTest
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            QTest.qWait(50)
+            if cond():
+                return True
+        return cond()
+
+    def _reload(self, total_ram):
+        # Pin the machine's total RAM, then reload the list so the
+        # fit labels are deterministic instead of depending on the
+        # machine the suite runs on.
+        self.state["state"]["total_ram"] = total_ram
+        self.state["load_models"]()
+        self.assertTrue(self._wait_for(
+            lambda: self.state["widgets"]["A"]["picker"].count() == 2))
+        self.app.processEvents()
+
+    def _pick_models(self):
+        self.state["widgets"]["A"]["picker"].setCurrentIndex(0)
+        self.state["widgets"]["B"]["picker"].setCurrentIndex(1)
+        self.app.processEvents()
+
+    def test_entries_show_size_and_fit_data_is_plain_name(self):
+        self._reload(self.TOTAL_8GB)
+        for side in ("A", "B"):
+            picker = self.state["widgets"][side]["picker"]
+            self.assertEqual(
+                picker.itemText(0),
+                "fake-a:latest - 1.1 GB - fits this PC")
+            self.assertEqual(picker.itemData(0), "fake-a:latest")
+            self.assertEqual(
+                picker.itemText(1),
+                "fake-b:latest - 8.5 GB - too big for this PC")
+            self.assertEqual(picker.itemData(1), "fake-b:latest")
+            for i in range(picker.count()):
+                self.assertNotIn("\u2014", picker.itemText(i))
+
+    def test_picking_sets_the_plain_name(self):
+        self._reload(self.TOTAL_8GB)
+        self._pick_models()
+        convo = self.state["convo"]
+        self.assertEqual(convo.sides["A"].model, "fake-a:latest")
+        self.assertEqual(convo.sides["B"].model, "fake-b:latest")
+
+    def test_too_big_model_still_selectable_and_sends(self):
+        # Inform, never block (U7): a too-big model still works.
+        self._reload(self.TOTAL_8GB)
+        self.state["widgets"]["A"]["picker"].setCurrentIndex(1)
+        self.app.processEvents()
+        self.assertEqual(self.state["convo"].sides["A"].model,
+                         "fake-b:latest")
+        self.assertTrue(self.state["send_a"].isEnabled())
+        self.state["composer"].setPlainText("hello big model")
+        self.state["send_a"].click()
+        self.assertTrue(self._wait_for(lambda: (
+            len(self.state["convo"].sides["A"].messages) >= 2
+            and not self.state["state"]["busy"]), timeout=15))
+        self.assertIn("fake-b:latest", self.client.calls)
+
+    def test_loading_state_disables_pickers_with_placeholder(self):
+        self.client.list_delay = 1.5
+        try:
+            self.state["load_models"]()
+            self.app.processEvents()
+            for side in ("A", "B"):
+                picker = self.state["widgets"][side]["picker"]
+                self.assertFalse(picker.isEnabled())
+                self.assertEqual(picker.placeholderText(),
+                                 "Loading models...")
+                self.assertEqual(picker.count(), 0)
+            self.assertTrue(self._wait_for(
+                lambda: self.state["widgets"]["A"]["picker"].count() == 2))
+            for side in ("A", "B"):
+                picker = self.state["widgets"][side]["picker"]
+                self.assertTrue(picker.isEnabled())
+                self.assertEqual(picker.placeholderText(), "Pick a model")
+        finally:
+            self.client.list_delay = 0.0
+
+    def test_refresh_reapplies_size_and_fit(self):
+        self._reload(self.TOTAL_8GB)
+        # The fake's list changes: fake-a grows past the fit line,
+        # fake-b shrinks to half a gigabyte.
+        self.client.model_sizes = {"fake-a:latest": 7000000000,
+                                   "fake-b:latest": 500000000}
+        self.state["widgets"]["A"]["refresh"].click()
+        self.assertTrue(self._wait_for(
+            lambda: self.state["widgets"]["A"]["picker"].itemText(0) == (
+                "fake-a:latest - 7.0 GB - too big for this PC")))
+        for side in ("A", "B"):
+            picker = self.state["widgets"][side]["picker"]
+            self.assertEqual(
+                picker.itemText(1),
+                "fake-b:latest - 500 MB - fits this PC")
+            self.assertEqual(picker.itemData(0), "fake-a:latest")
+
+    def test_unknown_total_shows_size_only(self):
+        # /proc unreadable: sizes still show, no fit label, no crash.
+        self._reload(None)
+        picker = self.state["widgets"]["A"]["picker"]
+        self.assertEqual(picker.itemText(0), "fake-a:latest - 1.1 GB")
+        self.assertEqual(picker.itemText(1), "fake-b:latest - 8.5 GB")
+
+    def test_pair_round_trip_uses_plain_names(self):
+        self._reload(self.TOTAL_8GB)
+        self._pick_models()
+        self.state["pair_name"].setText("work pair")
+        self.state["pair_save"].click()
+        self.app.processEvents()
+        with open(self.pairs_file, "r", encoding="utf-8") as fh:
+            on_disk = json.load(fh)
+        self.assertEqual(on_disk["pairs"]["work pair"]["model_a"],
+                         "fake-a:latest")
+        self.assertEqual(on_disk["pairs"]["work pair"]["model_b"],
+                         "fake-b:latest")
+        # Swap the picks, then load the pair back: plain names again.
+        self.state["widgets"]["A"]["picker"].setCurrentIndex(1)
+        self.state["widgets"]["B"]["picker"].setCurrentIndex(0)
+        self.app.processEvents()
+        combo = self.state["pair_combo"]
+        combo.setCurrentIndex(-1)
+        combo.setCurrentIndex(0)
+        self.app.processEvents()
+        convo = self.state["convo"]
+        self.assertEqual(convo.sides["A"].model, "fake-a:latest")
+        self.assertEqual(convo.sides["B"].model, "fake-b:latest")
+
+    def test_conversation_data_uses_plain_names(self):
+        self._reload(self.TOTAL_8GB)
+        self._pick_models()
+        data = conversation_to_data(
+            self.state["convo"], self.state["state"]["full_log"])
+        self.assertEqual(data["sides"]["A"]["model"], "fake-a:latest")
+        self.assertEqual(data["sides"]["B"]["model"], "fake-b:latest")
+        convo, _log = data_to_conversation(data)
+        self.assertEqual(convo.sides["A"].model, "fake-a:latest")
+        self.assertEqual(convo.sides["B"].model, "fake-b:latest")
 
 
 if __name__ == "__main__":

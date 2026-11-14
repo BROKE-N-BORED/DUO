@@ -1,7 +1,17 @@
 # DUO changelog
 
 Every version, newest first. v0.1–v0.17 were built on 2026-11-12;
-v0.18–v0.32 on 2026-11-13.
+v0.18–v0.33 on 2026-11-13.
+
+## v0.33 — 2026-11-13
+
+The model pickers show size and fit now. Each model lists its size
+and whether it fits this PC in plain words — "lfm3:1.7b - 1.1 GB -
+fits this PC" — so you never have to guess at sizes or specs. A
+model that is too big for this PC is still listed and still
+selectable; the label only tells you what to expect. While the
+list loads, the pickers show "Loading models..." instead of sitting
+empty.
 
 ## v0.32 — 2026-11-13
 

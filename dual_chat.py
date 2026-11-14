@@ -214,13 +214,14 @@ from duo_ollama import (
     UPDATE_CHECK_TIMEOUT, UPDATE_CHECK_URL, UPDATE_CHECK_URL_ENV, Cancelled,
     OllamaClient, OllamaError, OllamaServerManager, check_for_update,
     parse_ollama_list_output, parse_ps_payload, parse_tags_payload,
-    parse_version,)
+    parse_tags_sizes, parse_version,)
 from duo_runner import SerialRunner
 from duo_stats import (
-    STATS_EMPTY_LINE, compute_turn_stats, cpu_percent_between,
-    format_ram, format_session_line, format_stats_line,
-    format_system_meter, parse_cpu_times, parse_meminfo,
-    read_system_meter,)
+    MODEL_FIT_RESERVE_BYTES, STATS_EMPTY_LINE, compute_turn_stats,
+    cpu_percent_between, format_model_entry, format_ram,
+    format_session_line, format_stats_line, format_system_meter,
+    model_fits, parse_cpu_times, parse_meminfo, read_system_meter,
+    read_total_ram,)
 from duo_storage import (
     CONVERSATION_FORMAT_VERSION, ConversationError, conversation_to_data,
     data_to_conversation, delete_pair, delete_preset, is_valid_preset,
@@ -305,7 +306,7 @@ def make_debug_logger(log_dir=None):
         return _NullLogger()
 
 APP_NAME = "DUO"
-APP_VERSION = "0.32"
+APP_VERSION = "0.33"
 
 # Plain-language messages shown in the panes. No tracebacks in the UI.
 MSG_STOPPED = "Stopped."
@@ -628,7 +629,18 @@ class _ModelLoader:
             def run(self):
                 started = time.monotonic()
                 try:
-                    models = client.list_models()
+                    # Sizes ride along with the names (v0.33): the
+                    # picker shows each model's size and whether it
+                    # fits this PC. A client without the new method
+                    # (an old test stub) falls back to bare names
+                    # with no sizes.
+                    with_sizes = getattr(
+                        client, "list_models_with_sizes", None)
+                    if with_sizes is not None:
+                        models = with_sizes()
+                    else:
+                        models = [(name, None) for name in
+                                  client.list_models()]
                     if on_result is not None:
                         on_result(True, models,
                                   time.monotonic() - started)
@@ -1285,7 +1297,15 @@ def build_window(client=None, logger=None, deck_port=None):
              # the loaded log is complete by definition) or emptied
              # (clearing both sides). Clearing one side leaves it
              # set: the remaining entries are still a trimmed log.
-             "full_log_trimmed": False}
+             "full_log_trimmed": False,
+             # The model list is loading (v0.33): the pickers stay
+             # disabled with a "Loading models..." placeholder until
+             # the list lands or the load fails.
+             "models_loading": False,
+             # Total RAM in bytes, read once at startup for the
+             # picker's fit labels (v0.33, U39). None when /proc
+             # can't be read: the pickers then show sizes only.
+             "total_ram": read_total_ram()}
 
     # --- helpers ----------------------------------------------------------
     # Transcript formats: sender labels are bold, everything else
@@ -1662,7 +1682,11 @@ def build_window(client=None, logger=None, deck_port=None):
                          and len(state.get("compare", {})) == 2)
         for side in ("A", "B"):
             w = widgets[side]
-            w["picker"].setEnabled(not busy)
+            # The pickers stay disabled while the model list is
+            # loading (v0.33): refresh_buttons must not re-enable
+            # them mid-load.
+            w["picker"].setEnabled(
+                not busy and not state.get("models_loading", False))
             w["refresh"].setEnabled(not busy)
             w["stop"].setEnabled(side in state["active"]
                                  or side in state["queued"])
@@ -2450,8 +2474,10 @@ def build_window(client=None, logger=None, deck_port=None):
             # fires no change, and the load must not depend on one.
             picker = widgets[side]["picker"]
             model = new_side.model
-            if model and picker.findText(model) >= 0:
-                picker.setCurrentIndex(picker.findText(model))
+            # The picker shows "name - size - fit"; the plain name
+            # is the item data (v0.33), so look it up by data.
+            if model and picker.findData(model) >= 0:
+                picker.setCurrentIndex(picker.findData(model))
                 side_obj.model = model
             else:
                 picker.setCurrentIndex(-1)
@@ -2982,7 +3008,9 @@ def build_window(client=None, logger=None, deck_port=None):
             if not model:
                 continue
             picker = widgets[side]["picker"]
-            found = picker.findText(model)
+            # The plain model name is the item data (v0.33); the
+            # visible text carries size and fit too.
+            found = picker.findData(model)
             if found >= 0:
                 picker.setCurrentIndex(found)
             else:
@@ -3208,8 +3236,10 @@ def build_window(client=None, logger=None, deck_port=None):
     def on_picker_changed(side):
         def changed(index):
             picker = widgets[side]["picker"]
+            # The plain model name is the item data (v0.33); the
+            # visible text carries size and fit too.
             convo.sides[side].model = (
-                picker.currentText() if index >= 0 else None)
+                picker.currentData() if index >= 0 else None)
             # A different model makes the last turn's stats stale.
             state["stats"][side] = None
             refresh_stats_label(side)
@@ -3221,20 +3251,32 @@ def build_window(client=None, logger=None, deck_port=None):
             on_picker_changed(side))
 
     def populate_models(models):
+        """Fill both pickers from [(name, size-in-bytes), ...].
+
+        Each entry shows the model's size and whether it fits this
+        PC (v0.33, U39); the plain name is the item data, so pairs,
+        conversations, sends, relay, tasks and the phone deck all
+        keep working with plain names exactly as before."""
         if not alive():
             return
+        state["models_loading"] = False
         for side in ("A", "B"):
             picker = widgets[side]["picker"]
             previous = convo.sides[side].model
             picker.blockSignals(True)
             picker.clear()
-            picker.addItems(models)
-            if previous in models:
-                picker.setCurrentIndex(models.index(previous))
+            for name, size in models:
+                picker.addItem(
+                    format_model_entry(name, size, state["total_ram"]),
+                    name)
+            names = [name for name, _ in models]
+            if previous in names:
+                picker.setCurrentIndex(names.index(previous))
             else:
                 # Nothing selected by default, ever.
                 picker.setCurrentIndex(-1)
                 convo.sides[side].model = None
+            picker.setPlaceholderText("Pick a model")
             picker.blockSignals(False)
         if models:
             statusbar.showMessage(
@@ -3248,6 +3290,9 @@ def build_window(client=None, logger=None, deck_port=None):
     def on_models_failed(message):
         if not alive():
             return
+        state["models_loading"] = False
+        for side in ("A", "B"):
+            widgets[side]["picker"].setPlaceholderText("Pick a model")
         statusbar.showMessage(message)
         if message in (MSG_OLLAMA_DOWN, MSG_OLLAMA_SLOW):
             show_start_ollama(True)
@@ -3268,7 +3313,21 @@ def build_window(client=None, logger=None, deck_port=None):
                            % (seconds, models_or_message))
 
     def load_models():
+        # Loading state (v0.33, entry 011): while the /api/tags
+        # fetch runs, the pickers are disabled with a "Loading
+        # models..." placeholder -- the shape of what's coming,
+        # honestly, never a fake progress bar. The picked model
+        # survives the reload: populate_models restores it by name.
+        state["models_loading"] = True
         statusbar.showMessage("Loading models...")
+        for side in ("A", "B"):
+            picker = widgets[side]["picker"]
+            picker.blockSignals(True)
+            picker.clear()
+            picker.setCurrentIndex(-1)
+            picker.setPlaceholderText("Loading models...")
+            picker.setEnabled(False)
+            picker.blockSignals(False)
         loader = _ModelLoader(client, signals, on_result=_on_probe_result)
         loaders.append(loader)
         loader.thread.finished.connect(

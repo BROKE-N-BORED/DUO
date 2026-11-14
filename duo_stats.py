@@ -44,6 +44,63 @@ def format_ram(size_bytes):
     return "%d MB" % round(size_bytes / 1_000_000)
 
 
+# --- model fit (v0.33, redesign R2) ----------------------------------------
+# U39: model selection shows what the model does and whether it fits
+# this PC -- never make the user guess at sizes or specs. A model
+# fits when its size leaves the reserve (2 GB for the OS, DUO, and
+# Ollama itself) untouched. A model that doesn't fit is still
+# selectable -- inform, never block. Sizes come from /api/tags;
+# total RAM comes from /proc/meminfo, read once and cached by the
+# window. Everything here returns None on unknown input instead of
+# raising: an unreadable /proc means "size only, no fit label",
+# never a crash.
+
+MODEL_FIT_RESERVE_BYTES = 2 * 1_000_000_000
+
+
+def read_total_ram(meminfo_path="/proc/meminfo"):
+    """Total RAM in bytes from /proc/meminfo, or None when it can't
+    be read or parsed. Never raises."""
+    try:
+        with open(meminfo_path, encoding="utf-8") as fh:
+            parsed = parse_meminfo(fh.read())
+    except (OSError, ValueError):
+        return None
+    return parsed[0] if parsed is not None else None
+
+
+def model_fits(size_bytes, total_ram_bytes):
+    """True when a model of ``size_bytes`` fits in ``total_ram_bytes``
+    with the reserve left over; False when it doesn't; None when the
+    total is unknown (no fit judgement possible). The boundary is
+    inclusive: exactly total-minus-reserve fits."""
+    if total_ram_bytes is None:
+        return None
+    if not isinstance(size_bytes, (int, float)):
+        return None
+    return size_bytes <= total_ram_bytes - MODEL_FIT_RESERVE_BYTES
+
+
+def format_model_entry(name, size_bytes, total_ram_bytes):
+    """One model picker's display line for a model.
+
+    "lfm3:1.7b - 1.1 GB - fits this PC" when the size and the total
+    are both known; "big-model:13b - 8.0 GB - too big for this PC"
+    when it doesn't fit; "name - 1.1 GB" when the total is unknown;
+    the bare name when the size is unknown. Plain hyphens only --
+    no em-dashes in visible text (U33). The plain name is the
+    picker's item data; this text is display only."""
+    if not isinstance(size_bytes, (int, float)):
+        return name
+    text = "%s - %s" % (name, format_ram(size_bytes))
+    fits = model_fits(size_bytes, total_ram_bytes)
+    if fits is True:
+        return "%s - fits this PC" % text
+    if fits is False:
+        return "%s - too big for this PC" % text
+    return text
+
+
 # --- system meter (v0.29) --------------------------------------------------
 # CPU % and RAM for the whole machine, read from /proc with stdlib
 # only -- no psutil. CPU % needs two samples (it is the delta between

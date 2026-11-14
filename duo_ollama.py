@@ -71,6 +71,23 @@ def parse_tags_payload(payload):
     return sorted(names)
 
 
+def parse_tags_sizes(payload):
+    """Parse an /api/tags JSON payload into a sorted list of
+    (name, size-in-bytes) pairs. A missing or non-numeric size is
+    None -- the model still lists, just without a size. Entries
+    without a name are skipped."""
+    pairs = []
+    for entry in payload.get("models", []) or []:
+        name = entry.get("name")
+        if not name:
+            continue
+        size = entry.get("size")
+        if not isinstance(size, (int, float)):
+            size = None
+        pairs.append((name, size))
+    return sorted(pairs)
+
+
 def parse_ollama_list_output(text):
     """Parse `ollama list` table output into a sorted list of model names.
 
@@ -227,6 +244,32 @@ class OllamaClient:
             if out.returncode != 0:
                 raise OllamaError(MSG_OLLAMA_DOWN)
             return parse_ollama_list_output(out.stdout)
+        except OllamaError:
+            raise
+        except Exception:
+            raise OllamaError(MSG_OLLAMA_DOWN)
+
+    def list_models_with_sizes(self, timeout=5):
+        """Return installed models as [(name, size-in-bytes), ...],
+        sorted by name, or raise OllamaError. Sizes come from
+        /api/tags; the `ollama list` fallback has no sizes, so its
+        entries carry None. A model with no size still lists -- the
+        picker shows its name without a size."""
+        try:
+            req = urllib.request.Request(self.base_url + "/api/tags")
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return parse_tags_sizes(json.loads(resp.read().decode("utf-8")))
+        except Exception:
+            pass  # Fall through to the `ollama list` fallback.
+        try:
+            if shutil.which("ollama") is None:
+                raise OllamaError(MSG_OLLAMA_DOWN)
+            out = subprocess.run(
+                ["ollama", "list"], capture_output=True, text=True, timeout=15)
+            if out.returncode != 0:
+                raise OllamaError(MSG_OLLAMA_DOWN)
+            return [(name, None)
+                    for name in parse_ollama_list_output(out.stdout)]
         except OllamaError:
             raise
         except Exception:
