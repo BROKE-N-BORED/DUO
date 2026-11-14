@@ -48,6 +48,11 @@ Everything in one app:
   into the next message. Model replies render their Markdown —
   bold, code, headers, lists, links — while your own messages stay
   exactly as typed.
+- **First run** — the first time you open DUO, each pane shows
+  three steps that teach the loop: pick a model for each side,
+  send a message to both, start a relay. Step 1 gets a checkmark
+  once both models are picked, and the guide goes away for good
+  once you send your first message.
 - **Stays connected** — if Ollama stalls briefly while the computer
   is busy, a turn retries a few times instead of giving up, and a
   slow Ollama is never reported as "not running". If Ollama really

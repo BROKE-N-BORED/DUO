@@ -178,7 +178,6 @@ import shutil  # noqa: F401 -- unused here, but the tests patch
 # duo_ollama; shutil is one shared module, so the patch lands).
 import sys
 import threading
-import time
 
 # Debug log layer: the BNB T21 standard, vendored as debug_log.py next
 # to this file. Logging must never break the app, so a missing module
@@ -191,7 +190,8 @@ except ImportError:  # pragma: no cover - the zip always ships it
 # The code used to live in this one file (5,165 lines). v0.25
 # (audit T14) splits it into focused sibling modules; this file
 # keeps the window and the entry point (the phone deck moved to
-# duo_deck.py in v0.31), and re-exports the moved names so
+# duo_deck.py in v0.31, the background Qt workers to duo_workers.py
+# in v0.39), and re-exports the moved names so
 # `from dual_chat import ...` keeps working unchanged -- the
 # tests, the installer, and the deck all import through here.
 # build_window stays a closure in this file: splitting the
@@ -240,6 +240,8 @@ from duo_transcript import (
     default_full_filename, default_side_filename,
     format_both_transcript, format_full_transcript, format_side_transcript,
     load_side_transcript_file, parse_side_transcript, sanitize_filename_part,)
+from duo_workers import (_ModelLoader, _OllamaStarter, _SignalObject,
+                         _Signals, _UpdateChecker, _qt,)
 
 
 class _NullLogger:
@@ -306,7 +308,7 @@ def make_debug_logger(log_dir=None):
         return _NullLogger()
 
 APP_NAME = "DUO"
-APP_VERSION = "0.38"
+APP_VERSION = "0.39"
 
 # Plain-language messages shown in the panes. No tracebacks in the UI.
 MSG_STOPPED = "Stopped."
@@ -398,6 +400,31 @@ SETTING_TEMPERATURE = "temperature/%s"
 TEMPERATURE_DEFAULT = 0.7  # Ollama's own default, made visible.
 TEMPERATURE_MIN = 0.0
 TEMPERATURE_MAX = 2.0
+# First-run guide (v0.39, redesign R5): the flag remembers that the
+# user has used the app (first send, relay, task, opened
+# conversation, or import). While it is unset and both panes are
+# empty, each transcript shows the guide instead of "No messages
+# yet." -- three steps that teach the loop. A step ticks only when
+# honestly done (library entry 020): step 1 ticks once both models
+# are picked.
+SETTING_FIRST_RUN_DONE = "first_run/done"
+FIRST_RUN_HEADER = "New here? Here's the loop:"
+FIRST_RUN_STEP1 = "Pick a model for each side above."
+FIRST_RUN_STEP2 = "Type a message below and send it to both."
+FIRST_RUN_STEP3 = "Start a relay and watch them talk."
+FIRST_RUN_TICK = "\u2713"  # a checkmark, not a bullet
+
+
+def first_run_guide_html(models_picked):
+    """The first-run guide as HTML: a bold header and three steps.
+
+    Step 1 shows a checkmark instead of its number once both models
+    are picked. Read back as plain text, the document is exactly the
+    four lines: header, then the three steps."""
+    step1 = ("%s %s" % (FIRST_RUN_TICK, FIRST_RUN_STEP1)
+             if models_picked else "1. %s" % FIRST_RUN_STEP1)
+    return ("<b>%s</b><br>%s<br>2. %s<br>3. %s"
+            % (FIRST_RUN_HEADER, step1, FIRST_RUN_STEP2, FIRST_RUN_STEP3))
 
 # Agreement stop: simple case-insensitive substring matching on this
 # fixed list. No LLM judge -- the 2B models are slow enough already.
@@ -586,140 +613,11 @@ class RelaySession:
 # Qt GUI
 # ---------------------------------------------------------------------------
 
-def _qt():
-    from PySide6 import QtCore, QtWidgets  # noqa: F401  (imported on demand)
-    return QtCore, QtWidgets
+# The background Qt workers (the signal bridge and the loader /
+# starter / update-checker threads) live in duo_workers.py, moved
+# verbatim in v0.39; they are imported at the top of this file.
 
 
-class _Signals:
-    """QObject bridge: runner callbacks (worker thread) -> Qt signals."""
-
-    def __init__(self):
-        QtCore, _ = _qt()
-        self._obj = _SignalObject()
-
-    def __getattr__(self, name):
-        return getattr(self._obj, name)
-
-
-class _SignalObject:
-    def __init__(self):
-        from PySide6.QtCore import QObject, Signal
-
-        class _Obj(QObject):
-            started = Signal(str)
-            chunk = Signal(str, str)
-            done = Signal(str, str)
-            failed = Signal(str, str)
-            cancelled = Signal(str)
-            idle = Signal()
-            models_loaded = Signal(list)
-            models_failed = Signal(str)
-            ollama_started = Signal(bool, str)
-            # Update check: (result, manual) where result is
-            # check_for_update's ("newer"/"latest"/"failed", version)
-            # and manual says whether the button asked for it.
-            update_checked = Signal(object, bool)
-            # Phone deck send: (text, target, holder dict with a
-            # "done" Event and an "error" slot the GUI thread fills).
-            phone_send = Signal(str, str, object)
-
-        self._inner = _Obj()
-        self.started = self._inner.started
-        self.chunk = self._inner.chunk
-        self.done = self._inner.done
-        self.failed = self._inner.failed
-        self.cancelled = self._inner.cancelled
-        self.idle = self._inner.idle
-        self.models_loaded = self._inner.models_loaded
-        self.models_failed = self._inner.models_failed
-        self.ollama_started = self._inner.ollama_started
-        self.update_checked = self._inner.update_checked
-        self.phone_send = self._inner.phone_send
-
-
-class _ModelLoader:
-    """Loads the model list off the GUI thread.
-
-    on_result (optional) is called in the loader thread with
-    (ok, models_or_message, seconds) -- the debug log uses it to
-    record the probe outcome and its latency.
-    """
-
-    def __init__(self, client, signals, on_result=None):
-        from PySide6.QtCore import QThread
-
-        class _Thread(QThread):
-            def run(self):
-                started = time.monotonic()
-                try:
-                    # Sizes ride along with the names (v0.33): the
-                    # picker shows each model's size and whether it
-                    # fits this PC. A client without the new method
-                    # (an old test stub) falls back to bare names
-                    # with no sizes.
-                    with_sizes = getattr(
-                        client, "list_models_with_sizes", None)
-                    if with_sizes is not None:
-                        models = with_sizes()
-                    else:
-                        models = [(name, None) for name in
-                                  client.list_models()]
-                    if on_result is not None:
-                        on_result(True, models,
-                                  time.monotonic() - started)
-                    try:
-                        signals.models_loaded.emit(models)
-                    except RuntimeError:
-                        pass  # Window gone; nothing left to update.
-                except OllamaError as exc:
-                    if on_result is not None:
-                        on_result(False, str(exc),
-                                  time.monotonic() - started)
-                    try:
-                        signals.models_failed.emit(str(exc))
-                    except RuntimeError:
-                        pass  # Window gone; nothing left to update.
-
-        self.thread = _Thread()
-
-
-class _OllamaStarter:
-    """Starts Ollama off the GUI thread (the wait for the probe can
-    take seconds). Emits (ok, message) through signals.ollama_started."""
-
-    def __init__(self, manager, signals):
-        from PySide6.QtCore import QThread
-
-        class _Thread(QThread):
-            def run(self):
-                ok, message = manager.start()
-                try:
-                    signals.ollama_started.emit(ok, message)
-                except RuntimeError:
-                    pass  # Window gone; nothing left to update.
-
-        self.thread = _Thread()
-
-
-class _UpdateChecker:
-    """Runs the update check off the GUI thread (the network call
-    can take up to the 5s timeout). Emits (result, manual) through
-    signals.update_checked, where result is check_for_update's
-    ("newer"/"latest"/"failed", version) tuple."""
-
-    def __init__(self, signals, current_version, manual):
-        from PySide6.QtCore import QThread
-
-        class _Thread(QThread):
-            def run(self):
-                result = check_for_update(current_version)
-                try:
-                    signals.update_checked.emit(result, manual)
-                except RuntimeError:
-                    pass  # Window gone; nothing left to update.
-
-        self.thread = _Thread()
 
 
 class MainWindow:
@@ -759,7 +657,13 @@ def build_window(client=None, logger=None, deck_port=None):
     window = QtWidgets.QMainWindow()
     window.setWindowTitle("%s %s" % (APP_NAME, APP_VERSION))
     window.setWindowIcon(make_app_icon())
-    window.resize(1100, 680)  # Fits a 1366x768 screen with room to spare.
+    # Default height 700 (v0.39, R5): at 680 the panes only got 135 px
+    # for a 225 px transcript block, so the transcript's 100 px floor
+    # painted underneath the search row -- the first-run guide's
+    # steps 2-3 (and the bottom line of real replies) hid behind it.
+    # 700 is the tallest the screen-fit test allows: 700 plus the
+    # window's title bar plus the Mint panel still fits 1366x768.
+    window.resize(1100, 700)
     window.setMinimumSize(900, 540)
 
     def alive():
@@ -770,8 +674,11 @@ def build_window(client=None, logger=None, deck_port=None):
     central = QtWidgets.QWidget()
     window.setCentralWidget(central)
     root = QtWidgets.QVBoxLayout(central)
-    root.setContentsMargins(8, 8, 8, 8)
-    root.setSpacing(8)
+    # 4 px margins and spacing (v0.39, R5): 8 px left the panes too
+    # short for the transcript block at the default window size
+    # (see the resize note below).
+    root.setContentsMargins(4, 4, 4, 4)
+    root.setSpacing(4)
 
     panes = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
     root.addWidget(panes, stretch=1)
@@ -815,8 +722,11 @@ def build_window(client=None, logger=None, deck_port=None):
         frame = QtWidgets.QFrame()
         frame.setFrameShape(QtWidgets.QFrame.StyledPanel)
         layout = QtWidgets.QVBoxLayout(frame)
-        layout.setContentsMargins(6, 6, 6, 6)
-        layout.setSpacing(6)
+        # 3 px margins and spacing (v0.39, R5): 6 px left the panes
+        # too short for the transcript block at the default window
+        # size (see the resize note in build_window).
+        layout.setContentsMargins(3, 3, 3, 3)
+        layout.setSpacing(3)
 
         title_row = QtWidgets.QHBoxLayout()
         title = QtWidgets.QLabel("Model " + side)
@@ -880,7 +790,10 @@ def build_window(client=None, logger=None, deck_port=None):
         top_frame = QtWidgets.QFrame()
         top_layout = QtWidgets.QVBoxLayout(top_frame)
         top_layout.setContentsMargins(0, 0, 0, 0)
-        top_layout.setSpacing(6)
+        # 2 px (v0.39, R5): 6 px left the panes too short for the
+        # transcript block at the default window size (see the
+        # resize note in build_window).
+        top_layout.setSpacing(2)
 
         transcript = QtWidgets.QTextEdit()
         transcript.setReadOnly(True)
@@ -925,7 +838,11 @@ def build_window(client=None, logger=None, deck_port=None):
         # amber waiting, green thinking, red failed. Both are set
         # together by set_side_state, the one setter, so the color
         # and the words always agree. The bottom-row status label
-        # shows the same words (set by the same setter).
+        # shows the same words (set by the same setter). The session
+        # token total shares this row (v0.39, R5): it used to have a
+        # row of its own, and the panes were too short for the
+        # transcript block at the default window size (see the
+        # resize note in build_window).
         activity_row = QtWidgets.QHBoxLayout()
         activity_dot = QtWidgets.QLabel()
         activity_dot.setFixedSize(12, 12)
@@ -937,15 +854,14 @@ def build_window(client=None, logger=None, deck_port=None):
         activity_label.setStyleSheet("font-size: 11px;")
         activity_row.addWidget(activity_label)
         activity_row.addStretch(1)
-        top_layout.addLayout(activity_row)
-
         # Session token total: every token this side has generated
         # or been prompted with since the app started. Clear never
         # resets it -- only restarting the app does.
         session_tokens = QtWidgets.QLabel(
             format_session_line({"out": 0, "in": 0}))
         session_tokens.setStyleSheet("font-size: 11px;")
-        top_layout.addWidget(session_tokens)
+        activity_row.addWidget(session_tokens)
+        top_layout.addLayout(activity_row)
 
         # Summarize row: the nudge label appears when this side's
         # history passes the budget; the button is always here.
@@ -1034,6 +950,7 @@ def build_window(client=None, logger=None, deck_port=None):
             "hist_split": hist_split,
             "hist_up": hist_up, "hist_down": hist_down,
             "hist_delete": hist_delete,
+            "guide_shown": False,
             "stats": stats, "session_tokens": session_tokens,
             "activity_dot": activity_dot, "activity": activity_label,
             "nudge": nudge, "summarize": summarize_btn,
@@ -1061,7 +978,10 @@ def build_window(client=None, logger=None, deck_port=None):
     # No block cap on purpose: a chat composer must never drop typed
     # or pasted text. (v0.12 and earlier capped it at 5 blocks, which
     # silently threw away the oldest paragraphs of a long paste.)
-    composer.setFixedHeight(64)
+    # 38 px (v0.39, R5): 64 px left the panes too short for the
+    # transcript block at the default window size (see the resize
+    # note above). Still shows two full lines of typed text.
+    composer.setFixedHeight(38)
     d_layout.addWidget(composer)
 
     # --- attachments -------------------------------------------------------
@@ -1492,7 +1412,13 @@ def build_window(client=None, logger=None, deck_port=None):
              # Total RAM in bytes, read once at startup for the
              # picker's fit labels (v0.33, U39). None when /proc
              # can't be read: the pickers then show sizes only.
-             "total_ram": read_total_ram()}
+             "total_ram": read_total_ram(),
+             # First-run guide (v0.39, R5): True once the user has
+             # used the app (first send, relay, task, opened
+             # conversation, or import). While False and both panes
+             # are empty, the transcripts show the guide.
+             "first_run_done": prefs.value(
+                 SETTING_FIRST_RUN_DONE, False, type=bool)}
 
     # --- helpers ----------------------------------------------------------
     # Transcript formats: sender labels are bold, everything else
@@ -1640,6 +1566,10 @@ def build_window(client=None, logger=None, deck_port=None):
         side_obj = convo.sides[side]
         widgets[side]["transcript"].clear()
         widgets[side]["reply_body_pos"] = None
+        # The clear takes the first-run guide with it, if it was
+        # showing (v0.39, R5); the refresh at the end puts it back
+        # when the pane is still empty on a first run.
+        widgets[side]["guide_shown"] = False
         for msg in side_obj.messages:
             markdown = (msg.role == "assistant"
                         or msg.label == SUMMARY_LABEL)
@@ -1650,6 +1580,48 @@ def build_window(client=None, logger=None, deck_port=None):
         # the search state goes too (empty histories never reach
         # append_message, which clears it on its own).
         clear_search(side)
+        refresh_empty_state(side)
+
+    def refresh_empty_state(side):
+        """Show or hide the first-run guide in one pane (v0.39, R5).
+
+        The guide shows only while the user has never used the app
+        (the first-run flag is unset) and both panes are empty -- it
+        is document text, so it replaces the "No messages yet."
+        placeholder, and it never enters the history, so exports
+        and saves never see it. Step 1 ticks once both models are
+        picked. Rebuilding is cheap and idempotent, so a refresh
+        picks up a new tick. When the guide should not show, only a
+        pane that is actually showing it is touched -- a pane with
+        real messages is never cleared here. Either way the search
+        goes, as for any transcript change."""
+        t = widgets[side]["transcript"]
+        if (not state["first_run_done"]
+                and not convo.sides["A"].messages
+                and not convo.sides["B"].messages):
+            t.clear()
+            cursor = t.textCursor()
+            cursor.insertHtml(first_run_guide_html(
+                convo.sides["A"].model is not None
+                and convo.sides["B"].model is not None))
+            widgets[side]["guide_shown"] = True
+            clear_search(side)
+        elif widgets[side]["guide_shown"]:
+            t.clear()
+            widgets[side]["guide_shown"] = False
+            clear_search(side)
+
+    def mark_first_run_done():
+        """The user has used the app: the first-run guide never
+        shows again. Sets the persisted flag and clears the guide
+        from both panes. Called before the first message lands, so
+        the guide is gone before anything is appended after it."""
+        if state["first_run_done"]:
+            return
+        state["first_run_done"] = True
+        prefs.setValue(SETTING_FIRST_RUN_DONE, True)
+        for _side in ("A", "B"):
+            refresh_empty_state(_side)
 
     # --- transcript search ---------------------------------------------------
     # Search is display-only: it highlights matches in the pane's
@@ -2592,6 +2564,9 @@ def build_window(client=None, logger=None, deck_port=None):
                 QtWidgets.QMessageBox.No)
             if answer != QtWidgets.QMessageBox.Yes:
                 return
+        # Importing counts as using the app (v0.39, R5): the
+        # first-run guide never shows again.
+        mark_first_run_done()
         side_obj.messages = [ChatMessage(entry["role"], entry["content"],
                                          entry["label"])
                              for entry in entries]
@@ -2663,6 +2638,10 @@ def build_window(client=None, logger=None, deck_port=None):
         full-transcript log. Models that are no longer installed stay
         unpicked -- the picker is left blank for that side. Returns
         the list of missing model names."""
+        # Opening a conversation counts as using the app (v0.39,
+        # R5): the first-run guide never shows again, even if the
+        # loaded conversation is empty.
+        mark_first_run_done()
         missing = []
         for side in ("A", "B"):
             new_side = new_convo.sides[side]
@@ -2780,6 +2759,9 @@ def build_window(client=None, logger=None, deck_port=None):
             targets = convo.targets_for(action)
         except NoModelSelected as exc:
             return str(exc)
+        # The first message ends the first run (v0.39, R5): the
+        # guide leaves both panes before the message lands.
+        mark_first_run_done()
         # Attached files ride along with this message: their contents
         # are prepended as plain blocks the model can read. The window
         # shows the typed message plus a short tag, not the contents.
@@ -2895,6 +2877,9 @@ def build_window(client=None, logger=None, deck_port=None):
                 or convo.sides["B"].model is None):
             set_status_message(MSG_RELAY_NEEDS_BOTH)
             return
+        # The seed is a first message too (v0.39, R5): the guide
+        # leaves both panes before it lands.
+        mark_first_run_done()
         start_side = start_picker.currentText()
         session = RelaySession(
             start_side=start_side,
@@ -2998,6 +2983,9 @@ def build_window(client=None, logger=None, deck_port=None):
             set_status_message(
                 MSG_NO_MODEL.format(side="Model " + other))
             return
+        # A task is a first message too (v0.39, R5): the guide
+        # leaves both panes before it lands.
+        mark_first_run_done()
         state["busy"] = True
         # A task is not a compare round: the offer is spent.
         state["compare"] = {}
@@ -3414,6 +3402,7 @@ def build_window(client=None, logger=None, deck_port=None):
             convo.sides[side].clear()
             widgets[side]["transcript"].clear()
             widgets[side]["reply_body_pos"] = None
+            widgets[side]["guide_shown"] = False
             clear_search(side)
             # A cleared conversation restarts: that side's entries
             # leave the full transcript too.
@@ -3431,6 +3420,10 @@ def build_window(client=None, logger=None, deck_port=None):
             refresh_stats_label(side)
             set_side_state(side, "idle")
             refresh_buttons()
+            # An emptied pane on a first run shows the guide again
+            # (v0.39, R5); after the first run it stays the bare
+            # placeholder.
+            refresh_empty_state(side)
         return clear
 
     def make_save(side):
@@ -3462,6 +3455,11 @@ def build_window(client=None, logger=None, deck_port=None):
             state["stats"][side] = None
             refresh_stats_label(side)
             refresh_buttons()
+            # The first-run guide's step 1 ticks once both models
+            # are picked (v0.39, R5) -- refresh both panes, since
+            # the tick depends on both pickers.
+            refresh_empty_state("A")
+            refresh_empty_state("B")
         return changed
 
     for side in ("A", "B"):
@@ -3597,7 +3595,12 @@ def build_window(client=None, logger=None, deck_port=None):
     update_checkers = []
 
     def run_update_check(manual):
-        checker = _UpdateChecker(signals, APP_VERSION, manual)
+        # check_fn=check_for_update resolves the name in dual_chat's
+        # namespace, so tests stubbing dual_chat.check_for_update
+        # (the v0.28 seam) still intercept the call -- see
+        # duo_workers._UpdateChecker.
+        checker = _UpdateChecker(signals, APP_VERSION, manual,
+                                 check_fn=check_for_update)
         update_checkers.append(checker)
         checker.thread.finished.connect(
             lambda: update_checkers.remove(checker)
@@ -3771,6 +3774,8 @@ def build_window(client=None, logger=None, deck_port=None):
         "refresh_preset_combo": refresh_preset_combo,
         "use_this": use_this, "do_forward": do_forward,
         "render_transcript": render_transcript,
+        "refresh_empty_state": refresh_empty_state,
+        "mark_first_run_done": mark_first_run_done,
         "refresh_history_list": refresh_history_list,
         "do_summarize": do_summarize, "refresh_buttons": refresh_buttons,
         "attach_btn": attach_btn, "attach_frame": attach_frame,
@@ -3935,6 +3940,10 @@ def build_window(client=None, logger=None, deck_port=None):
     # refreshes or pane actions -- only the button runs it again.
     run_update_check(manual=False)
     refresh_buttons()
+    # First run (v0.39, R5): both panes empty and the user has never
+    # sent a message -- the transcripts teach the loop.
+    refresh_empty_state("A")
+    refresh_empty_state("B")
     return window
 
 

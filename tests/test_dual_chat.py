@@ -27,7 +27,9 @@ from dual_chat import (  # noqa: E402
     AGREEMENT_PHRASES, APP_VERSION, AWARE_TEMPLATE, CHAT_MAX_ATTEMPTS,
     CHAT_RETRY_DELAYS, CHAT_TIMEOUT, COMPARE_PREFIX,
     CONVERSATION_FORMAT_VERSION, DECK_PAGE_HTML,
-    DECK_PORT, ERROR_STATE_HOLD_MS, FULL_LOG_MAX_ENTRIES,
+    DECK_PORT, ERROR_STATE_HOLD_MS,
+    FIRST_RUN_HEADER, FIRST_RUN_STEP1, FIRST_RUN_STEP2, FIRST_RUN_STEP3,
+    FIRST_RUN_TICK, FULL_LOG_MAX_ENTRIES,
     FULL_LOG_TRIMMED_NOTE,
     HIST_EDITOR_DEFAULT_HEIGHT, HIST_EDITOR_MIN_HEIGHT,
     HIST_TRANSCRIPT_MIN_HEIGHT,
@@ -39,6 +41,7 @@ from dual_chat import (  # noqa: E402
     MSG_UPDATE_AVAILABLE, MSG_UPDATE_FAILED, MSG_UPDATE_LATEST,
     SETTINGS_APP, SETTINGS_ORG, SETTING_DIRECTOR_COLLAPSED,
     SETTING_ENTER_TO_SEND,
+    SETTING_FIRST_RUN_DONE,
     SETTING_HIST_SPLITTER_STATE,
     SETTING_SPLITTER_STATE, SETTING_TEMPERATURE,
     SETTING_WINDOW_GEOMETRY,
@@ -66,7 +69,8 @@ from dual_chat import (  # noqa: E402
     format_full_transcript, format_model_entry, format_ram,
     format_session_line,
     format_side_transcript,
-    format_stats_line, format_system_meter, get_lan_ip,
+    format_stats_line, format_system_meter, first_run_guide_html,
+    get_lan_ip,
     is_valid_preset, load_attachment,
     load_conversation_file, load_pairs, load_presets,
     load_side_transcript_file,
@@ -3520,6 +3524,14 @@ class TaskRoundsGuiTests(unittest.TestCase):
         self._run_task(0, 1, "Write the story.", rounds=3)
         self.assertTrue(self._wait_for(
             lambda: self.state["state"]["busy"], timeout=5))
+        # Busy goes true at submit, but the runner thread starts
+        # the job a moment later -- wait for the call itself, or
+        # the stop can land before the job starts and no call is
+        # ever made (the v0.35 Item6 race; this test flaked the
+        # same way under load at v0.39).
+        self.assertTrue(self._wait_for(
+            lambda: self.client.calls == ["fake-a:latest"],
+            timeout=10))
         self.state["widgets"]["A"]["stop"].click()
         self.assertTrue(self._wait_for(
             lambda: "Task stopped." in
@@ -6659,7 +6671,7 @@ class FrontDoorTests(unittest.TestCase):
 
     def test_changelog_covers_every_version(self):
         log = self._read("CHANGELOG.md")
-        for version in ["0.%d" % n for n in range(1, 39)]:
+        for version in ["0.%d" % n for n in range(1, 40)]:
             self.assertIn(version, log)
 
     def test_gitignore_covers_runtime_files(self):
@@ -8668,7 +8680,7 @@ class ModuleSplitTests(unittest.TestCase):
     MODULES = ("duo_ollama", "duo_stats", "duo_text", "duo_tasks",
                "duo_markdown", "duo_model", "duo_transcript",
                "duo_storage", "duo_runner", "duo_icon", "duo_menu",
-               "duo_deck")
+               "duo_deck", "duo_workers")
 
     def _tree(self):
         return os.path.dirname(
@@ -8708,6 +8720,7 @@ class ModuleSplitTests(unittest.TestCase):
         import duo_tasks
         import duo_text
         import duo_transcript
+        import duo_workers
         pairs = [
             (dual_chat.make_app_icon, duo_icon.make_app_icon),
             (dual_chat.build_menu_bar, duo_menu.build_menu_bar),
@@ -8742,6 +8755,12 @@ class ModuleSplitTests(unittest.TestCase):
             (dual_chat.parse_side_transcript,
              duo_transcript.parse_side_transcript),
             (dual_chat.TranscriptError, duo_transcript.TranscriptError),
+            (dual_chat._Signals, duo_workers._Signals),
+            (dual_chat._SignalObject, duo_workers._SignalObject),
+            (dual_chat._ModelLoader, duo_workers._ModelLoader),
+            (dual_chat._OllamaStarter, duo_workers._OllamaStarter),
+            (dual_chat._UpdateChecker, duo_workers._UpdateChecker),
+            (dual_chat._qt, duo_workers._qt),
         ]
         for through_dual_chat, original in pairs:
             self.assertIs(through_dual_chat, original, original)
@@ -9029,6 +9048,12 @@ class MessageStructureTests(unittest.TestCase):
                   encoding="utf-8") as fh:
             script = fh.read()
         self.assertIn('"duo_deck.py": 0o100644', script)
+
+    def test_zip_includes_the_workers_module(self):
+        with open(os.path.join(self._tree(), "build_zip.py"),
+                  encoding="utf-8") as fh:
+            script = fh.read()
+        self.assertIn('"duo_workers.py": 0o100644', script)
 
 class UpdateCheckTests(unittest.TestCase):
     """v0.28 (audit T17): the update check's pure core -- version
@@ -11580,6 +11605,263 @@ class HistorySplitterGuiTests(unittest.TestCase):
         self._expand_editor("A")
         frame = self.state["widgets"]["A"]["hist_frame"]
         self.assertAlmostEqual(frame.height(), 200, delta=15)
+
+
+class FirstRunGuideTests(unittest.TestCase):
+    """v0.39 (redesign R5): the first-run guide's pure core -- the
+    HTML fragment, the ticked step 1, and the no-em-dash rule."""
+
+    def test_guide_html_exact_lines_unticked(self):
+        html = first_run_guide_html(False)
+        self.assertIn("<b>%s</b>" % FIRST_RUN_HEADER, html)
+        self.assertIn("1. %s" % FIRST_RUN_STEP1, html)
+        self.assertIn("2. %s" % FIRST_RUN_STEP2, html)
+        self.assertIn("3. %s" % FIRST_RUN_STEP3, html)
+        self.assertNotIn(FIRST_RUN_TICK, html)
+
+    def test_guide_html_ticks_step_1_when_models_picked(self):
+        html = first_run_guide_html(True)
+        self.assertIn("<b>%s</b>" % FIRST_RUN_HEADER, html)
+        self.assertIn("%s %s" % (FIRST_RUN_TICK, FIRST_RUN_STEP1), html)
+        self.assertNotIn("1. %s" % FIRST_RUN_STEP1, html)
+        # Steps 2 and 3 stay numbered.
+        self.assertIn("2. %s" % FIRST_RUN_STEP2, html)
+        self.assertIn("3. %s" % FIRST_RUN_STEP3, html)
+
+    def test_guide_text_has_no_em_dash(self):
+        for text in (FIRST_RUN_HEADER, FIRST_RUN_STEP1, FIRST_RUN_STEP2,
+                     FIRST_RUN_STEP3,
+                     first_run_guide_html(False),
+                     first_run_guide_html(True)):
+            self.assertNotIn("\u2014", text)
+
+
+@unittest.skipUnless(os.environ.get("DUAL_CHAT_GUI_TESTS") == "1",
+                     "GUI tests run with DUAL_CHAT_GUI_TESTS=1")
+class FirstRunGuiTests(unittest.TestCase):
+    """v0.39 (redesign R5): the first-run empty state teaches the
+    loop. With no conversation and the flag unset, each pane shows
+    the three-step guide instead of "No messages yet."; step 1
+    ticks once both models are picked; the first send (or an opened
+    conversation, or an import) ends the first run for good. The
+    guide is display-only: it never enters the history, an export,
+    or a saved conversation. The update check is stubbed, as in
+    MenuBarGuiTests, so no test touches the network."""
+
+    @classmethod
+    def setUpClass(cls):
+        from PySide6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+        cls.client = FakeGuiClient()
+
+    def setUp(self):
+        # A true first run: the flag is cleared before every window,
+        # and the window is built WITHOUT picking models -- the
+        # tick tests pick them when they need to.
+        self._clear_first_run_flag()
+        from dual_chat import build_window
+        self._patcher = mock.patch(
+            "dual_chat.check_for_update",
+            return_value=("latest", None))
+        self._patcher.start()
+        self.client.reset()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.window = build_window(self.client, logger=TEST_LOGGER)
+        self.window.show()
+        self.state = self.window._dual_chat
+        self._wait_for(lambda: self.state["widgets"]["A"]["picker"].count() == 2)
+
+    def tearDown(self):
+        self.window.close()
+        self.app.processEvents()
+        self._patcher.stop()
+        self.tmp.cleanup()
+        self._clear_first_run_flag()
+
+    def _clear_first_run_flag(self):
+        from PySide6.QtCore import QSettings
+        settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
+        settings.remove(SETTING_FIRST_RUN_DONE)
+        settings.sync()
+
+    def _flag_is_set(self):
+        from PySide6.QtCore import QSettings
+        settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
+        return settings.value(SETTING_FIRST_RUN_DONE, False, type=bool)
+
+    def _wait_for(self, cond, timeout=10.0):
+        from PySide6.QtTest import QTest
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            QTest.qWait(50)
+            if cond():
+                return True
+        return cond()
+
+    def _pick_models(self):
+        self.state["widgets"]["A"]["picker"].setCurrentIndex(0)
+        self.state["widgets"]["B"]["picker"].setCurrentIndex(1)
+        self.app.processEvents()
+
+    def _pick_one_model(self):
+        self.state["widgets"]["A"]["picker"].setCurrentIndex(0)
+        self.app.processEvents()
+
+    def _send_to_a_and_wait(self, text):
+        self.state["composer"].setPlainText(text)
+        self.state["send_a"].click()
+        return self._wait_for(lambda: (
+            len(self.state["convo"].sides["A"].messages) >= 2
+            and not self.state["state"]["busy"]), timeout=15)
+
+    def _save_dialog(self, path):
+        """Patch the save dialog to return ``path`` ("" cancels)."""
+        from PySide6 import QtWidgets
+        return mock.patch.object(
+            QtWidgets.QFileDialog, "getSaveFileName",
+            return_value=(path, "Text files (*.txt)"))
+
+    def _open_dialog(self, path):
+        """Patch the open dialog to return ``path`` ("" cancels)."""
+        from PySide6 import QtWidgets
+        return mock.patch.object(
+            QtWidgets.QFileDialog, "getOpenFileName",
+            return_value=(path, "DUO conversation files (*.json)"))
+
+    def _guide_text(self, ticked=False):
+        step1 = ("%s %s" % (FIRST_RUN_TICK, FIRST_RUN_STEP1) if ticked
+                 else "1. %s" % FIRST_RUN_STEP1)
+        return "\n".join([FIRST_RUN_HEADER, step1,
+                          "2. %s" % FIRST_RUN_STEP2,
+                          "3. %s" % FIRST_RUN_STEP3])
+
+    def test_guide_shows_on_first_run(self):
+        from PySide6.QtGui import QFont, QTextCursor
+        for side in ("A", "B"):
+            t = self.state["widgets"][side]["transcript"]
+            self.assertEqual(t.toPlainText(), self._guide_text())
+            self.assertNotIn("\u2014", t.toPlainText())
+            # The header is bold: the first character carries the
+            # bold weight.
+            cursor = QTextCursor(t.document())
+            cursor.setPosition(0)
+            self.assertEqual(cursor.charFormat().fontWeight(),
+                             QFont.Weight.Bold)
+            # Display-only: no message entered the history.
+            self.assertEqual(self.state["convo"].sides[side].messages,
+                             [])
+            self.assertTrue(
+                self.state["widgets"][side]["guide_shown"])
+
+    def test_step_1_stays_unticked_with_one_model(self):
+        self._pick_one_model()
+        for side in ("A", "B"):
+            t = self.state["widgets"][side]["transcript"]
+            self.assertEqual(t.toPlainText(), self._guide_text())
+            self.assertNotIn(FIRST_RUN_TICK, t.toPlainText())
+
+    def test_step_1_ticks_when_both_models_picked(self):
+        self._pick_models()
+        for side in ("A", "B"):
+            t = self.state["widgets"][side]["transcript"]
+            self.assertEqual(t.toPlainText(),
+                             self._guide_text(ticked=True))
+            # The guide is still showing -- the panes are empty.
+            self.assertTrue(
+                self.state["widgets"][side]["guide_shown"])
+
+    def test_guide_gone_after_first_send_and_flag_set(self):
+        self._pick_models()
+        self.assertTrue(self._send_to_a_and_wait("hello"))
+        self.assertTrue(self._flag_is_set())
+        self.assertTrue(self.state["state"]["first_run_done"])
+        for side in ("A", "B"):
+            t = self.state["widgets"][side]["transcript"]
+            self.assertNotIn(FIRST_RUN_HEADER, t.toPlainText())
+            self.assertFalse(
+                self.state["widgets"][side]["guide_shown"])
+        # The other pane went back to the bare placeholder.
+        self.assertEqual(
+            self.state["widgets"]["B"]["transcript"].toPlainText(), "")
+        self.assertEqual(
+            self.state["widgets"]["B"]["transcript"].placeholderText(),
+            "No messages yet.")
+
+    def test_guide_never_returns_after_clear(self):
+        self._pick_models()
+        self.assertTrue(self._send_to_a_and_wait("hello"))
+        with _answer_yes():
+            self.state["widgets"]["A"]["clear"].click()
+        self.app.processEvents()
+        t = self.state["widgets"]["A"]["transcript"]
+        self.assertEqual(t.toPlainText(), "")
+        self.assertEqual(t.placeholderText(), "No messages yet.")
+        self.assertNotIn(FIRST_RUN_HEADER, t.toPlainText())
+
+    def test_opening_a_conversation_sets_the_flag(self):
+        from PySide6.QtWidgets import QMessageBox
+        convo = Conversation()
+        convo.sides["A"].add_user("hi")
+        data = conversation_to_data(convo, [("A", "You", "hi")])
+        path = os.path.join(self.tmp.name, "saved.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh)
+        with self._open_dialog(path):
+            self.state["open_convo"].click()
+        self.app.processEvents()
+        self.assertTrue(self._flag_is_set())
+        self.assertEqual(len(self.state["convo"].sides["A"].messages),
+                         1)
+        # Clear both panes: the guide never comes back.
+        with _answer_yes():
+            self.state["widgets"]["A"]["clear"].click()
+        self.app.processEvents()
+        for side in ("A", "B"):
+            t = self.state["widgets"][side]["transcript"]
+            self.assertEqual(t.toPlainText(), "")
+            self.assertNotIn(FIRST_RUN_HEADER, t.toPlainText())
+
+    def test_empty_pane_export_has_no_guide_text(self):
+        path = os.path.join(self.tmp.name, "out.txt")
+        with self._save_dialog(path):
+            self.state["widgets"]["A"]["save"].click()
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+        self.assertIn("No messages yet.", text)
+        self.assertNotIn(FIRST_RUN_HEADER, text)
+        self.assertNotIn(FIRST_RUN_STEP1, text)
+        self.assertNotIn(FIRST_RUN_STEP2, text)
+        self.assertNotIn(FIRST_RUN_STEP3, text)
+
+    def test_search_does_not_crash_on_the_guide(self):
+        w = self.state["widgets"]["A"]
+        w["search_edit"].setText("relay")
+        self.app.processEvents()
+        # "relay" appears once in the guide's third step.
+        self.assertEqual(w["search_count"].text(), "1 matches")
+
+    def test_guide_fully_visible_at_the_default_size(self):
+        # Regression test for the layout crush found by the v0.39
+        # drive: at the old 1100x680 default the panes only got
+        # 135 px for a 225 px transcript block, so the transcript's
+        # 100 px floor painted underneath the search row and the
+        # guide's steps 2-3 hid behind it. At the default size the
+        # search row must start below the guide's last line, in
+        # both panes -- the whole guide readable, nothing covered.
+        from PySide6.QtTest import QTest
+        self.window.resize(1100, 700)
+        QTest.qWait(300)
+        for side in ("A", "B"):
+            w = self.state["widgets"][side]
+            transcript = w["transcript"]
+            guide_bottom = (transcript.geometry().y()
+                            + transcript.document().size().height())
+            search_top = w["search_edit"].geometry().y()
+            self.assertGreaterEqual(
+                search_top, guide_bottom,
+                "side %s: search row at %d covers the guide, "
+                "which ends at %.1f" % (side, search_top,
+                                        guide_bottom))
 
 
 if __name__ == "__main__":

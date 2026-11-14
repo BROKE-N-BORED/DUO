@@ -1,7 +1,26 @@
 # DUO changelog
 
 Every version, newest first. v0.1–v0.17 were built on 2026-11-12;
-v0.18–v0.35 on 2026-11-13; v0.36–v0.38 on 2026-11-14.
+v0.18–v0.35 on 2026-11-13; v0.36–v0.39 on 2026-11-14.
+
+## v0.39 — 2026-11-14
+
+First run teaches the loop now. When you open DUO with no
+conversation yet, each chat pane shows three steps: pick a model
+for each side, send a message to both, start a relay and watch
+them talk. Step 1 gets a checkmark once both models are picked.
+The guide disappears the moment you send your first message (or
+open a conversation, or import one) and never comes back. It is
+only ever on screen — it never gets saved, exported, or sent to
+a model. Under the hood, the background workers (the model
+loader, the Ollama starter, the update checker) moved into their
+own file, duo_workers.py, so the main window file stays under
+its size limit. Fixed along the way: at the old default window
+size the chat panes were too short for the transcript, so the
+bottom of a reply hid behind the search row — the window now
+opens a little taller (1100x700, still fits a 1366x768 screen)
+with tighter spacing and the session total sharing the activity
+row, and the whole guide and the whole reply stay visible.
 
 ## v0.38 — 2026-11-14
 
