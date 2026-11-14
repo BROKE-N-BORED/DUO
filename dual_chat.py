@@ -306,7 +306,7 @@ def make_debug_logger(log_dir=None):
         return _NullLogger()
 
 APP_NAME = "DUO"
-APP_VERSION = "0.35"
+APP_VERSION = "0.36"
 
 # Plain-language messages shown in the panes. No tracebacks in the UI.
 MSG_STOPPED = "Stopped."
@@ -1292,7 +1292,17 @@ def build_window(client=None, logger=None, deck_port=None):
         _set_director_collapsed(True)
 
     statusbar = window.statusBar()
-    statusbar.showMessage("Loading models...")
+    # Status notes (v0.36, T22): a permanent label, not a timed
+    # message -- a note stays until the next note replaces it, so
+    # looking away for a few seconds never loses it. One setter,
+    # set_status_message, is the only way notes are written.
+    status_label = QtWidgets.QLabel("")
+    statusbar.addWidget(status_label, 1)
+
+    def set_status_message(text):
+        status_label.setText(text)
+
+    set_status_message("Loading models...")
     # The status bar holds only the status message and the system
     # meter (v0.35, T23): the Start Ollama button moved to the
     # bottom button row, where the actions live.
@@ -2067,7 +2077,7 @@ def build_window(client=None, logger=None, deck_port=None):
         state["task"] = None
         logger.action("task ended: %s" % (status_message or "done"))
         if status_message:
-            statusbar.showMessage(status_message, 4000)
+            set_status_message(status_message)
         refresh_buttons()
 
     def show_task_progress(session):
@@ -2075,7 +2085,7 @@ def build_window(client=None, logger=None, deck_port=None):
         one-round task shows nothing -- it is over before a progress
         line would mean anything."""
         if session.rounds > 1:
-            statusbar.showMessage(
+            set_status_message(
                 "Task: round %d of %d..."
                 % (session.rounds_done + 1, session.rounds))
 
@@ -2152,14 +2162,14 @@ def build_window(client=None, logger=None, deck_port=None):
         state["summarizing"] = None
         set_side_state(side, "idle")
         if not text.strip():
-            statusbar.showMessage(
-                "Summarize came back empty. History unchanged.", 4000)
+            set_status_message(
+                "Summarize came back empty. History unchanged.")
             refresh_buttons()
             return
         if convo.sides[side].summarize(text):
             render_transcript(side)
             refresh_history_list(side)
-            statusbar.showMessage("History summarized.", 3000)
+            set_status_message("History summarized.")
         refresh_buttons()
 
     def on_done(job_id, text):
@@ -2368,10 +2378,10 @@ def build_window(client=None, logger=None, deck_port=None):
             added.append(name)
         refresh_attach_list()
         if notes:
-            statusbar.showMessage(" ".join(notes), 5000)
+            set_status_message(" ".join(notes))
         elif added:
-            statusbar.showMessage(
-                "Attached: %s." % ", ".join(added), 3000)
+            set_status_message(
+                "Attached: %s." % ", ".join(added))
         return len(added)
 
     def remove_attachment(index):
@@ -2392,7 +2402,7 @@ def build_window(client=None, logger=None, deck_port=None):
         state["attachments"] = []
         refresh_attach_list()
         if had:
-            statusbar.clearMessage()
+            set_status_message("")
 
     def on_attach_clicked():
         paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
@@ -2419,10 +2429,10 @@ def build_window(client=None, logger=None, deck_port=None):
             write_text_atomic(path, text)
         except OSError as exc:
             reason = exc.strerror or str(exc)
-            statusbar.showMessage(
-                "Couldn't save to %s: %s" % (path, reason), 5000)
+            set_status_message(
+                "Couldn't save to %s: %s" % (path, reason))
             return False
-        statusbar.showMessage("Saved to %s" % path, 5000)
+        set_status_message("Saved to %s" % path)
         return True
 
     def do_save(side):
@@ -2461,8 +2471,8 @@ def build_window(client=None, logger=None, deck_port=None):
         try:
             entries = load_side_transcript_file(path)
         except (TranscriptError, OSError) as exc:
-            statusbar.showMessage(
-                "Couldn't import that file: %s" % exc, 5000)
+            set_status_message(
+                "Couldn't import that file: %s" % exc)
             return
         side_obj = convo.sides[side]
         if side_obj.messages:
@@ -2494,8 +2504,8 @@ def build_window(client=None, logger=None, deck_port=None):
         refresh_stats_label(side)
         set_side_state(side, "idle")
         refresh_buttons()
-        statusbar.showMessage(
-            "Transcript imported from %s" % path, 5000)
+        set_status_message(
+            "Transcript imported from %s" % path)
 
     def do_save_both():
         """Save both transcripts to one combined text file."""
@@ -2533,10 +2543,10 @@ def build_window(client=None, logger=None, deck_port=None):
             save_conversation_file(path, convo, state["full_log"])
         except OSError as exc:
             reason = exc.strerror or str(exc)
-            statusbar.showMessage(
-                "Couldn't save to %s: %s" % (path, reason), 5000)
+            set_status_message(
+                "Couldn't save to %s: %s" % (path, reason))
             return
-        statusbar.showMessage("Conversation saved to %s" % path, 5000)
+        set_status_message("Conversation saved to %s" % path)
 
     def _apply_conversation(new_convo, new_log):
         """Swap the loaded conversation into the window: both panes'
@@ -2599,8 +2609,8 @@ def build_window(client=None, logger=None, deck_port=None):
         try:
             new_convo, new_log = load_conversation_file(path)
         except (ConversationError, OSError) as exc:
-            statusbar.showMessage(
-                "Couldn't open that file: %s" % exc, 5000)
+            set_status_message(
+                "Couldn't open that file: %s" % exc)
             return
         if convo.sides["A"].messages or convo.sides["B"].messages:
             answer = QtWidgets.QMessageBox.question(
@@ -2612,12 +2622,12 @@ def build_window(client=None, logger=None, deck_port=None):
                 return
         missing = _apply_conversation(new_convo, new_log)
         if missing:
-            statusbar.showMessage(
+            set_status_message(
                 "Conversation opened, but not installed: %s."
-                % ", ".join(missing), 5000)
+                % ", ".join(missing))
         else:
-            statusbar.showMessage(
-                "Conversation opened from %s" % path, 5000)
+            set_status_message(
+                "Conversation opened from %s" % path)
 
     save_convo.clicked.connect(do_save_conversation)
     open_convo.clicked.connect(do_open_conversation)
@@ -2637,11 +2647,11 @@ def build_window(client=None, logger=None, deck_port=None):
             written = logger.generate_report(path)
         except OSError as exc:
             reason = exc.strerror or str(exc)
-            statusbar.showMessage(
-                "Couldn't save to %s: %s" % (path, reason), 5000)
+            set_status_message(
+                "Couldn't save to %s: %s" % (path, reason))
             return
         logger.action("debug report written to %s" % written)
-        statusbar.showMessage("Debug report saved to %s" % written, 5000)
+        set_status_message("Debug report saved to %s" % written)
 
     debug_btn.clicked.connect(do_debug_report)
 
@@ -2695,8 +2705,8 @@ def build_window(client=None, logger=None, deck_port=None):
         attachments = list(state["attachments"])
         err = send_message(composer.toPlainText(), action, attachments)
         if err is not None:
-            statusbar.showMessage(
-                err, 3000 if err == MSG_EMPTY else 4000)
+            set_status_message(
+                err)
             return
         composer.clear()
         clear_attachments()
@@ -2743,11 +2753,11 @@ def build_window(client=None, logger=None, deck_port=None):
             return
         side_obj = convo.sides[side]
         if side_obj.model is None:
-            statusbar.showMessage(
-                MSG_NO_MODEL.format(side="Model " + side), 4000)
+            set_status_message(
+                MSG_NO_MODEL.format(side="Model " + side))
             return
         if len(side_obj.messages) <= SUMMARY_KEEP_LAST:
-            statusbar.showMessage("Nothing to summarize yet.", 3000)
+            set_status_message("Nothing to summarize yet.")
             return
         state["busy"] = True
         state["summarizing"] = side
@@ -2770,11 +2780,11 @@ def build_window(client=None, logger=None, deck_port=None):
             return
         text = composer.toPlainText().strip()
         if not text:
-            statusbar.showMessage(MSG_EMPTY, 3000)
+            set_status_message(MSG_EMPTY)
             return
         if (convo.sides["A"].model is None
                 or convo.sides["B"].model is None):
-            statusbar.showMessage(MSG_RELAY_NEEDS_BOTH, 4000)
+            set_status_message(MSG_RELAY_NEEDS_BOTH)
             return
         start_side = start_picker.currentText()
         session = RelaySession(
@@ -2858,26 +2868,26 @@ def build_window(client=None, logger=None, deck_port=None):
             return
         text = task_edit.toPlainText().strip()
         if not text:
-            statusbar.showMessage(MSG_TASK_EMPTY, 3000)
+            set_status_message(MSG_TASK_EMPTY)
             return
         if task_worker.currentIndex() < 0:
-            statusbar.showMessage(MSG_TASK_NEEDS_WORKER, 3000)
+            set_status_message(MSG_TASK_NEEDS_WORKER)
             return
         if task_follow_up.currentIndex() < 0:
-            statusbar.showMessage(MSG_TASK_NEEDS_FOLLOW_UP, 3000)
+            set_status_message(MSG_TASK_NEEDS_FOLLOW_UP)
             return
         worker = "A" if task_worker.currentIndex() == 0 else "B"
         follow_up = TASK_FOLLOW_UPS[task_follow_up.currentIndex()]
         rounds = task_rounds.value()
         worker_obj = convo.sides[worker]
         if worker_obj.model is None:
-            statusbar.showMessage(
-                MSG_NO_MODEL.format(side="Model " + worker), 4000)
+            set_status_message(
+                MSG_NO_MODEL.format(side="Model " + worker))
             return
         other = RelaySession.other(worker)
         if follow_up != "nothing" and convo.sides[other].model is None:
-            statusbar.showMessage(
-                MSG_NO_MODEL.format(side="Model " + other), 4000)
+            set_status_message(
+                MSG_NO_MODEL.format(side="Model " + other))
             return
         state["busy"] = True
         # A task is not a compare round: the offer is spent.
@@ -2916,7 +2926,7 @@ def build_window(client=None, logger=None, deck_port=None):
     def on_review_forward_edited():
         text = review_edit.toPlainText()
         if not text.strip():
-            statusbar.showMessage(MSG_REVIEW_EMPTY, 3000)
+            set_status_message(MSG_REVIEW_EMPTY)
             return
         do_forward(text)
 
@@ -3064,7 +3074,7 @@ def build_window(client=None, logger=None, deck_port=None):
     def on_pair_save():
         name = pair_name.text().strip()
         if not name:
-            statusbar.showMessage(MSG_PAIR_NEEDS_NAME, 3000)
+            set_status_message(MSG_PAIR_NEEDS_NAME)
             return
         setup = {
             "model_a": convo.sides["A"].model,
@@ -3076,11 +3086,11 @@ def build_window(client=None, logger=None, deck_port=None):
             save_pair(pairs_path(), name, setup)
         except OSError as exc:
             reason = exc.strerror or str(exc)
-            statusbar.showMessage(
-                "Couldn't save pair '%s': %s" % (name, reason), 5000)
+            set_status_message(
+                "Couldn't save pair '%s': %s" % (name, reason))
             return
         refresh_pair_combo(select=name)
-        statusbar.showMessage("Pair '%s' saved." % name, 3000)
+        set_status_message("Pair '%s' saved." % name)
 
     def on_pair_selected(index):
         if index < 0:
@@ -3107,11 +3117,11 @@ def build_window(client=None, logger=None, deck_port=None):
         widgets["B"]["instr_edit"].setPlainText(
             setup.get("instruction_b") or "")
         if missing:
-            statusbar.showMessage(
+            set_status_message(
                 "Pair '%s' loaded, but not installed: %s."
-                % (name, ", ".join(missing)), 5000)
+                % (name, ", ".join(missing)))
         else:
-            statusbar.showMessage("Pair '%s' loaded." % name, 3000)
+            set_status_message("Pair '%s' loaded." % name)
         refresh_buttons()
 
     def on_pair_delete():
@@ -3130,11 +3140,11 @@ def build_window(client=None, logger=None, deck_port=None):
             delete_pair(pairs_path(), name)
         except OSError as exc:
             reason = exc.strerror or str(exc)
-            statusbar.showMessage(
-                "Couldn't delete pair '%s': %s" % (name, reason), 5000)
+            set_status_message(
+                "Couldn't delete pair '%s': %s" % (name, reason))
             return
         refresh_pair_combo()
-        statusbar.showMessage("Pair '%s' deleted." % name, 3000)
+        set_status_message("Pair '%s' deleted." % name)
 
     pair_save.clicked.connect(on_pair_save)
     pair_delete.clicked.connect(on_pair_delete)
@@ -3166,8 +3176,8 @@ def build_window(client=None, logger=None, deck_port=None):
             preset_combo.setCurrentIndex(-1)
         preset_combo.blockSignals(False)
         if presets_file_corrupt(presets_path()):
-            statusbar.showMessage(
-                "Couldn't read the saved relay presets.", 5000)
+            set_status_message(
+                "Couldn't read the saved relay presets.")
         # The Delete button follows the selection, and this rebuild
         # runs with signals blocked, so refresh the buttons here.
         refresh_buttons()
@@ -3176,7 +3186,7 @@ def build_window(client=None, logger=None, deck_port=None):
     def on_preset_save():
         name = preset_name.text().strip()
         if not name:
-            statusbar.showMessage(MSG_PRESET_NEEDS_NAME, 3000)
+            set_status_message(MSG_PRESET_NEEDS_NAME)
             return
         config = {
             "start_side": start_picker.currentText(),
@@ -3191,12 +3201,11 @@ def build_window(client=None, logger=None, deck_port=None):
             save_preset(presets_path(), name, config)
         except OSError as exc:
             reason = exc.strerror or str(exc)
-            statusbar.showMessage(
-                "Couldn't save relay preset '%s': %s" % (name, reason),
-                5000)
+            set_status_message(
+                "Couldn't save relay preset '%s': %s" % (name, reason))
             return
         refresh_preset_combo(select=name)
-        statusbar.showMessage("Relay preset '%s' saved." % name, 3000)
+        set_status_message("Relay preset '%s' saved." % name)
 
     def on_preset_selected(index):
         if index < 0:
@@ -3206,8 +3215,8 @@ def build_window(client=None, logger=None, deck_port=None):
         if config is None:
             # Gone (or gone bad) since the dropdown was filled --
             # say so plainly and leave the row alone.
-            statusbar.showMessage(
-                "Relay preset '%s' couldn't be loaded." % name, 5000)
+            set_status_message(
+                "Relay preset '%s' couldn't be loaded." % name)
             return
         start_picker.setCurrentText(config["start_side"])
         mode_picker.setCurrentText(
@@ -3216,7 +3225,7 @@ def build_window(client=None, logger=None, deck_port=None):
         stop_edit.setText(", ".join(config["stop_phrases"]))
         agree_check.setChecked(config["stop_on_agreement"])
         review_check.setChecked(config["review_each_hop"])
-        statusbar.showMessage("Relay preset '%s' loaded." % name, 3000)
+        set_status_message("Relay preset '%s' loaded." % name)
         refresh_buttons()
 
     def on_preset_delete():
@@ -3236,12 +3245,11 @@ def build_window(client=None, logger=None, deck_port=None):
             delete_preset(presets_path(), name)
         except OSError as exc:
             reason = exc.strerror or str(exc)
-            statusbar.showMessage(
-                "Couldn't delete relay preset '%s': %s" % (name, reason),
-                5000)
+            set_status_message(
+                "Couldn't delete relay preset '%s': %s" % (name, reason))
             return
         refresh_preset_combo()
-        statusbar.showMessage("Relay preset '%s' deleted." % name, 3000)
+        set_status_message("Relay preset '%s' deleted." % name)
 
     preset_save.clicked.connect(on_preset_save)
     preset_delete.clicked.connect(on_preset_delete)
@@ -3366,10 +3374,10 @@ def build_window(client=None, logger=None, deck_port=None):
             picker.setPlaceholderText("Pick a model")
             picker.blockSignals(False)
         if models:
-            statusbar.showMessage(
+            set_status_message(
                 "Ollama connected: %d model(s) found." % len(models))
         else:
-            statusbar.showMessage(
+            set_status_message(
                 "Ollama connected but no models found. Pull a model first.")
         set_ollama_down(False)
         refresh_buttons()
@@ -3380,7 +3388,7 @@ def build_window(client=None, logger=None, deck_port=None):
         state["models_loading"] = False
         for side in ("A", "B"):
             widgets[side]["picker"].setPlaceholderText("Pick a model")
-        statusbar.showMessage(message)
+        set_status_message(message)
         if message in (MSG_OLLAMA_DOWN, MSG_OLLAMA_SLOW):
             set_ollama_down(True)
         refresh_buttons()
@@ -3406,7 +3414,7 @@ def build_window(client=None, logger=None, deck_port=None):
         # honestly, never a fake progress bar. The picked model
         # survives the reload: populate_models restores it by name.
         state["models_loading"] = True
-        statusbar.showMessage("Loading models...")
+        set_status_message("Loading models...")
         for side in ("A", "B"):
             picker = widgets[side]["picker"]
             picker.blockSignals(True)
@@ -3429,7 +3437,7 @@ def build_window(client=None, logger=None, deck_port=None):
         wait for the probe can take seconds)."""
         logger.action("Start Ollama pressed")
         state["ollama_starting"] = True
-        statusbar.showMessage("Starting Ollama...")
+        set_status_message("Starting Ollama...")
         refresh_buttons()
         starter = _OllamaStarter(ollama_manager, signals)
         starters.append(starter)
@@ -3442,7 +3450,7 @@ def build_window(client=None, logger=None, deck_port=None):
             return
         state["ollama_starting"] = False
         logger.action("Start Ollama finished: %s" % message)
-        statusbar.showMessage(message, 5000)
+        set_status_message(message)
         if ok:
             set_ollama_down(False)
             load_models()
@@ -3479,14 +3487,14 @@ def build_window(client=None, logger=None, deck_port=None):
         status, version = result
         if status == "newer":
             logger.action("update available: DUO %s" % version)
-            statusbar.showMessage(
-                MSG_UPDATE_AVAILABLE % version, 5000)
+            set_status_message(
+                MSG_UPDATE_AVAILABLE % version)
         elif manual and status == "latest":
             logger.info("update check: up to date")
-            statusbar.showMessage(MSG_UPDATE_LATEST, 5000)
+            set_status_message(MSG_UPDATE_LATEST)
         elif manual and status == "failed":
             logger.info("update check failed")
-            statusbar.showMessage(MSG_UPDATE_FAILED, 5000)
+            set_status_message(MSG_UPDATE_FAILED)
         elif status == "latest":
             logger.info("update check: up to date")
         else:
@@ -3671,6 +3679,8 @@ def build_window(client=None, logger=None, deck_port=None):
         "set_side_state": set_side_state, "side_state": side_state,
         "meter_label": meter_label, "refresh_meter": refresh_meter,
         "meter_timer": meter_timer,
+        "status_label": status_label,
+        "set_status_message": set_status_message,
         "phone_btn": phone_btn, "deck_server": deck_server,
         "show_phone_deck": show_phone_deck,
         "on_phone_send": on_phone_send,

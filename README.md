@@ -237,6 +237,8 @@ bash run.sh
 - System meter: the status bar shows the whole machine's CPU %
   and RAM ("CPU 42% · RAM 3.1 / 7.7 GB"), re-read once a second.
   On a machine without /proc the meter stays empty and silent.
+  Status notes in the bar stay until the next note replaces
+  them, so looking away never loses one.
 
 ## Files
 

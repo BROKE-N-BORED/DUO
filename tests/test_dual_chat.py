@@ -1126,7 +1126,7 @@ class GuiTests(unittest.TestCase):
             window.show()
             state = window._dual_chat
             self.assertTrue(self._wait_for(lambda:
-                "isn't running" in window.statusBar().currentMessage(),
+                "isn't running" in state["status_label"].text(),
                 timeout=10))
         finally:
             window.close()
@@ -2282,7 +2282,7 @@ class DirectorGuiTests(unittest.TestCase):
         self.app.processEvents()
         self.assertFalse(os.path.exists(self.pairs_file))
         self.assertIn("Name the pair",
-                      self.window.statusBar().currentMessage())
+                      self.state["status_label"].text())
 
     def test_pair_save_failure_shows_plain_note(self):
         # v0.18 (audit T7): a failed pairs save says so plainly
@@ -2297,7 +2297,7 @@ class DirectorGuiTests(unittest.TestCase):
                         side_effect=OSError("disk full")):
             self.state["pair_save"].click()
         self.app.processEvents()
-        message = self.window.statusBar().currentMessage()
+        message = self.state["status_label"].text()
         self.assertTrue(
             message.startswith("Couldn't save pair 'new pair'"),
             message)
@@ -2912,7 +2912,7 @@ class Item5GuiTests(unittest.TestCase):
         bad = self._write("photo.png", b"\x89PNG\r\n\x1a\n\x00\xff\xfe")
         self.assertEqual(self._attach(bad), 0)
         self.assertEqual(self.state["state"]["attachments"], [])
-        message = self.window.statusBar().currentMessage()
+        message = self.state["status_label"].text()
         self.assertIn("photo.png", message)
         self.assertIn("isn't a text file", message)
         self.assertEqual(self.client.calls, [])
@@ -2921,7 +2921,7 @@ class Item5GuiTests(unittest.TestCase):
         big = self._write("huge.txt", "x" * (MAX_ATTACHMENT_BYTES + 1))
         self.assertEqual(self._attach(big), 0)
         self.assertEqual(self.state["state"]["attachments"], [])
-        message = self.window.statusBar().currentMessage()
+        message = self.state["status_label"].text()
         self.assertIn("huge.txt", message)
         self.assertIn("over 100 KB", message)
 
@@ -2929,7 +2929,7 @@ class Item5GuiTests(unittest.TestCase):
         paths = [self._write("f%d.txt" % i, "x") for i in range(6)]
         self.assertEqual(self._attach(*paths), 5)
         self.assertEqual(len(self.state["state"]["attachments"]), 5)
-        message = self.window.statusBar().currentMessage()
+        message = self.state["status_label"].text()
         self.assertIn("up to 5 files", message)
 
     def test_attachments_clear_after_send(self):
@@ -2944,14 +2944,14 @@ class Item5GuiTests(unittest.TestCase):
         # after the send even though the attachments had cleared.
         self._attach(self._write("notes.txt", "AAA"))
         self.assertIn("Attached: notes.txt.",
-                      self.window.statusBar().currentMessage())
+                      self.state["status_label"].text())
         self.state["composer"].setPlainText("read this")
         self.state["send_both"].click()
         # Assert right after the click, before the 3-second note
         # timeout could expire and hide the bug.
         self.app.processEvents()
         self.assertNotIn("Attached:",
-                         self.window.statusBar().currentMessage())
+                         self.state["status_label"].text())
         # Let the turn finish so the window closes cleanly.
         self.assertTrue(self._wait_for(lambda: (
             len(self.state["convo"].sides["A"].messages) >= 2
@@ -3117,7 +3117,7 @@ class Item6GuiTests(unittest.TestCase):
         # The task box cleared after the run started.
         self.assertEqual(self.state["task_edit"].toPlainText(), "")
         self.assertIn("Task done.",
-                      self.window.statusBar().currentMessage())
+                      self.state["status_label"].text())
 
     def test_nothing_makes_no_second_call_with_b_as_worker(self):
         self._run_task(1, 2, "Summarize this.")  # B works, Nothing follows
@@ -3241,7 +3241,7 @@ class Item6GuiTests(unittest.TestCase):
         self.state["widgets"]["A"]["stop"].click()
         self.assertTrue(self._wait_for(
             lambda: "Task stopped." in
-            self.window.statusBar().currentMessage(), timeout=10))
+            self.state["status_label"].text(), timeout=10))
         self.assertTrue(self._wait_idle())
         self.assertIsNone(self.state["state"]["task"])
         # No second call: the task ended with the stop.
@@ -3269,7 +3269,7 @@ class Item6GuiTests(unittest.TestCase):
         self.assertTrue(self.state["task_run"].isEnabled())
         self.state["task_run"].click()
         self.assertIn("Pick a model for Model A first.",
-                      self.window.statusBar().currentMessage())
+                      self.state["status_label"].text())
         self.assertEqual(self.client.calls, [])
         self.assertIsNone(self.state["state"]["task"])
 
@@ -3436,7 +3436,7 @@ class TaskRoundsGuiTests(unittest.TestCase):
         self.assertIn("Draft three.", a_text)
         self.assertIn("Part two.", b_text)
         self.assertIn("Task done.",
-                      self.window.statusBar().currentMessage())
+                      self.state["status_label"].text())
 
     def test_three_round_review_revises(self):
         self.client.replies = {
@@ -3496,7 +3496,7 @@ class TaskRoundsGuiTests(unittest.TestCase):
         self.assertTrue(self._wait_idle())
         self.assertEqual(self.client.calls, ["fake-a:latest"])
         self.assertIn("Task done.",
-                      self.window.statusBar().currentMessage())
+                      self.state["status_label"].text())
 
     def test_rounds_setup_locked_mid_task(self):
         self.client.delay = 0.5
@@ -3520,7 +3520,7 @@ class TaskRoundsGuiTests(unittest.TestCase):
         self.state["widgets"]["A"]["stop"].click()
         self.assertTrue(self._wait_for(
             lambda: "Task stopped." in
-            self.window.statusBar().currentMessage(), timeout=10))
+            self.state["status_label"].text(), timeout=10))
         self.assertTrue(self._wait_idle())
         self.assertIsNone(self.state["state"]["task"])
         # No further rounds: the chain ended with the stop.
@@ -3564,7 +3564,7 @@ class TaskRoundsGuiTests(unittest.TestCase):
             state["task_run"].click()
             self.assertTrue(self._wait_for(
                 lambda: "Task failed:" in
-                window.statusBar().currentMessage(), timeout=15))
+                state["status_label"].text(), timeout=15))
             self.assertTrue(self._wait_for(
                 lambda: state["state"]["task"] is None, timeout=10))
             # Two calls and no more: round 3 never ran.
@@ -3588,13 +3588,13 @@ class TaskRoundsGuiTests(unittest.TestCase):
         self._run_task(0, 1, "Write the story.", rounds=3)
         self.assertTrue(self._wait_for(
             lambda: "Task: round 1 of 3..." in
-            self.window.statusBar().currentMessage(), timeout=10))
+            self.state["status_label"].text(), timeout=10))
         self.assertTrue(self._wait_for(
             lambda: "Task: round 2 of 3..." in
-            self.window.statusBar().currentMessage(), timeout=15))
+            self.state["status_label"].text(), timeout=15))
         self.assertTrue(self._wait_idle())
         self.assertIn("Task done.",
-                      self.window.statusBar().currentMessage())
+                      self.state["status_label"].text())
 
 
 # ---------------------------------------------------------------------------
@@ -4252,7 +4252,7 @@ class Item7GuiTests(unittest.TestCase):
             "\n".join(lines[1:]),
             "\nYou: hello\n\n"
             "fake-a:latest: Reply from fake-a:latest.\n")
-        self.assertEqual(self.window.statusBar().currentMessage(),
+        self.assertEqual(self.state["status_label"].text(),
                          "Saved to %s" % path)
 
     def test_save_both_writes_both_sections(self):
@@ -4296,7 +4296,7 @@ class Item7GuiTests(unittest.TestCase):
         bad = os.path.join(self.tmp.name, "no-such-dir", "out.txt")
         with self._save_dialog(bad):
             self.state["widgets"]["A"]["save"].click()
-        message = self.window.statusBar().currentMessage()
+        message = self.state["status_label"].text()
         self.assertTrue(message.startswith("Couldn't save to %s" % bad),
                         message)
         self.assertIn("No such file or directory", message)
@@ -4318,7 +4318,7 @@ class Item7GuiTests(unittest.TestCase):
                         side_effect=OSError("disk full")), \
                 self._save_dialog(path):
             self.state["widgets"]["A"]["save"].click()
-        message = self.window.statusBar().currentMessage()
+        message = self.state["status_label"].text()
         self.assertTrue(message.startswith("Couldn't save to %s" % path),
                         message)
         self.assertIn("disk full", message)
@@ -4590,7 +4590,7 @@ class Item9GuiTests(unittest.TestCase):
             "B -- You [task handoff]: "
             "Task result from Model A, for review.\n\n"
             "B -- fake-b:latest: beta three\n")
-        self.assertEqual(self.window.statusBar().currentMessage(),
+        self.assertEqual(self.state["status_label"].text(),
                          "Saved to %s" % path)
 
     def test_clear_removes_side_from_full_log(self):
@@ -5394,7 +5394,7 @@ class StartOllamaGuiTests(unittest.TestCase):
         # nothing left to start.
         self.assertTrue(self._wait_for(
             lambda: "Ollama connected" in
-            self.window.statusBar().currentMessage(), timeout=10))
+            self.state["status_label"].text(), timeout=10))
         self.assertFalse(self.state["start_ollama_btn"].isEnabled())
         self.assertFalse(self.state["ollama_manager"].running)
 
@@ -5408,7 +5408,7 @@ class StartOllamaGuiTests(unittest.TestCase):
         self.state["start_ollama_btn"].click()
         self.assertTrue(self._wait_for(
             lambda: "didn't start" in
-            self.window.statusBar().currentMessage(), timeout=10))
+            self.state["status_label"].text(), timeout=10))
         self.assertTrue(self.state["start_ollama_btn"].isVisible())
         self.assertTrue(self.state["start_ollama_btn"].isEnabled())
 
@@ -5587,7 +5587,7 @@ class DebugLogGuiTests(unittest.TestCase):
         self.assertIn("ollama", text.lower())
         self.assertIn("Recent actions", text)
         self.assertIn("DUO %s started" % APP_VERSION, text)
-        self.assertEqual(self.window.statusBar().currentMessage(),
+        self.assertEqual(self.state["status_label"].text(),
                          "Debug report saved to %s" % path)
 
     def test_debug_report_cancel_writes_nothing(self):
@@ -6224,7 +6224,7 @@ class KeyboardSendGuiTests(unittest.TestCase):
         self._pick_models()
         self.client.calls.clear()
         self._key_click(Qt.Key_Return, Qt.ControlModifier)
-        self.assertEqual(self.window.statusBar().currentMessage(),
+        self.assertEqual(self.state["status_label"].text(),
                          MSG_EMPTY)
         self.assertEqual(self.client.calls, [])
 
@@ -6629,7 +6629,7 @@ class WindowFinishGuiTests(unittest.TestCase):
                            side_effect=OSError("disk full")):
             self.state["pair_delete"].click()
         self.app.processEvents()
-        message = self.window.statusBar().currentMessage()
+        message = self.state["status_label"].text()
         self.assertTrue(
             message.startswith("Couldn't delete pair 'one'"), message)
         self.assertIn("disk full", message)
@@ -6656,7 +6656,7 @@ class FrontDoorTests(unittest.TestCase):
 
     def test_changelog_covers_every_version(self):
         log = self._read("CHANGELOG.md")
-        for version in ["0.%d" % n for n in range(1, 36)]:
+        for version in ["0.%d" % n for n in range(1, 37)]:
             self.assertIn(version, log)
 
     def test_gitignore_covers_runtime_files(self):
@@ -7177,7 +7177,7 @@ class ConversationGuiTests(unittest.TestCase):
         path = os.path.join(self.tmp.name, "saved.json")
         with self._save_dialog(path):
             self.state["save_convo"].click()
-        self.assertEqual(self.window.statusBar().currentMessage(),
+        self.assertEqual(self.state["status_label"].text(),
                          "Conversation saved to %s" % path)
         with open(path, encoding="utf-8") as fh:
             self.assertEqual(json.load(fh)["version"],
@@ -7228,7 +7228,7 @@ class ConversationGuiTests(unittest.TestCase):
                          "fake-b:latest")
         self.assertEqual(self.state["convo"].sides["A"].messages,
                          [ChatMessage("user", "hello", "You")])
-        message = self.window.statusBar().currentMessage()
+        message = self.state["status_label"].text()
         self.assertIn("not installed", message)
         self.assertIn("gone-model:latest", message)
 
@@ -7243,7 +7243,7 @@ class ConversationGuiTests(unittest.TestCase):
         self.app.processEvents()
         self._assert_snapshot(snap)
         self.assertIn("Couldn't open that file",
-                      self.window.statusBar().currentMessage())
+                      self.state["status_label"].text())
 
     def test_open_reject_keeps_current_conversation(self):
         from PySide6.QtWidgets import QMessageBox
@@ -7712,7 +7712,7 @@ class RelayPresetGuiTests(unittest.TestCase):
         return config
 
     def _status(self):
-        return self.window.statusBar().currentMessage()
+        return self.state["status_label"].text()
 
     def test_nothing_loaded_by_default(self):
         s = self.state
@@ -8191,7 +8191,7 @@ class TranscriptImportGuiTests(unittest.TestCase):
         return self._write_file(name, format_side_transcript(side))
 
     def _status(self):
-        return self.window.statusBar().currentMessage()
+        return self.state["status_label"].text()
 
     def test_import_button_present_and_enabled_when_idle(self):
         w = self.state["widgets"]["A"]
@@ -9240,7 +9240,7 @@ class UpdateCheckGuiTests(unittest.TestCase):
         return cond()
 
     def _message(self):
-        return self.window.statusBar().currentMessage()
+        return self.state["status_label"].text()
 
     def test_closing_while_a_check_runs_waits_for_it(self):
         # v0.31: destroying a running QThread aborts the whole
@@ -9905,6 +9905,28 @@ class MenuBarTextTests(unittest.TestCase):
                         "DEBUG REPORT", line,
                         "%s:%d: %s" % (path, number, line))
 
+    def test_no_timed_status_message_remains(self):
+        # v0.36 (audit T22): status notes are a permanent label
+        # now -- no timed showMessage call and no clearMessage
+        # call may remain in DUO's own code.
+        import glob
+        files = [os.path.join(self._tree(), "dual_chat.py"),
+                 os.path.join(self._tree(), "duo_menu.py")]
+        files += sorted(glob.glob(
+            os.path.join(self._tree(), "duo_*.py")))
+        files = [path for path in files
+                 if not path.endswith("debug_log.py")]
+        for path in files:
+            with open(path, encoding="utf-8") as fh:
+                lines = fh.readlines()
+            for number, line in enumerate(lines, start=1):
+                self.assertNotIn(
+                    ".showMessage(", line,
+                    "%s:%d: %s" % (path, number, line))
+                self.assertNotIn(
+                    ".clearMessage(", line,
+                    "%s:%d: %s" % (path, number, line))
+
 
 @unittest.skipUnless(os.environ.get("DUAL_CHAT_GUI_TESTS") == "1",
                      "GUI tests run with DUAL_CHAT_GUI_TESTS=1")
@@ -10166,7 +10188,7 @@ class MenuBarGuiTests(unittest.TestCase):
     def test_check_for_updates_menu_item_reports_latest(self):
         self.state["menu_actions"]["check_updates"].trigger()
         self.assertTrue(self._wait_for(
-            lambda: self.window.statusBar().currentMessage()
+            lambda: self.state["status_label"].text()
             == MSG_UPDATE_LATEST, timeout=10))
 
     def test_quit_menu_item_closes_the_window(self):
@@ -10963,6 +10985,92 @@ class RelayChipGuiTests(unittest.TestCase):
         self.assertTrue(self._wait_for_relay_stopped())
         self.assertIn("stopped by you",
                       self.state["relay_status"].text())
+
+
+# ---------------------------------------------------------------------------
+# Persistent status messages (v0.36, audit T22)
+
+@unittest.skipUnless(os.environ.get("DUAL_CHAT_GUI_TESTS") == "1",
+                     "GUI tests run with DUAL_CHAT_GUI_TESTS=1")
+class PersistentStatusGuiTests(unittest.TestCase):
+    """v0.36 (audit T22): status-bar notes persist until the next
+    note replaces them -- a note set now is still there six seconds
+    later, past every old timeout. The update check is stubbed, as
+    in MenuBarGuiTests, so no test touches the network."""
+
+    @classmethod
+    def setUpClass(cls):
+        from PySide6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+        cls.client = FakeGuiClient()
+
+    def setUp(self):
+        from dual_chat import build_window
+        self._patcher = mock.patch(
+            "dual_chat.check_for_update",
+            return_value=("latest", None))
+        self._patcher.start()
+        self.client.reset()
+        self.window = build_window(self.client, logger=TEST_LOGGER)
+        self.window.show()
+        self.state = self.window._dual_chat
+        self._wait_for(lambda: self.state["widgets"]["A"]["picker"].count() == 2)
+
+    def tearDown(self):
+        self.window.close()
+        self.app.processEvents()
+        self._patcher.stop()
+
+    def _wait_for(self, cond, timeout=10.0):
+        from PySide6.QtTest import QTest
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            QTest.qWait(50)
+            if cond():
+                return True
+        return cond()
+
+    def _note(self):
+        return self.state["status_label"].text()
+
+    def test_update_note_still_there_after_six_seconds(self):
+        # The real path: a manual update check writes its note,
+        # and it is still showing six seconds later -- past the
+        # old 3-5 second timeouts.
+        self.state["update_btn"].click()
+        self.assertTrue(self._wait_for(
+            lambda: self._note() == "You're on the latest version.",
+            timeout=10))
+        from PySide6.QtTest import QTest
+        QTest.qWait(6000)
+        self.assertEqual(self._note(), "You're on the latest version.")
+
+    def test_second_note_replaces_first(self):
+        self.state["set_status_message"]("First note.")
+        self.assertEqual(self._note(), "First note.")
+        self.state["set_status_message"]("Second note.")
+        self.assertEqual(self._note(), "Second note.")
+
+    def test_clearing_the_note_empties_the_label(self):
+        self.state["set_status_message"]("Something happened.")
+        self.assertEqual(self._note(), "Something happened.")
+        self.state["set_status_message"]("")
+        self.assertEqual(self._note(), "")
+
+    def test_meter_still_updates_while_a_note_persists(self):
+        import re
+        self.state["set_status_message"]("Holding still.")
+        pattern = r"CPU \d+% · RAM [\d.]+ / [\d.]+ (GB|MB)"
+        self.assertTrue(self._wait_for(
+            lambda: re.match(pattern,
+                             self.state["meter_label"].text()) is not None,
+            timeout=10),
+            self.state["meter_label"].text())
+        from PySide6.QtTest import QTest
+        QTest.qWait(2000)
+        self.assertEqual(self._note(), "Holding still.")
+        self.assertIsNotNone(re.match(
+            pattern, self.state["meter_label"].text()))
 
 
 if __name__ == "__main__":

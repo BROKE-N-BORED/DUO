@@ -1,7 +1,15 @@
 # DUO changelog
 
 Every version, newest first. v0.1–v0.17 were built on 2026-11-12;
-v0.18–v0.35 on 2026-11-13.
+v0.18–v0.35 on 2026-11-13; v0.36 on 2026-11-14.
+
+## v0.36 — 2026-11-14
+
+Status-bar notes stay now. They used to vanish after three to five
+seconds, so looking away meant missing them — now a note stays
+until the next note replaces it. The words are all the same, and
+the CPU/RAM meter on the right of the bar keeps updating as
+before.
 
 ## v0.35 — 2026-11-13
 
