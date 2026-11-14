@@ -212,11 +212,13 @@ bash run.sh
   system-prompt field for that side. Whatever you type there is sent
   as the system message for that model on every turn. Leave it empty
   for no system message.
-- Pairs: the Pair row saves the current setup — both models plus both
-  instruction fields — under a name, and loads it back from the
-  dropdown. Pairs live in duo-pairs.json next to the app. Nothing is
-  saved or loaded unless you ask for it. Delete pair removes the
-  selected pair, after asking first.
+- Pairs: the Pair row saves the current setup — both models, both
+  temperatures, and both instruction fields — under a name, and
+  loads it back from the dropdown. Hovering over a saved pair (or
+  a relay preset) shows what loading it would set. Pairs live in
+  duo-pairs.json next to the app. Nothing is saved or loaded unless
+  you ask for it. Delete pair removes the selected pair, after
+  asking first.
 - Compare: after Send to Both, each pane gets a Use this button. Tap
   it and that reply is sent to the other side ("You picked this
   answer: ...") so the conversation continues from the better answer.

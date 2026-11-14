@@ -91,12 +91,13 @@ HOW_TO_USE_SECTIONS = (
      "transcript back into one pane. Search finds words in a "
      "pane."),
     ("Saved pairs and relay presets",
-     "A saved pair remembers which model goes in each pane, so "
-     "you can pick both at once. A relay preset remembers the "
-     "whole relay row: start side, mode, turn cap, stop words, "
-     "and the two checkboxes. Name a pair or preset, save it, "
-     "and pick it from the dropdown later. Nothing loads by "
-     "itself."),
+     "A saved pair remembers the whole setup for both panes: which "
+     "model goes in each pane, each side's temperature, and each "
+     "side's instructions, so you can pick both at once. A relay "
+     "preset remembers the whole relay row: start side, mode, turn "
+     "cap, stop words, and the two checkboxes. Name a pair or "
+     "preset, save it, and pick it from the dropdown later. Nothing "
+     "loads by itself."),
     ("The phone deck",
      "Phone deck shows a QR code for your phone. Scan it on your "
      "home WiFi and your phone gets a small page where you can "

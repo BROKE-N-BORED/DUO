@@ -228,9 +228,10 @@ from duo_stats import (
 from duo_storage import (
     CONVERSATION_FORMAT_VERSION, ConversationError, conversation_to_data,
     data_to_conversation, delete_pair, delete_preset, is_valid_preset,
-    load_conversation_file, load_pairs, load_presets, pairs_path,
-    presets_file_corrupt, presets_path, save_conversation_file, save_pair,
-    save_preset, write_text_atomic,)
+    load_conversation_file, load_pairs, load_presets, pair_tooltip,
+    pairs_path, preset_tooltip, presets_file_corrupt, presets_path,
+    save_conversation_file, save_pair, save_preset, valid_temperature,
+    write_text_atomic,)
 from duo_tasks import (
     TASK_CONTINUE_TEMPLATE, TASK_FOLLOW_UPS, TASK_REVIEW_TEMPLATE,
     TASK_REVISE_TEMPLATE, TASK_ROUNDS_DEFAULT, TASK_ROUNDS_MAX,
@@ -311,7 +312,7 @@ def make_debug_logger(log_dir=None):
         return _NullLogger()
 
 APP_NAME = "DUO"
-APP_VERSION = "0.40"
+APP_VERSION = "0.41"
 
 # Plain-language messages shown in the panes. No tracebacks in the UI.
 MSG_STOPPED = "Stopped."
@@ -3150,7 +3151,12 @@ def build_window(client=None, logger=None, deck_port=None):
         pair_combo.blockSignals(True)
         pair_combo.clear()
         names = sorted(pairs)
-        pair_combo.addItems(names)
+        for index, name in enumerate(names):
+            pair_combo.addItem(name)
+            # Hovering shows what loading this pair would set (v0.41,
+            # R6): models, temperatures, instructions preview.
+            pair_combo.setItemData(index, pair_tooltip(pairs[name]),
+                                   QtCore.Qt.ToolTipRole)
         if select in names:
             pair_combo.setCurrentIndex(names.index(select))
         else:
@@ -3169,6 +3175,8 @@ def build_window(client=None, logger=None, deck_port=None):
         setup = {
             "model_a": convo.sides["A"].model,
             "model_b": convo.sides["B"].model,
+            "temperature_a": widgets["A"]["temperature"].value(),
+            "temperature_b": widgets["B"]["temperature"].value(),
             "instruction_a": widgets["A"]["instr_edit"].toPlainText(),
             "instruction_b": widgets["B"]["instr_edit"].toPlainText(),
         }
@@ -3202,10 +3210,18 @@ def build_window(client=None, logger=None, deck_port=None):
                 picker.setCurrentIndex(found)
             else:
                 missing.append(model)
-        widgets["A"]["instr_edit"].setPlainText(
-            setup.get("instruction_a") or "")
-        widgets["B"]["instr_edit"].setPlainText(
-            setup.get("instruction_b") or "")
+        # Temperatures and instructions follow the pair too (v0.41,
+        # R6). A key missing from an old pair leaves the current value
+        # alone -- only keys the pair actually has are applied, so a
+        # pair saved before temperatures were stored can't reset them.
+        for side, tkey, ikey in (
+                ("A", "temperature_a", "instruction_a"),
+                ("B", "temperature_b", "instruction_b")):
+            temp = valid_temperature(setup.get(tkey))
+            if temp is not None:
+                widgets[side]["temperature"].setValue(temp)
+            if isinstance(setup.get(ikey), str):
+                widgets[side]["instr_edit"].setPlainText(setup[ikey])
         if missing:
             set_status_message(
                 "Pair '%s' loaded, but not installed: %s."
@@ -3259,7 +3275,11 @@ def build_window(client=None, logger=None, deck_port=None):
         preset_combo.blockSignals(True)
         preset_combo.clear()
         names = sorted(presets)
-        preset_combo.addItems(names)
+        for index, name in enumerate(names):
+            preset_combo.addItem(name)
+            # Hovering shows the six relay fields this preset sets.
+            preset_combo.setItemData(index, preset_tooltip(presets[name]),
+                                     QtCore.Qt.ToolTipRole)
         if select in names:
             preset_combo.setCurrentIndex(names.index(select))
         else:

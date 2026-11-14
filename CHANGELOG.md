@@ -1,7 +1,19 @@
 # DUO changelog
 
 Every version, newest first. v0.1–v0.17 were built on 2026-11-12;
-v0.18–v0.35 on 2026-11-13; v0.36–v0.40 on 2026-11-14.
+v0.18–v0.35 on 2026-11-13; v0.36–v0.41 on 2026-11-14.
+
+## v0.41 — 2026-11-14
+
+Saved pairs carry the whole setup now. A pair used to remember
+only the two models (and the instructions); it now remembers each
+side's temperature too, so loading a pair puts the whole setup
+back exactly as it was. Pairs saved before this version still
+load fine: anything the old pair doesn't hold is left exactly as
+it is, never reset. And picking a pair or a relay preset is no
+longer a blind commit — hovering over one shows what loading it
+would set: both models, both temperatures, and a preview of the
+instructions for a pair; all six relay fields for a preset.
 
 ## v0.40 — 2026-11-14
 

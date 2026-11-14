@@ -78,16 +78,16 @@ from dual_chat import (  # noqa: E402
     make_debug_logger,
     markdown_to_html,
     model_fits,
-    pairs_path, parse_cpu_times, parse_meminfo,
+    pair_tooltip, pairs_path, parse_cpu_times, parse_meminfo,
     parse_ollama_list_output, parse_ps_payload,
     parse_side_transcript, parse_stop_phrases, parse_tags_payload,
     parse_tags_sizes, parse_version, phrase_matches,
-    presets_file_corrupt, presets_path,
+    preset_tooltip, presets_file_corrupt, presets_path,
     read_system_meter, read_total_ram,
     render_qr_pixmap,
     sanitize_filename_part,
     save_conversation_file, save_pair, save_preset,
-    write_text_atomic,
+    valid_temperature, write_text_atomic,
 )
 
 # One shared debug logger for the GUI tests, writing to a temp dir so
@@ -1790,6 +1790,62 @@ class PairsTests(unittest.TestCase):
                      if n.startswith(".duo-pairs-")]
         self.assertEqual(leftovers, [])
 
+    def test_valid_temperature(self):
+        # v0.41 (redesign R6): only real numbers load as temperatures.
+        # A hand-edited pairs file can hold anything; the loader must
+        # never hand the spinbox a value it can't take.
+        self.assertEqual(valid_temperature(0.3), 0.3)
+        self.assertEqual(valid_temperature(1), 1.0)
+        self.assertEqual(valid_temperature(2.0), 2.0)
+        for bad in (None, "0.7", True, float("nan"), float("inf"),
+                    float("-inf"), [0.7]):
+            self.assertIsNone(valid_temperature(bad))
+
+    def test_pair_tooltip_shows_both_sides(self):
+        # v0.41 (redesign R6): hovering a pair shows what loading it
+        # would set -- both models, both temperatures, and the
+        # instructions preview. No em-dash: tooltips are visible UI.
+        setup = {"model_a": "fake-a:latest", "model_b": "fake-b:latest",
+                 "temperature_a": 0.3, "temperature_b": 1.4,
+                 "instruction_a": "Be brief.",
+                 "instruction_b": "Be thorough."}
+        self.assertEqual(pair_tooltip(setup), (
+            "Model A: fake-a:latest, temperature 0.3\n"
+            "Instructions: Be brief.\n"
+            "Model B: fake-b:latest, temperature 1.4\n"
+            "Instructions: Be thorough."))
+        self.assertNotIn("\u2014", pair_tooltip(setup))
+
+    def test_pair_tooltip_old_format_says_unchanged(self):
+        # A pair saved before temperatures were stored: the missing
+        # keys read as "unchanged", never as a reset.
+        text = pair_tooltip({"model_a": "fake-a:latest",
+                             "model_b": "fake-b:latest"})
+        self.assertEqual(text, (
+            "Model A: fake-a:latest, temperature unchanged\n"
+            "Instructions: unchanged\n"
+            "Model B: fake-b:latest, temperature unchanged\n"
+            "Instructions: unchanged"))
+        self.assertNotIn("\u2014", text)
+
+    def test_pair_tooltip_truncates_long_instructions(self):
+        text = pair_tooltip({"model_a": "a", "model_b": None,
+                             "temperature_a": 0.7, "temperature_b": 0.7,
+                             "instruction_a": "x" * 80,
+                             "instruction_b": ""})
+        self.assertIn("Instructions: " + "x" * 60 + "...", text)
+        self.assertIn("Model B: no model picked, temperature 0.7", text)
+        self.assertIn("Instructions: no instructions", text)
+        self.assertNotIn("\u2014", text)
+
+    def test_pair_tooltip_garbage_temperature_says_unchanged(self):
+        text = pair_tooltip({"model_a": "a", "model_b": "b",
+                             "temperature_a": "hot",
+                             "temperature_b": float("nan"),
+                             "instruction_a": "", "instruction_b": ""})
+        self.assertIn("Model A: a, temperature unchanged", text)
+        self.assertIn("Model B: b, temperature unchanged", text)
+
 
 class RelayPresetTests(unittest.TestCase):
     def setUp(self):
@@ -1947,6 +2003,29 @@ class RelayPresetTests(unittest.TestCase):
         leftovers = [n for n in os.listdir(self.tmp.name)
                      if n.startswith(".duo-presets-")]
         self.assertEqual(leftovers, [])
+
+    def test_preset_tooltip_shows_all_six_fields(self):
+        # v0.41 (redesign R6): hovering a preset shows the whole row
+        # it would restore, one short line per field. No em-dash:
+        # tooltips are visible UI.
+        self.assertEqual(preset_tooltip(self.config), (
+            "Start with: B\n"
+            "Mode: Aware\n"
+            "Turns: 3\n"
+            "Stop on: banana, stop now\n"
+            "Stop on agreement: yes\n"
+            "Review each hop: no"))
+        self.assertNotIn("\u2014", preset_tooltip(self.config))
+
+    def test_preset_tooltip_empty_stop_phrases(self):
+        config = dict(self.config, mode="blind", stop_phrases=[],
+                      stop_on_agreement=False, review_each_hop=True)
+        text = preset_tooltip(config)
+        self.assertIn("Mode: Blind", text)
+        self.assertIn("Stop on: none", text)
+        self.assertIn("Stop on agreement: no", text)
+        self.assertIn("Review each hop: yes", text)
+        self.assertNotIn("\u2014", text)
 
 
 # ---------------------------------------------------------------------------
@@ -2217,6 +2296,11 @@ class DirectorGuiTests(unittest.TestCase):
     def test_pairs_save_load_round_trip(self):
         self.state["widgets"]["A"]["instr_edit"].setPlainText("Be brief.")
         self.state["widgets"]["B"]["instr_edit"].setPlainText("Be thorough.")
+        # v0.41 (redesign R6): temperatures follow the pair too.
+        # Set them explicitly: QSettings persists them between tests,
+        # so the saved values must not depend on test order.
+        self.state["widgets"]["A"]["temperature"].setValue(0.3)
+        self.state["widgets"]["B"]["temperature"].setValue(1.4)
         self.state["pair_name"].setText("work pair")
         self.state["pair_save"].click()
         self.app.processEvents()
@@ -2224,6 +2308,7 @@ class DirectorGuiTests(unittest.TestCase):
             on_disk = json.load(fh)
         self.assertEqual(on_disk, {"pairs": {"work pair": {
             "model_a": "fake-a:latest", "model_b": "fake-b:latest",
+            "temperature_a": 0.3, "temperature_b": 1.4,
             "instruction_a": "Be brief.",
             "instruction_b": "Be thorough."}}})
         combo = self.state["pair_combo"]
@@ -2232,6 +2317,8 @@ class DirectorGuiTests(unittest.TestCase):
         # Change everything, then load the pair back from the dropdown.
         self.state["widgets"]["A"]["picker"].setCurrentIndex(1)
         self.state["widgets"]["B"]["picker"].setCurrentIndex(0)
+        self.state["widgets"]["A"]["temperature"].setValue(1.9)
+        self.state["widgets"]["B"]["temperature"].setValue(0.1)
         self.state["widgets"]["A"]["instr_edit"].setPlainText("")
         self.state["widgets"]["B"]["instr_edit"].setPlainText("")
         self.app.processEvents()
@@ -2242,6 +2329,10 @@ class DirectorGuiTests(unittest.TestCase):
         self.assertEqual(convo.sides["A"].model, "fake-a:latest")
         self.assertEqual(convo.sides["B"].model, "fake-b:latest")
         self.assertEqual(
+            self.state["widgets"]["A"]["temperature"].value(), 0.3)
+        self.assertEqual(
+            self.state["widgets"]["B"]["temperature"].value(), 1.4)
+        self.assertEqual(
             self.state["widgets"]["A"]["instr_edit"].toPlainText(),
             "Be brief.")
         self.assertEqual(
@@ -2250,14 +2341,23 @@ class DirectorGuiTests(unittest.TestCase):
         # Re-picking the pair that is already selected still loads it:
         # change the setup again and activate the same dropdown item.
         self.state["widgets"]["A"]["picker"].setCurrentIndex(1)
+        self.state["widgets"]["A"]["temperature"].setValue(2.0)
         self.state["widgets"]["A"]["instr_edit"].setPlainText("Changed.")
         self.app.processEvents()
         combo.activated.emit(0)
         self.app.processEvents()
         self.assertEqual(convo.sides["A"].model, "fake-a:latest")
         self.assertEqual(
+            self.state["widgets"]["A"]["temperature"].value(), 0.3)
+        self.assertEqual(
             self.state["widgets"]["A"]["instr_edit"].toPlainText(),
             "Be brief.")
+        # Leave the persisted temperatures at the defaults, so no
+        # later test inherits this test's values.
+        self.state["widgets"]["A"]["temperature"].setValue(
+            TEMPERATURE_DEFAULT)
+        self.state["widgets"]["B"]["temperature"].setValue(
+            TEMPERATURE_DEFAULT)
 
     def test_pairs_nothing_loaded_by_default(self):
         save_pair(self.pairs_file, "work pair",
@@ -6672,7 +6772,7 @@ class FrontDoorTests(unittest.TestCase):
 
     def test_changelog_covers_every_version(self):
         log = self._read("CHANGELOG.md")
-        for version in ["0.%d" % n for n in range(1, 41)]:
+        for version in ["0.%d" % n for n in range(1, 42)]:
             self.assertIn(version, log)
 
     def test_gitignore_covers_runtime_files(self):
@@ -12169,6 +12269,202 @@ class PaneIdentityGuiTests(unittest.TestCase):
             self.assertNotIn(color, text)
         self.assertNotIn("color:", text)
         self.assertIn("fake-a:latest:", text)
+
+
+# ---------------------------------------------------------------------------
+# Pair settings GUI tests (offscreen)
+# ---------------------------------------------------------------------------
+
+@unittest.skipUnless(os.environ.get("DUAL_CHAT_GUI_TESTS") == "1",
+                     "GUI tests run with DUAL_CHAT_GUI_TESTS=1")
+class PairSettingsGuiTests(unittest.TestCase):
+    """v0.41 (redesign R6): saved pairs carry the whole setup --
+    models, temperatures, and instructions -- and hovering a pair
+    or a relay preset shows what loading it would set."""
+
+    @classmethod
+    def setUpClass(cls):
+        from PySide6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+        cls.client = FakeGuiClient()
+
+    def setUp(self):
+        # Temperatures are persisted per side, so clear both before
+        # every window: each test starts from the default (0.7).
+        self._clear_temperatures()
+        from dual_chat import build_window
+        self.client.reset()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.pairs_file = os.path.join(self.tmp.name, "duo-pairs.json")
+        self.presets_file = os.path.join(self.tmp.name,
+                                         "duo-relay-presets.json")
+        self._env = mock.patch.dict(os.environ, {
+            "DUAL_CHAT_PAIRS_FILE": self.pairs_file,
+            "DUAL_CHAT_PRESETS_FILE": self.presets_file})
+        self._env.start()
+        self.window = build_window(self.client, logger=TEST_LOGGER)
+        self.window.show()
+        self.state = self.window._dual_chat
+        self._wait_for(lambda: self.state["widgets"]["A"]["picker"].count() == 2)
+        self._pick_models()
+
+    def tearDown(self):
+        self.window.close()
+        self._env.stop()
+        self.tmp.cleanup()
+        self._clear_temperatures()
+
+    def _clear_temperatures(self):
+        from PySide6.QtCore import QSettings
+        settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
+        settings.remove(SETTING_TEMPERATURE % "A")
+        settings.remove(SETTING_TEMPERATURE % "B")
+        settings.sync()
+
+    def _wait_for(self, cond, timeout=10.0):
+        from PySide6.QtTest import QTest
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            QTest.qWait(50)
+            if cond():
+                return True
+        return cond()
+
+    def _pick_models(self):
+        self.state["widgets"]["A"]["picker"].setCurrentIndex(0)
+        self.state["widgets"]["B"]["picker"].setCurrentIndex(1)
+        self.app.processEvents()
+
+    def _temp(self, side):
+        return self.state["widgets"][side]["temperature"].value()
+
+    def _instr(self, side):
+        return self.state["widgets"][side]["instr_edit"].toPlainText()
+
+    def _set_setup(self, temp_a, temp_b, instr_a, instr_b):
+        self.state["widgets"]["A"]["temperature"].setValue(temp_a)
+        self.state["widgets"]["B"]["temperature"].setValue(temp_b)
+        self.state["widgets"]["A"]["instr_edit"].setPlainText(instr_a)
+        self.state["widgets"]["B"]["instr_edit"].setPlainText(instr_b)
+        self.app.processEvents()
+
+    def _tooltip(self, combo, index):
+        from PySide6.QtCore import Qt
+        return combo.itemData(index, Qt.ToolTipRole)
+
+    def test_save_captures_temperatures_and_instructions(self):
+        self._set_setup(0.3, 1.4, "Be brief.", "Be thorough.")
+        self.state["pair_name"].setText("work pair")
+        self.state["pair_save"].click()
+        self.app.processEvents()
+        with open(self.pairs_file, "r", encoding="utf-8") as fh:
+            on_disk = json.load(fh)
+        self.assertEqual(on_disk, {"pairs": {"work pair": {
+            "model_a": "fake-a:latest", "model_b": "fake-b:latest",
+            "temperature_a": 0.3, "temperature_b": 1.4,
+            "instruction_a": "Be brief.",
+            "instruction_b": "Be thorough."}}})
+
+    def test_load_restores_temperatures_and_instructions(self):
+        save_pair(self.pairs_file, "work pair",
+                  {"model_a": "fake-a:latest", "model_b": "fake-b:latest",
+                   "temperature_a": 0.3, "temperature_b": 1.4,
+                   "instruction_a": "Be brief.",
+                   "instruction_b": "Be thorough."})
+        self.state["refresh_pair_combo"]()
+        # Change everything, then load the pair from the dropdown.
+        self.state["widgets"]["A"]["picker"].setCurrentIndex(1)
+        self.state["widgets"]["B"]["picker"].setCurrentIndex(0)
+        self._set_setup(1.9, 0.1, "", "")
+        combo = self.state["pair_combo"]
+        combo.setCurrentIndex(0)
+        self.app.processEvents()
+        convo = self.state["convo"]
+        self.assertEqual(convo.sides["A"].model, "fake-a:latest")
+        self.assertEqual(convo.sides["B"].model, "fake-b:latest")
+        self.assertEqual(self._temp("A"), 0.3)
+        self.assertEqual(self._temp("B"), 1.4)
+        self.assertEqual(self._instr("A"), "Be brief.")
+        self.assertEqual(self._instr("B"), "Be thorough.")
+        self.assertIn("Pair 'work pair' loaded.",
+                      self.state["status_label"].text())
+
+    def test_old_format_pair_leaves_settings_alone(self):
+        # A pair saved before temperatures were stored holds models
+        # only. Loading it restores the models and leaves the current
+        # temperatures and instructions exactly as they are -- it
+        # must not reset them to defaults or blank them.
+        with open(self.pairs_file, "w", encoding="utf-8") as fh:
+            json.dump({"pairs": {"old pair": {
+                "model_a": "fake-a:latest",
+                "model_b": "fake-b:latest"}}}, fh)
+        self.state["refresh_pair_combo"]()
+        self.state["widgets"]["A"]["picker"].setCurrentIndex(1)
+        self.state["widgets"]["B"]["picker"].setCurrentIndex(0)
+        self._set_setup(1.9, 0.1, "Keep me.", "Keep me too.")
+        self.state["pair_combo"].setCurrentIndex(0)
+        self.app.processEvents()
+        convo = self.state["convo"]
+        self.assertEqual(convo.sides["A"].model, "fake-a:latest")
+        self.assertEqual(convo.sides["B"].model, "fake-b:latest")
+        self.assertEqual(self._temp("A"), 1.9)
+        self.assertEqual(self._temp("B"), 0.1)
+        self.assertEqual(self._instr("A"), "Keep me.")
+        self.assertEqual(self._instr("B"), "Keep me too.")
+
+    def test_missing_model_still_restores_settings(self):
+        # A pair whose model is no longer installed: the plain note
+        # still appears, and the temperatures and instructions for
+        # that side still restore -- they don't depend on the model.
+        save_pair(self.pairs_file, "gone pair",
+                  {"model_a": "gone-model:latest",
+                   "model_b": "fake-b:latest",
+                   "temperature_a": 0.3, "temperature_b": 1.4,
+                   "instruction_a": "Be brief.",
+                   "instruction_b": "Be thorough."})
+        self.state["refresh_pair_combo"]()
+        self._set_setup(1.9, 0.1, "", "")
+        self.state["pair_combo"].setCurrentIndex(0)
+        self.app.processEvents()
+        self.assertIn("not installed: gone-model:latest",
+                      self.state["status_label"].text())
+        self.assertEqual(self._temp("A"), 0.3)
+        self.assertEqual(self._temp("B"), 1.4)
+        self.assertEqual(self._instr("A"), "Be brief.")
+        self.assertEqual(self._instr("B"), "Be thorough.")
+        self.assertEqual(self.state["convo"].sides["B"].model,
+                         "fake-b:latest")
+
+    def test_pair_tooltip_shows_what_loading_would_set(self):
+        save_pair(self.pairs_file, "work pair",
+                  {"model_a": "fake-a:latest", "model_b": "fake-b:latest",
+                   "temperature_a": 0.3, "temperature_b": 1.4,
+                   "instruction_a": "Be brief.",
+                   "instruction_b": "Be thorough."})
+        self.state["refresh_pair_combo"]()
+        text = self._tooltip(self.state["pair_combo"], 0)
+        self.assertEqual(text, (
+            "Model A: fake-a:latest, temperature 0.3\n"
+            "Instructions: Be brief.\n"
+            "Model B: fake-b:latest, temperature 1.4\n"
+            "Instructions: Be thorough."))
+        self.assertNotIn("\u2014", text)
+
+    def test_preset_tooltip_shows_all_six_fields(self):
+        save_preset(self.presets_file, "debate",
+                    {"start_side": "B", "mode": "aware", "turn_cap": 3,
+                     "stop_phrases": ["banana", "stop now"],
+                     "stop_on_agreement": True, "review_each_hop": False})
+        self.state["refresh_preset_combo"]()
+        text = self._tooltip(self.state["preset_combo"], 0)
+        self.assertEqual(text, (
+            "Start with: B\n"
+            "Mode: Aware\n"
+            "Turns: 3\n"
+            "Stop on: banana, stop now\n"
+            "Stop on agreement: yes\n"
+            "Review each hop: no"))
+        self.assertNotIn("\u2014", text)
 
 
 if __name__ == "__main__":

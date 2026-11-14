@@ -8,6 +8,7 @@ does, so the paths are unchanged.
 """
 
 import json
+import math
 import os
 import tempfile
 
@@ -64,10 +65,12 @@ def load_pairs(path):
 def save_pair(path, name, setup):
     """Save one pair (creating or overwriting it) in the JSON file.
 
-    A setup is {"model_a", "model_b", "instruction_a",
-    "instruction_b"}; models may be None when nothing is picked.
-    The write is atomic: a failed save leaves the previous file
-    intact and raises the OSError.
+    A setup is {"model_a", "model_b", "temperature_a",
+    "temperature_b", "instruction_a", "instruction_b"}; models may
+    be None when nothing is picked. Old pairs hold models and
+    instructions only -- a missing key means "not in this pair" and
+    loading leaves that value alone. The write is atomic: a failed
+    save leaves the previous file intact and raises the OSError.
     """
     pairs = load_pairs(path)
     pairs[name] = setup
@@ -88,6 +91,70 @@ def delete_pair(path, name):
     text = json.dumps({"pairs": pairs}, indent=2, sort_keys=True) + "\n"
     write_text_atomic(path, text, prefix=".duo-pairs-")
     return True
+
+
+def valid_temperature(value):
+    """A stored temperature as a float, or None when the value is
+    missing, mistyped, or not a finite number. A hand-edited pairs
+    file can hold anything, and the spinbox only takes real numbers;
+    the spinbox itself clamps to its 0.0-2.0 range on load."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if not math.isfinite(value):
+        return None
+    return float(value)
+
+
+# Hover previews (v0.41, redesign R6): what loading a pair or a
+# relay preset would set, shown as the dropdown item's tooltip, so
+# picking one is never a blind commit. Plain words, no em-dashes.
+PAIR_TOOLTIP_PREVIEW_CHARS = 60
+
+
+def pair_tooltip(setup):
+    """What loading this pair would set, as tooltip text: both sides'
+    model, temperature, and instructions preview. A key the pair
+    doesn't have (an old pair, saved before temperatures were
+    stored) reads as "unchanged" -- loading it leaves that value
+    alone. A model of None means nothing was picked when the pair
+    was saved. The instructions preview is the first 60 characters,
+    flattened to one line, with "..." when there is more."""
+    lines = []
+    for side, label in (("a", "Model A"), ("b", "Model B")):
+        model = setup.get("model_%s" % side)
+        temp = valid_temperature(setup.get("temperature_%s" % side))
+        lines.append("%s: %s, temperature %s" % (
+            label, model or "no model picked",
+            temp if temp is not None else "unchanged"))
+        key = "instruction_%s" % side
+        if key not in setup or not isinstance(setup[key], str):
+            lines.append("Instructions: unchanged")
+        elif not setup[key].strip():
+            lines.append("Instructions: no instructions")
+        else:
+            flat = " ".join(setup[key].split())
+            if len(flat) > PAIR_TOOLTIP_PREVIEW_CHARS:
+                flat = flat[:PAIR_TOOLTIP_PREVIEW_CHARS] + "..."
+            lines.append("Instructions: %s" % flat)
+    return "\n".join(lines)
+
+
+def preset_tooltip(config):
+    """What loading this relay preset would set, as tooltip text:
+    all six relay fields, one short line each. The config comes
+    from load_presets, so the fields are already validated."""
+    phrases = config.get("stop_phrases") or []
+    lines = [
+        "Start with: %s" % config.get("start_side"),
+        "Mode: %s" % ("Aware" if config.get("mode") == "aware" else "Blind"),
+        "Turns: %s" % config.get("turn_cap"),
+        "Stop on: %s" % (", ".join(phrases) if phrases else "none"),
+        "Stop on agreement: %s" % (
+            "yes" if config.get("stop_on_agreement") else "no"),
+        "Review each hop: %s" % (
+            "yes" if config.get("review_each_hop") else "no"),
+    ]
+    return "\n".join(lines)
 
 
 def presets_path():
