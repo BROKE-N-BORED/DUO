@@ -54,6 +54,16 @@ Reduced motion makes the toggle instant, like the dip. The
 Relay/Pairs/Tasks section toggles stay instant by design: R8 is
 the Director toggle only, the one that moves the whole window.
 
+Theme colors (v0.51): the code-block background, the focus tint,
+and both search highlight colors are derived from the actual
+palette at runtime instead of hardcoded light values -- on a dark
+theme the hardcoded #f0f0f0 code background and #e8f0fe focus tint
+made white text invisible (his photos 2026-11-15, confirmed by
+the user drive 2026-11-16). Light themes keep the exact values
+they always had; dark themes get colors mixed from the palette's
+own Base, so text stays readable. The colors are read once at
+window build; a theme change mid-run needs a restart.
+
 PySide6 is imported lazily inside the functions (the duo_menu.py /
 duo_workers.py precedent), so this module -- and dual_chat.py,
 which imports it -- still import cleanly on a machine without
@@ -71,9 +81,21 @@ DIP_RELEASE_MS = 75
 COMPLETION_FLASH_COLOR = "#a3e635"
 COMPLETION_FLASH_MS = 200
 # Focus ring (entry 023): the ring color (side A's blue, already in
-# the palette) and the light tint a focused field gets.
+# the palette) and the light tint a focused field gets. The tint is
+# the LIGHT value; dark themes get their tint from theme_colors().
 FOCUS_RING_COLOR = "#2563eb"
 FOCUS_RING_TINT = "#e8f0fe"
+# Theme colors (v0.51): the light-theme values for the code-block
+# background, the focus tint, and both search highlight colors.
+# These are the values DUO always used -- a light theme keeps them
+# exactly. A dark theme derives its own from the palette instead
+# (theme_colors), so white text never lands on a near-white field.
+_LIGHT_THEME_COLORS = {
+    "code_bg": "#f0f0f0",
+    "focus_tint": "#e8f0fe",
+    "search_bg": "#ffff00",
+    "search_current_bg": "#ffa500",
+}
 # Reduced motion: the QSettings key, default off.
 SETTING_REDUCED_MOTION = "motion/reduced"
 # Director spring (entry 002): the toggle's expand/collapse
@@ -93,23 +115,97 @@ QWIDGETSIZE_MAX = 16777215
 # The focus ring, one rule per focusable widget class. Only :focus
 # selectors: nothing here touches an unfocused widget, so the
 # native look survives untouched (probed: zero differing pixels).
-FOCUS_RING_STYLESHEET = (
-    "QPushButton:focus { border: 2px solid %s; "
-    "background-color: %s; }\n"
-    "QTextEdit:focus { border: 2px solid %s; "
-    "background-color: %s; }\n"
-    "QPlainTextEdit:focus { border: 2px solid %s; "
-    "background-color: %s; }\n"
-    "QLineEdit:focus { border: 2px solid %s; "
-    "background-color: %s; }\n"
-    "QComboBox:focus { border: 2px solid %s; "
-    "background-color: %s; }\n"
-    "QSpinBox:focus, QDoubleSpinBox:focus { border: 2px solid %s; "
-    "background-color: %s; }\n"
-    "QListWidget:focus { border: 2px solid %s; "
-    "background-color: %s; }\n"
-    % ((FOCUS_RING_COLOR, FOCUS_RING_TINT) * 7)
-)
+# Built by _focus_ring_sheet so the runtime sheet (dark tint on a
+# dark theme) and the light constant below come from one template.
+def _focus_ring_sheet(ring, tint):
+    return (
+        "QPushButton:focus { border: 2px solid %s; "
+        "background-color: %s; }\n"
+        "QTextEdit:focus { border: 2px solid %s; "
+        "background-color: %s; }\n"
+        "QPlainTextEdit:focus { border: 2px solid %s; "
+        "background-color: %s; }\n"
+        "QLineEdit:focus { border: 2px solid %s; "
+        "background-color: %s; }\n"
+        "QComboBox:focus { border: 2px solid %s; "
+        "background-color: %s; }\n"
+        "QSpinBox:focus, QDoubleSpinBox:focus { border: 2px solid %s; "
+        "background-color: %s; }\n"
+        "QListWidget:focus { border: 2px solid %s; "
+        "background-color: %s; }\n"
+        % ((ring, tint) * 7)
+    )
+
+
+FOCUS_RING_STYLESHEET = _focus_ring_sheet(
+    FOCUS_RING_COLOR, FOCUS_RING_TINT)
+
+
+def is_dark_palette(palette):
+    """True when `palette` is a dark theme: its Base (the color
+    text fields paint behind text) is darker than mid-grey."""
+    from PySide6 import QtGui
+    return palette.color(QtGui.QPalette.Base).lightness() < 128
+
+
+def _mix_color(base, target_hex, fraction):
+    """`base` moved `fraction` of the way toward `target_hex`,
+    as a #rrggbb name. The dark-theme derivation: the result
+    stays close to the theme's own colors instead of a fixed
+    hex that fights them."""
+    from PySide6 import QtGui
+    target = QtGui.QColor(target_hex)
+    left = 1.0 - fraction
+    return QtGui.QColor(
+        round(base.red() * left + target.red() * fraction),
+        round(base.green() * left + target.green() * fraction),
+        round(base.blue() * left + target.blue() * fraction),
+    ).name()
+
+
+def theme_colors(palette=None):
+    """The colors DUO paints behind text, for `palette` (the
+    application's palette when omitted): code_bg (fenced code
+    blocks), focus_tint (the focused field's background),
+    search_bg (plain search matches) and search_current_bg (the
+    match Previous/Next is on). A light theme gets the exact
+    values DUO always used. A dark theme gets colors derived
+    from its own Base: the code block a touch lighter than the
+    field it sits in, the focus tint the Base pulled toward the
+    ring blue, the search colors the Base pulled toward yellow
+    and orange -- all dark enough for the theme's light text.
+    No palette and no application (or no PySide6 at all) means
+    the light values: the first-run guard path never sees a
+    dark theme."""
+    if palette is None:
+        try:
+            from PySide6 import QtWidgets
+        except ImportError:
+            return dict(_LIGHT_THEME_COLORS)
+        app = QtWidgets.QApplication.instance()
+        if app is None:
+            return dict(_LIGHT_THEME_COLORS)
+        palette = app.palette()
+    if not is_dark_palette(palette):
+        return dict(_LIGHT_THEME_COLORS)
+    from PySide6 import QtGui
+    base = palette.color(QtGui.QPalette.Base)
+    return {
+        "code_bg": base.lighter(115).name(),
+        "focus_tint": _mix_color(base, FOCUS_RING_COLOR, 0.30),
+        "search_bg": _mix_color(base, "#ffff00", 0.35),
+        "search_current_bg": _mix_color(base, "#ffa500", 0.45),
+    }
+
+
+def focus_ring_stylesheet(palette=None):
+    """The focus-ring stylesheet for `palette` (the application's
+    palette when omitted). The ring color never changes -- the
+    blue reads on light and dark alike. The tint follows the
+    theme: #e8f0fe on light, a dark slate blue on dark. On a
+    light theme this is byte-identical to FOCUS_RING_STYLESHEET."""
+    return _focus_ring_sheet(
+        FOCUS_RING_COLOR, theme_colors(palette)["focus_tint"])
 
 
 def dot_stylesheet(color):
@@ -435,7 +531,7 @@ def install_motion(window, widgets, side_state, idle_color, prefs):
     `idle_color` is the dot's grey at rest, from SIDE_STATES.
     `prefs` is the window's QSettings.
     """
-    window.setStyleSheet(FOCUS_RING_STYLESHEET)
+    window.setStyleSheet(focus_ring_stylesheet())
     reduced = ReducedMotion(prefs)
     dip = install_press_dips(window, lambda: reduced.value)
     flashes = {}

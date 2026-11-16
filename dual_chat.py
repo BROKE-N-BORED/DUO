@@ -235,7 +235,7 @@ from duo_model import (
     RELAY_CAP_MIN, SIDE_COLORS, ChatMessage, ChatSide, Conversation,
     MSG_NO_MODEL, NoModelSelected, RelaySession, SUMMARY_KEEP_LAST,
     SUMMARY_LABEL,)
-from duo_motion import DirectorSpring, install_motion
+from duo_motion import DirectorSpring, install_motion, theme_colors
 from duo_ollama import (
     CHAT_MAX_ATTEMPTS, CHAT_RETRY_DELAYS, CHAT_TIMEOUT, DEFAULT_OLLAMA_URL,
     MSG_MODEL_FAILED, MSG_OLLAMA_DOWN, MSG_OLLAMA_SLOW, OLLAMA_URL_ENV,
@@ -278,7 +278,7 @@ from duo_workers import (_ModelLoader, _SignalObject,
 
 
 APP_NAME = "DUO"
-APP_VERSION = "0.50"
+APP_VERSION = "0.51"
 
 
 
@@ -323,6 +323,12 @@ def build_window(client=None, logger=None, deck_port=None):
             lambda: _debug_log.check_ollama(ollama_url))
     logger.register_dependency("PySide6-Essentials")
     logger.action("DUO %s started" % APP_VERSION)
+    # Theme colors (v0.51): the code-block background and the search
+    # highlight colors follow the actual palette, read once at build
+    # -- on a dark theme the old hardcoded light colors made white
+    # text invisible. The focus tint is read the same way by
+    # install_motion. A theme change mid-run needs a restart.
+    theme = theme_colors()
     signals = _Signals()
     convo = Conversation()
 
@@ -1222,7 +1228,8 @@ def build_window(client=None, logger=None, deck_port=None):
         _block_gap(cursor)
         cursor.insertText(label + ": ", _label_format(color))
         if markdown:
-            cursor.insertHtml(markdown_to_html(text))
+            cursor.insertHtml(
+                markdown_to_html(text, code_bg=theme["code_bg"]))
             cursor.movePosition(cursor.MoveOperation.End)
             cursor.insertBlock(QtGui.QTextBlockFormat())
         else:
@@ -1288,7 +1295,7 @@ def build_window(client=None, logger=None, deck_port=None):
         cursor.setPosition(body_pos)
         cursor.setPosition(end, QtGui.QTextCursor.KeepAnchor)
         cursor.removeSelectedText()
-        cursor.insertHtml(markdown_to_html(text))
+        cursor.insertHtml(markdown_to_html(text, code_bg=theme["code_bg"]))
         cursor.movePosition(QtGui.QTextCursor.MoveOperation.End)
         cursor.insertBlock(QtGui.QTextBlockFormat())
         t.setTextCursor(cursor)
@@ -1401,11 +1408,14 @@ def build_window(client=None, logger=None, deck_port=None):
     # substring search over the displayed text -- no regex. Matches
     # are found through the document itself (QTextDocument.find), so
     # positions are always document positions, whatever characters
-    # the text holds.
+    # the text holds. The highlight colors come from the theme
+    # (v0.51): yellow/orange on light, dark golds on dark -- the
+    # hardcoded yellow made white text unreadable on a dark theme.
     _SEARCH_FMT = QtGui.QTextCharFormat()
-    _SEARCH_FMT.setBackground(QtGui.QColor("yellow"))
+    _SEARCH_FMT.setBackground(QtGui.QColor(theme["search_bg"]))
     _SEARCH_CURRENT_FMT = QtGui.QTextCharFormat()
-    _SEARCH_CURRENT_FMT.setBackground(QtGui.QColor("orange"))
+    _SEARCH_CURRENT_FMT.setBackground(
+        QtGui.QColor(theme["search_current_bg"]))
 
     def _apply_search_selections(side):
         w = widgets[side]

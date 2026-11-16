@@ -63,7 +63,7 @@ def _markdown_inline(line):
     return _MD_INLINE_RE.sub(_replace, line)
 
 
-def markdown_to_html(text):
+def markdown_to_html(text, code_bg=None):
     """Convert the bounded Markdown subset to HTML for a pane.
 
     Blocks, split on blank lines: fenced code blocks (```), headers
@@ -72,7 +72,13 @@ def markdown_to_html(text):
     with <br>, so line breaks show exactly as typed (a raw newline
     inside a <p> would collapse to a space). Paragraph gaps render
     as one newline in the pane's plain text -- the <p> margins give
-    the visual separation. Returns "" for empty or blank input."""
+    the visual separation. Returns "" for empty or blank input.
+
+    `code_bg` is the fenced code block's background (v0.51): the
+    caller passes the theme-derived color from duo_motion, so a
+    dark theme gets a dark block instead of the light default.
+    Omitted, the light #f0f0f0 stands -- the converter stays Qt-free
+    and the one-argument callers keep their exact output."""
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     if not text.strip():
         return ""
@@ -152,11 +158,12 @@ def markdown_to_html(text):
         blocks.append(("para", "<br>".join(para_lines)))
 
     out = []
+    code_bg = code_bg or _MD_CODE_BG
     for block in blocks:
         kind = block[0]
         if kind == "code":
             out.append('<pre style="background-color:%s;">%s</pre>'
-                       % (_MD_CODE_BG, html.escape(block[1])))
+                       % (code_bg, html.escape(block[1])))
         elif kind == "header":
             out.append("<h%d>%s</h%d>" % (block[1], block[2], block[1]))
         elif kind == "ul":

@@ -2,7 +2,23 @@
 
 Every version, newest first. v0.1–v0.17 were built on 2026-11-12;
 v0.18–v0.35 on 2026-11-13; v0.36–v0.49 on 2026-11-14; v0.50 on
-2026-11-15.
+2026-11-15; v0.51 on 2026-11-16.
+
+## v0.51 — 2026-11-16
+
+DUO is readable on a dark theme. Three things were painted a
+fixed near-white no matter the theme, so on a dark desktop the
+white text vanished into them: the message box went solid white
+the moment you clicked in it (and what you typed was invisible),
+code blocks were white text on a pale grey block, and the How to
+Use window opened as a white rectangle. The same white tint also
+blanked the default button in dialogs. All three now follow the
+theme: the code-block background, the focused field's tint, and
+the search highlight colors are worked out from the desktop's own
+colors when DUO starts, so a dark theme gets dark surfaces and a
+light theme keeps exactly the look it always had. The blue focus
+ring itself is unchanged. A theme change while DUO is running
+needs a restart to take effect.
 
 ## v0.50 — 2026-11-15
 

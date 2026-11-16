@@ -168,7 +168,7 @@ class BigText:
 
     def _apply_font(self):
         from PySide6 import QtGui, QtWidgets
-        from duo_motion import FOCUS_RING_STYLESHEET
+        from duo_motion import focus_ring_stylesheet
         app = QtWidgets.QApplication.instance()
         if self._value:
             if app is not None and not BigText._applied:
@@ -187,7 +187,10 @@ class BigText:
                 # A font with neither a point nor a pixel size
                 # cannot be grown by a fixed step; leave it alone.
             rule = self._font_rule()
-            sheet = FOCUS_RING_STYLESHEET
+            # The focus-ring sheet follows the theme (v0.51): the
+            # big-text composition must use the runtime sheet, not
+            # the light constant, or dark + big text whites out.
+            sheet = focus_ring_stylesheet()
             if rule:
                 sheet = sheet + "\n" + rule + "\n"
             self._window.setStyleSheet(sheet)
@@ -195,7 +198,7 @@ class BigText:
             if app is not None and BigText._applied:
                 app.setFont(BigText._base_font)
                 BigText._applied = False
-            self._window.setStyleSheet(FOCUS_RING_STYLESHEET)
+            self._window.setStyleSheet(focus_ring_stylesheet())
 
 
 def install_accessibility(window, small_labels, prefs):

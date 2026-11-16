@@ -14388,5 +14388,209 @@ class AccessibilityGuiTests(unittest.TestCase):
             False, type=bool)))
 
 
+class ThemeColorsTests(unittest.TestCase):
+    """v0.51: the code-block background, the focus tint, and both
+    search highlight colors follow the actual palette. A light
+    theme keeps the exact values DUO always used; a dark theme
+    derives its own from the palette's Base, so white text never
+    lands on a near-white field (his photos 2026-11-15). Pure
+    tests: explicit palettes, no application needed."""
+
+    def _palette_with_base(self, base_hex):
+        from PySide6 import QtGui
+        pal = QtGui.QPalette()
+        pal.setColor(QtGui.QPalette.Base, QtGui.QColor(base_hex))
+        return pal
+
+    def test_light_palette_keeps_the_classic_values(self):
+        import duo_motion
+        import duo_markdown
+        colors = duo_motion.theme_colors(
+            self._palette_with_base("#ffffff"))
+        self.assertEqual(colors["code_bg"], "#f0f0f0")
+        self.assertEqual(colors["focus_tint"], "#e8f0fe")
+        self.assertEqual(colors["search_bg"], "#ffff00")
+        self.assertEqual(colors["search_current_bg"], "#ffa500")
+        # The converter's default and the theme's light value are
+        # the same color -- if one moves, the other must too.
+        self.assertEqual(colors["code_bg"], duo_markdown._MD_CODE_BG)
+
+    def test_dark_palette_derives_dark_colors(self):
+        import duo_motion
+        from PySide6 import QtGui
+        colors = duo_motion.theme_colors(
+            self._palette_with_base("#242424"))
+        for name in ("code_bg", "focus_tint", "search_bg",
+                     "search_current_bg"):
+            self.assertLess(QtGui.QColor(colors[name]).lightness(),
+                            128, "%s should be dark" % name)
+        # The code block is a touch lighter than the field it sits
+        # in, so it still reads as a block.
+        self.assertGreater(
+            QtGui.QColor(colors["code_bg"]).lightness(),
+            QtGui.QColor("#242424").lightness())
+        self.assertNotEqual(colors["search_bg"],
+                            colors["search_current_bg"])
+
+    def test_darkness_boundary_is_mid_grey(self):
+        import duo_motion
+        self.assertFalse(duo_motion.is_dark_palette(
+            self._palette_with_base("#808080")))
+        self.assertTrue(duo_motion.is_dark_palette(
+            self._palette_with_base("#7f7f7f")))
+
+    def test_focus_ring_stylesheet_light_is_the_constant(self):
+        import duo_motion
+        self.assertEqual(
+            duo_motion.focus_ring_stylesheet(
+                self._palette_with_base("#ffffff")),
+            duo_motion.FOCUS_RING_STYLESHEET)
+
+    def test_focus_ring_stylesheet_dark_keeps_ring_and_focus_only(self):
+        import duo_motion
+        sheet = duo_motion.focus_ring_stylesheet(
+            self._palette_with_base("#242424"))
+        self.assertIn("border: 2px solid #2563eb", sheet)
+        self.assertNotIn("#e8f0fe", sheet)
+        for line in sheet.strip().splitlines():
+            selectors = line.split("{")[0]
+            for selector in selectors.split(","):
+                self.assertIn(":focus", selector.strip())
+
+    def test_markdown_code_bg_parameter(self):
+        from duo_markdown import markdown_to_html
+        self.assertEqual(
+            markdown_to_html("```\nx = 1\n```", code_bg="#292929"),
+            '<pre style="background-color:#292929;">x = 1</pre>')
+
+
+@unittest.skipUnless(os.environ.get("DUAL_CHAT_GUI_TESTS") == "1",
+                     "GUI tests run with DUAL_CHAT_GUI_TESTS=1")
+class DarkPaletteGuiTests(unittest.TestCase):
+    """v0.51: the window built under a dark palette paints dark
+    surfaces -- the focus tint, the code blocks, and the search
+    highlights all follow the theme instead of the hardcoded
+    light colors. The palette is set on the shared application
+    before build_window and restored in tearDown, so no other
+    test sees it."""
+
+    @classmethod
+    def setUpClass(cls):
+        from PySide6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+        cls.client = FakeGuiClient()
+
+    def _dark_palette(self):
+        from PySide6 import QtGui
+        pal = QtGui.QPalette()
+        for role, hex_value in (
+                (QtGui.QPalette.Window, "#2b2b2b"),
+                (QtGui.QPalette.WindowText, "#ffffff"),
+                (QtGui.QPalette.Base, "#242424"),
+                (QtGui.QPalette.AlternateBase, "#2e2e2e"),
+                (QtGui.QPalette.Text, "#ffffff"),
+                (QtGui.QPalette.Button, "#2b2b2b"),
+                (QtGui.QPalette.ButtonText, "#ffffff"),
+                (QtGui.QPalette.Highlight, "#2563eb"),
+                (QtGui.QPalette.HighlightedText, "#ffffff")):
+            pal.setColor(role, QtGui.QColor(hex_value))
+        return pal
+
+    def setUp(self):
+        from dual_chat import build_window
+        self.client.reset()
+        self._saved_palette = self.app.palette()
+        self._dark = self._dark_palette()
+        self.app.setPalette(self._dark)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.pairs_file = os.path.join(self.tmp.name, "duo-pairs.json")
+        self._env = mock.patch.dict(
+            os.environ, {"DUAL_CHAT_PAIRS_FILE": self.pairs_file})
+        self._env.start()
+        self.window = build_window(self.client, logger=TEST_LOGGER)
+        self.window.show()
+        self.state = self.window._dual_chat
+        self._wait_for(lambda: self.state["widgets"]["A"]["picker"].count() == 2)
+        self._pick_models()
+
+    def tearDown(self):
+        self.window.close()
+        self.app.setPalette(self._saved_palette)
+        self._env.stop()
+        self.tmp.cleanup()
+        self.app.processEvents()
+
+    def _wait_for(self, cond, timeout=10.0):
+        from PySide6.QtTest import QTest
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            QTest.qWait(50)
+            if cond():
+                return True
+        return cond()
+
+    def _pick_models(self):
+        self.state["widgets"]["A"]["picker"].setCurrentIndex(0)
+        self.state["widgets"]["B"]["picker"].setCurrentIndex(1)
+        self.app.processEvents()
+
+    def test_window_stylesheet_uses_dark_tint(self):
+        import duo_motion
+        tint = duo_motion.theme_colors(self._dark)["focus_tint"]
+        self.assertIn("background-color: %s" % tint,
+                      self.window.styleSheet())
+        self.assertNotIn("#e8f0fe", self.window.styleSheet())
+        self.assertIn("border: 2px solid #2563eb",
+                      self.window.styleSheet())
+
+    def test_code_block_renders_dark(self):
+        import duo_motion
+        code_bg = duo_motion.theme_colors(self._dark)["code_bg"]
+        side = self.state["convo"].sides["A"]
+        side.add_assistant("```\ndef hello():\n    pass\n```")
+        self.state["render_transcript"]("A")
+        self.app.processEvents()
+        doc = self.state["widgets"]["A"]["transcript"].document()
+        block = doc.begin()
+        seen = []
+        while block.isValid():
+            if "def hello" in block.text():
+                # Qt stores the <pre> background on the code
+                # fragment's char format, not the block format
+                # (probed: blockFormat reads #000000).
+                fragment = block.begin()
+                while not fragment.atEnd():
+                    part = fragment.fragment()
+                    if part.isValid() and "def hello" in part.text():
+                        seen.append(part.charFormat().background()
+                                    .color().name())
+                    fragment += 1
+            block = block.next()
+        self.assertEqual(seen, [code_bg])
+
+    def test_search_highlights_are_dark(self):
+        import duo_motion
+        colors = duo_motion.theme_colors(self._dark)
+        side = self.state["convo"].sides["A"]
+        side.add_user("the rain in Spain")
+        side.add_assistant("rain, rain, go away")
+        self.state["render_transcript"]("A")
+        self.app.processEvents()
+        w = self.state["widgets"]["A"]
+        w["search_edit"].setText("rain")
+        self.app.processEvents()
+        selections = w["transcript"].extraSelections()
+        self.assertEqual(len(selections), 3)
+        self.assertEqual(
+            selections[0].format.background().color().name(),
+            colors["search_current_bg"])
+        self.assertEqual(
+            selections[1].format.background().color().name(),
+            colors["search_bg"])
+        self.assertEqual(
+            selections[2].format.background().color().name(),
+            colors["search_bg"])
+
+
 if __name__ == "__main__":
     unittest.main()
