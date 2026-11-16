@@ -13,12 +13,32 @@ is decided by what the attempts actually failed with, not by a
 fresh probe that can itself fail under load. The Start Ollama
 button and the server manager are gone: DUO no longer starts
 Ollama, it stays connected to the one that is running.
+
+v0.52: Stop can interrupt a stalled generation. The read loop
+used to block up to CHAT_TIMEOUT (30 min) inside one readline
+with the cancel check only before it, so Stop did nothing for
+up to 90 min across the three attempts. Now a reader thread
+blocks in readline and the main loop takes lines from a queue
+in short waits, checking Stop and the silence budget on every
+quiet window; a genuine stall still fails the attempt after
+CHAT_TIMEOUT of silence, exactly as before. The socket timeout
+is deliberately NOT shortened: a socket makefile cannot be
+read again after a timeout (CPython raises "cannot read from
+timed out object"), which a first version of this fix learned
+the hard way. And the response is NOT simply closed at the
+end: closing while the reader is inside readline can block
+(probed: fp.close() waits on the blocked read), so the socket
+is shut down first, the reader is joined, and only then is
+the response closed.
 """
 
 import json
 import os
+import queue
 import shutil
+import socket
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -46,6 +66,15 @@ MSG_MODEL_FAILED = "That model couldn't be loaded. Pick another model and try ag
 # content chunk) a few times with a pause between attempts, and only
 # then fails. The pauses are interruptible: Stop ends them at once.
 CHAT_TIMEOUT = 1800
+
+
+# The read loop's wake-up interval (v0.52, P0-1): the main loop
+# takes lines from the reader thread's queue in waits of this
+# length, checking Stop and the silence budget on every quiet
+# window. Five seconds keeps Stop responsive without churning
+# on a quiet stream; a slow-but-alive stream is untouched,
+# because every line that arrives restarts the silence budget.
+CHAT_READ_TIMEOUT = 5
 
 
 CHAT_MAX_ATTEMPTS = 3
@@ -229,6 +258,28 @@ def llama_start_timeout(detail):
     """True when an Ollama error body is the llama-server start
     timeout -- Ollama's own wording, matched on the body text."""
     return LLAMA_START_TIMEOUT_MARKER in (detail or "").lower()
+
+
+def _shutdown_response(resp):
+    """Shut down the socket under `resp` so a reader thread
+    blocked in readline wakes at once (v0.52, P0-1). Closing the
+    response while the reader is inside readline can block --
+    probed: fp.close() waits on the blocked read -- so the
+    shutdown runs first, the reader is joined, and only then is
+    the response closed. Best-effort: a response with no
+    reachable socket (a fake, or a future urllib that
+    rearranges the chain) is left alone, and a socket that is
+    already closed just raises OSError, which is swallowed.
+    Returns True when a socket was shut down."""
+    try:
+        sock = resp.fp.raw._sock
+    except AttributeError:
+        return False
+    try:
+        sock.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        return False
+    return True
 
 
 def _ollama_failure_kind(exc):
@@ -430,18 +481,65 @@ class OllamaClient:
         full = []
         ttft = None
         final = {}
+        # v0.52 (P0-1): read the stream on a reader thread and
+        # take lines from a queue in short waits, so Stop can
+        # land while the server is quiet. The reader thread
+        # blocks in readline with the long socket timeout it
+        # always had -- shortening it is not an option, because
+        # a socket makefile cannot be read again after a timeout
+        # (CPython raises "cannot read from timed out object").
+        # The main loop wakes every CHAT_READ_TIMEOUT seconds to
+        # check Stop and the silence budget; a slow-but-alive
+        # stream is untouched, because every line that arrives
+        # restarts the budget. The finally below shuts the
+        # socket down before closing the response: closing
+        # while the reader is inside readline can block
+        # (probed), and the shutdown wakes the reader at once,
+        # so no thread is left behind; it is a daemon either way.
+        # The queue carries lines (bytes), b"" at end of stream,
+        # or the exception a failed readline raised.
+        lines = queue.Queue()
+
+        def _read_lines():
+            while True:
+                try:
+                    line = resp.readline()
+                except Exception as exc:
+                    lines.put(exc)
+                    return
+                lines.put(line)
+                if not line:
+                    return
+
+        reader = threading.Thread(target=_read_lines, daemon=True)
+        reader.start()
+        last_data = time.monotonic()
         try:
             while True:
                 if cancel_event is not None and cancel_event.is_set():
                     raise Cancelled()
                 try:
-                    line = resp.readline()
-                except Exception as exc:
+                    item = lines.get(timeout=CHAT_READ_TIMEOUT)
+                except queue.Empty:
+                    # One quiet window, not a failure yet: a slow
+                    # model can pause between tokens. Stop lands
+                    # here within one window.
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise Cancelled()
+                    if time.monotonic() - last_data >= timeout:
+                        exc = TimeoutError("timed out")
+                        if full:
+                            raise OllamaError(MSG_OLLAMA_SLOW)
+                        raise _Retryable(exc, _ollama_failure_kind(exc))
+                    continue
+                if isinstance(item, Exception):
                     if full:
                         # Content already streamed: keep the partial
                         # text, fail the turn, never retry.
                         raise OllamaError(MSG_OLLAMA_SLOW)
-                    raise _Retryable(exc, _ollama_failure_kind(exc))
+                    raise _Retryable(item, _ollama_failure_kind(item))
+                line = item
+                last_data = time.monotonic()
                 if not line:
                     break
                 line = line.strip()
@@ -463,6 +561,16 @@ class OllamaClient:
                     final = chunk
                     break
         finally:
+            # Shut the socket down before closing: closing the
+            # response while the reader is inside readline can
+            # block (probed: fp.close() waits on the blocked
+            # read), and the shutdown wakes the reader at once.
+            # Join first so the reader is out of readline before
+            # the close runs; the join is bounded, so a socket
+            # that could not be reached degrades to the old
+            # close instead of hanging here.
+            _shutdown_response(resp)
+            reader.join(timeout=CHAT_READ_TIMEOUT)
             resp.close()
         if cancel_event is not None and cancel_event.is_set():
             raise Cancelled()

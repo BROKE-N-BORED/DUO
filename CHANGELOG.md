@@ -2,7 +2,19 @@
 
 Every version, newest first. v0.1–v0.17 were built on 2026-11-12;
 v0.18–v0.35 on 2026-11-13; v0.36–v0.49 on 2026-11-14; v0.50 on
-2026-11-15; v0.51 on 2026-11-16.
+2026-11-15; v0.51–v0.52 on 2026-11-16.
+
+## v0.52 — 2026-11-16
+
+Stop can interrupt a stalled generation. If Ollama went quiet
+in the middle of a turn — no tokens coming, nothing arriving —
+Stop used to do nothing: the app sat there for up to 30 minutes
+per try, three tries in a row, looking dead. Now Stop lands
+within a few seconds of a stall, because the app checks for it
+every few seconds while it waits for the next piece of a reply.
+A slow model is unaffected: as long as words keep arriving, the
+turn keeps going, and a genuine stall still fails the turn after
+the same 30 minutes of silence as before.
 
 ## v0.51 — 2026-11-16
 

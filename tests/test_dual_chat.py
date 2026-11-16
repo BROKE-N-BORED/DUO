@@ -5042,6 +5042,14 @@ class FlakyOllamaHandler(FakeOllamaHandler):
     then serve normally.
     mode "chat_and_tags_fail": drop every /api/chat and every
     /api/tags request -- both endpoints down at once.
+    mode "stall": answer 200, then send nothing for 60 s -- the
+    server went quiet mid-turn. The client must notice Stop
+    (v0.52) or the silence budget, not hang on the read.
+    mode "stall_after_two": stream two chunks, then go quiet for
+    60 s -- content already streamed, then the stall.
+    mode "slow_dribble": stream the chunks 1 s apart -- slower
+    than a patched short read window, faster than the silence
+    budget. The turn must still succeed.
     chat_posts counts the /api/chat requests the server saw;
     tags_gets counts the /api/tags requests.
     """
@@ -5114,6 +5122,57 @@ class FlakyOllamaHandler(FakeOllamaHandler):
             self.wfile.flush()
             time.sleep(0.2)
             self._drop()
+            return
+        if self.mode == "stall":
+            # Headers out, then nothing: read the body first so
+            # the request is complete, then sleep longer than any
+            # test's patience. The handler thread is a daemon; the
+            # client's cancel or silence budget ends the turn.
+            length = int(self.headers.get("Content-Length") or 0)
+            self.rfile.read(length)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-ndjson")
+            self.end_headers()
+            self.wfile.flush()
+            time.sleep(60)
+            return
+        if self.mode == "stall_after_two":
+            length = int(self.headers.get("Content-Length") or 0)
+            self.rfile.read(length)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-ndjson")
+            self.end_headers()
+            for chunk in ("Hello ", "from A."):
+                line = json.dumps(
+                    {"message": {"role": "assistant", "content": chunk},
+                     "done": False}).encode("utf-8") + b"\n"
+                self.wfile.write(line)
+            self.wfile.flush()
+            time.sleep(60)
+            return
+        if self.mode == "slow_dribble":
+            length = int(self.headers.get("Content-Length") or 0)
+            self.rfile.read(length)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-ndjson")
+            self.end_headers()
+            for chunk in ("Hello ", "from A."):
+                line = json.dumps(
+                    {"message": {"role": "assistant", "content": chunk},
+                     "done": False}).encode("utf-8") + b"\n"
+                self.wfile.write(line)
+                self.wfile.flush()
+                time.sleep(1.0)
+            self.wfile.write(
+                json.dumps({"message": {"role": "assistant", "content": ""},
+                            "done": True, "done_reason": "stop",
+                            "eval_count": 20,
+                            "eval_duration": 1000000000,
+                            "prompt_eval_count": 128,
+                            "prompt_eval_duration": 200000000,
+                            "total_duration": 1500000000}
+                           ).encode("utf-8") + b"\n")
+            self.wfile.flush()
             return
         return super().do_POST()
 
@@ -14590,6 +14649,84 @@ class DarkPaletteGuiTests(unittest.TestCase):
         self.assertEqual(
             selections[2].format.background().color().name(),
             colors["search_bg"])
+
+
+class OllamaClientStallTests(unittest.TestCase):
+    """v0.52 (P0-1): Stop interrupts a stalled generation. The read
+    loop used to block up to CHAT_TIMEOUT inside one readline, so
+    Stop did nothing for up to 90 min across the three attempts.
+    Now the socket wakes every CHAT_READ_TIMEOUT seconds to check
+    Stop, and a genuine stall still fails the attempt after the
+    silence budget. The read window is patched to 0.5 s here so
+    the tests run in seconds, not minutes."""
+
+    def setUp(self):
+        self._patcher = mock.patch("duo_ollama.CHAT_RETRY_DELAYS",
+                                   (0.01, 0.01))
+        self._patcher.start()
+        self._read_patcher = mock.patch("duo_ollama.CHAT_READ_TIMEOUT",
+                                        0.5)
+        self._read_patcher.start()
+        self._servers = []
+
+    def tearDown(self):
+        self._patcher.stop()
+        self._read_patcher.stop()
+        for server in self._servers:
+            server.shutdown()
+            server.server_close()
+
+    def _start(self, mode, fail_n=0):
+        server, handler, url = start_flaky_server(mode, fail_n)
+        self._servers.append(server)
+        return handler, url
+
+    def _stream(self, url, cancel_event, timeout=None):
+        client = OllamaClient(url)
+        kwargs = {}
+        if timeout is not None:
+            kwargs["timeout"] = timeout
+        return client.chat_stream(
+            "fake-a:latest", [{"role": "user", "content": "hi"}],
+            lambda t: None, cancel_event, **kwargs)
+
+    def test_stop_interrupts_a_stalled_generation(self):
+        handler, url = self._start("stall")
+        cancel_event = threading.Event()
+        # Stop half a second into the stall: without the fix this
+        # test would hang for the 30-minute readline timeout.
+        threading.Timer(0.5, cancel_event.set).start()
+        started = time.monotonic()
+        with self.assertRaises(Cancelled):
+            self._stream(url, cancel_event)
+        self.assertLess(time.monotonic() - started, 10)
+        # A cancel is not a retryable failure: one attempt only.
+        self.assertEqual(handler.chat_posts, 1)
+
+    def test_stop_interrupts_a_stall_after_content_streamed(self):
+        handler, url = self._start("stall_after_two")
+        cancel_event = threading.Event()
+        threading.Timer(0.5, cancel_event.set).start()
+        started = time.monotonic()
+        with self.assertRaises(Cancelled):
+            self._stream(url, cancel_event)
+        self.assertLess(time.monotonic() - started, 10)
+        self.assertEqual(handler.chat_posts, 1)
+
+    def test_stall_past_the_silence_budget_fails_slow(self):
+        handler, url = self._start("stall")
+        started = time.monotonic()
+        with self.assertRaises(OllamaError) as ctx:
+            self._stream(url, threading.Event(), timeout=2)
+        self.assertEqual(str(ctx.exception), MSG_OLLAMA_SLOW)
+        # All three attempts ran their 2 s silence budget.
+        self.assertEqual(handler.chat_posts, 3)
+        self.assertLess(time.monotonic() - started, 15)
+
+    def test_slow_stream_survives_the_short_windows(self):
+        _, url = self._start("slow_dribble")
+        full = self._stream(url, threading.Event())
+        self.assertEqual(full, "Hello from A.")
 
 
 if __name__ == "__main__":
