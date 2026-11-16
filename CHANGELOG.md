@@ -1,7 +1,26 @@
 # DUO changelog
 
 Every version, newest first. v0.1–v0.17 were built on 2026-11-12;
-v0.18–v0.35 on 2026-11-13; v0.36–v0.49 on 2026-11-14.
+v0.18–v0.35 on 2026-11-13; v0.36–v0.49 on 2026-11-14; v0.50 on
+2026-11-15.
+
+## v0.50 — 2026-11-15
+
+Installing DUO no longer needs the terminal. The Release zip now
+carries an Install DUO launcher: unzip, double-click it, and the
+installer runs with visible progress, then puts a DUO icon on the
+desktop and adds DUO to the app menu. Double-click the desktop icon
+to run DUO. The installer also fixes missing pieces itself instead
+of handing you a command: if python3-venv is missing it tries
+`sudo apt install python3-venv` and retries, and if the Qt system
+libraries are missing it tries `sudo apt install libegl1 libgl1`
+and checks again. If either install cannot happen, it says the
+command plainly and carries on — the install never fails over it.
+The desktop icon is marked trusted where the machine allows it; if
+the marking does not take, the installer says to right-click the
+icon and choose Allow Launching. Uninstall removes the desktop icon
+too. The terminal commands still work as the fallback: `bash
+install.sh`, then `bash run.sh`.
 
 ## v0.49 — 2026-11-14
 

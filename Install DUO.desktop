@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Install DUO
+Comment=Install DUO on this computer
+Exec=sh -c "cd \"$(dirname \"$1\")\" && exec bash install.sh --pause" sh %k
+Terminal=true
+Categories=Utility;

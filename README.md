@@ -101,35 +101,40 @@ Everything in one app:
 
 ## Install (one time)
 
-```sh
-bash install.sh
-```
+Unzip the download, then double-click **Install DUO** in the folder.
+It sets up the app, adds DUO to the app menu, and puts a DUO icon on
+the desktop. When it finishes, double-click the DUO icon on the
+desktop to run it.
 
-This creates a private `.venv` folder in the app folder with
+The installer creates a private `.venv` folder in the app folder with
 PySide6-Essentials, pinned to the version DUO was built and verified
-against (6.12.0). Nothing is installed system-wide, no sudo needed.
-The installer checks the install before calling it done: if the
-package is missing it says so and stops, and if the machine's Qt
-libraries can't start the window it warns and names the missing
-library. If you start DUO before installing, it tells you to run
-the installer first — no traceback, no guessing.
+against (6.12.0). If `python3-venv` or the machine's Qt libraries
+are missing, the installer tries to install them first (it runs in a
+terminal, so a sudo password prompt works); if it cannot, it says
+the command plainly and carries on. The installer checks the install
+before calling it done: if the package is missing it says so and
+stops, and if the machine's Qt libraries can't start the window it
+warns and names the missing library. If you start DUO before
+installing, it tells you to run the installer first, no traceback,
+no guessing.
 
 The installer also adds DUO to the app menu, with an icon drawn from
 the app's own window icon. If the icon can't be drawn on your
 machine, the menu entry still appears, just without an icon. To
 remove DUO later, run `bash uninstall.sh` — it asks first, then
-removes the menu entry, the `.venv` folder, and the files DUO created
-(saved pairs, debug log, menu icon).
+removes the menu entry, the desktop icon, the `.venv` folder, and
+the files DUO created (saved pairs, debug log, menu icon).
 
-If you cloned the repo instead of downloading a Release, the scripts
-may not be executable — run them with `bash`, as above. The Release
-zip is the install path and carries the executable bits.
+If you prefer the terminal, or you cloned the repo instead of
+downloading a Release: `bash install.sh`, then `bash run.sh`. The
+scripts may not be executable in a clone — run them with `bash`, as
+above. The Release zip is the install path, and it
+carries the executable bits.
 
 ## Run
 
-```sh
-bash run.sh
-```
+Double-click the DUO icon on the desktop, or pick DUO in the app
+menu. (Or run `bash run.sh` from the app folder.)
 
 ## How it works
 

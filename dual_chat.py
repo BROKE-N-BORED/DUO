@@ -278,7 +278,7 @@ from duo_workers import (_ModelLoader, _SignalObject,
 
 
 APP_NAME = "DUO"
-APP_VERSION = "0.49"
+APP_VERSION = "0.50"
 
 
 

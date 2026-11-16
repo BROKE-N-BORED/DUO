@@ -49,6 +49,14 @@ def show_about_dialog(parent, version):
 # The built-in How to Use index (U22): short plain-language
 # sections, one per thing DUO does. No web, no links, no em-dashes.
 HOW_TO_USE_SECTIONS = (
+    ("Installing DUO",
+     "Unzip the download, double-click Install DUO in the folder, "
+     "and wait for it to finish. It sets up the app, adds DUO to "
+     "the app menu, and puts a DUO icon on the desktop. Then "
+     "double-click the DUO icon to run it. If something is missing "
+     "on the computer, the installer tries to install it first; "
+     "if it cannot, it tells you the command to run. To remove "
+     "DUO, run uninstall.sh from the app folder. It asks first."),
     ("The two panes",
      "Each pane is one model. Pick a model in a pane's dropdown "
      "before you can send to it. Nothing is picked for you. The "

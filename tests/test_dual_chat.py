@@ -6567,7 +6567,7 @@ class FrontDoorTests(unittest.TestCase):
 
     def test_changelog_covers_every_version(self):
         log = self._read("CHANGELOG.md")
-        for version in ["0.%d" % n for n in range(1, 50)]:
+        for version in ["0.%d" % n for n in range(1, 51)]:
             self.assertIn(version, log)
 
     def test_gitignore_covers_runtime_files(self):
@@ -6695,8 +6695,8 @@ class FrontDoorTests(unittest.TestCase):
 
     def _uninstall_setup(self):
         # A fake install: the app folder plus a fake HOME holding a
-        # DUO menu entry, another app's menu entry, and a sentinel
-        # file that must survive the uninstall.
+        # DUO menu entry, a DUO desktop icon, another app's menu
+        # entry, and a sentinel file that must survive the uninstall.
         work = tempfile.mkdtemp(prefix="duo-uninstall-")
         home = tempfile.mkdtemp(prefix="duo-uninstall-home-")
         shutil.copy(os.path.join(self._tree(), "uninstall.sh"),
@@ -6715,6 +6715,12 @@ class FrontDoorTests(unittest.TestCase):
             fh.write("[Desktop Entry]\nName=DUO\n")
         with open(os.path.join(apps, "other.desktop"), "w") as fh:
             fh.write("[Desktop Entry]\nName=Other\n")
+        desktop = os.path.join(home, "Desktop")
+        os.makedirs(desktop)
+        with open(os.path.join(desktop, "DUO.desktop"), "w") as fh:
+            fh.write("[Desktop Entry]\nName=DUO\n")
+        with open(os.path.join(desktop, "keep-me.txt"), "w") as fh:
+            fh.write("sentinel\n")
         with open(os.path.join(home, "keep-me.txt"), "w") as fh:
             fh.write("sentinel\n")
         return work, home
@@ -6736,12 +6742,15 @@ class FrontDoorTests(unittest.TestCase):
             apps = os.path.join(home, ".local", "share", "applications")
             self.assertFalse(os.path.exists(
                 os.path.join(apps, "DUO.desktop")))
+            self.assertFalse(os.path.exists(
+                os.path.join(home, "Desktop", "DUO.desktop")))
             for name in (".venv", "duo-pairs.json", "duo-debug.log",
                          "duo.png"):
                 self.assertFalse(os.path.exists(
                     os.path.join(work, name)), name)
             # Everything else survives: the app folder's own files,
-            # the other app's menu entry, and the sentinel.
+            # the other app's menu entry, the desktop sentinel, and
+            # the home sentinel.
             self.assertTrue(os.path.exists(
                 os.path.join(work, "uninstall.sh")))
             self.assertTrue(os.path.exists(
@@ -6749,8 +6758,11 @@ class FrontDoorTests(unittest.TestCase):
             self.assertTrue(os.path.exists(
                 os.path.join(apps, "other.desktop")))
             self.assertTrue(os.path.exists(
+                os.path.join(home, "Desktop", "keep-me.txt")))
+            self.assertTrue(os.path.exists(
                 os.path.join(home, "keep-me.txt")))
             self.assertIn("Removed:", proc.stdout)
+            self.assertIn("desktop icon", proc.stdout)
         finally:
             shutil.rmtree(work, ignore_errors=True)
             shutil.rmtree(home, ignore_errors=True)
@@ -6764,6 +6776,8 @@ class FrontDoorTests(unittest.TestCase):
             apps = os.path.join(home, ".local", "share", "applications")
             self.assertTrue(os.path.exists(
                 os.path.join(apps, "DUO.desktop")))
+            self.assertTrue(os.path.exists(
+                os.path.join(home, "Desktop", "DUO.desktop")))
             for name in (".venv", "duo-pairs.json", "duo-debug.log",
                          "duo.png"):
                 self.assertTrue(os.path.exists(
@@ -6772,6 +6786,246 @@ class FrontDoorTests(unittest.TestCase):
         finally:
             shutil.rmtree(work, ignore_errors=True)
             shutil.rmtree(home, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# Install launcher (v0.50)
+# ---------------------------------------------------------------------------
+
+class InstallLauncherTests(unittest.TestCase):
+    """v0.50: installing DUO no longer needs the terminal. The zip
+    carries an Install DUO launcher (double-click it), the installer
+    puts a DUO icon on the desktop next to the menu entry, and
+    missing pieces (python3-venv, the Qt system libraries) are
+    installed automatically instead of handed back as a command."""
+
+    def _tree(self):
+        return os.path.dirname(
+            os.path.dirname(os.path.abspath(__file__)))
+
+    def _read(self, rel):
+        with open(os.path.join(self._tree(), rel),
+                  encoding="utf-8") as fh:
+            return fh.read()
+
+    def _parse_desktop(self, text):
+        entries = {}
+        section = None
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("[") and line.endswith("]"):
+                section = line[1:-1]
+                entries[section] = {}
+                continue
+            self.assertIn("=", line)
+            key, value = line.split("=", 1)
+            entries[section][key.strip()] = value.strip()
+        return entries
+
+    def test_install_launcher_exists_and_ships_executable(self):
+        # The launcher is in the tree, and the zip carries it with
+        # the exec bit -- the bit is what makes it double-clickable
+        # after unzip. (The repo itself stores every file 644 --
+        # push-files drops the exec bit -- so the zip pin, not the
+        # tree mode, is what this test can hold in a fresh clone.)
+        path = os.path.join(self._tree(), "Install DUO.desktop")
+        self.assertTrue(os.path.isfile(path), path)
+        script = self._read("build_zip.py")
+        self.assertIn('"Install DUO.desktop": 0o100755', script)
+
+    def test_install_launcher_parses_and_runs_install_sh_from_its_own_folder(self):
+        entries = self._parse_desktop(self._read("Install DUO.desktop"))
+        self.assertIn("Desktop Entry", entries)
+        entry = entries["Desktop Entry"]
+        self.assertEqual(entry.get("Type"), "Application")
+        self.assertEqual(entry.get("Name"), "Install DUO")
+        self.assertEqual(entry.get("Terminal"), "true")
+        # %k is the launcher's own path: the installer runs from the
+        # folder it sits in, with no placeholder to substitute.
+        # --pause keeps the terminal open until the result is read.
+        exec_line = entry.get("Exec", "")
+        self.assertIn("install.sh", exec_line)
+        self.assertIn("%k", exec_line)
+        self.assertIn("--pause", exec_line)
+        self.assertNotIn("@APP_DIR@", self._read("Install DUO.desktop"))
+
+    def test_install_launcher_validates_if_validator_present(self):
+        validator = shutil.which("desktop-file-validate")
+        if validator is None:
+            self.skipTest("desktop-file-validate not installed")
+        proc = subprocess.run(
+            [validator, os.path.join(self._tree(), "Install DUO.desktop")],
+            capture_output=True, text=True, timeout=60)
+        self.assertEqual(proc.returncode, 0,
+                         proc.stdout + proc.stderr)
+
+    def test_install_sh_installs_the_desktop_icon(self):
+        script = self._read("install.sh")
+        self.assertIn("install_desktop_icon", script)
+        self.assertIn("xdg-user-dir", script)
+        self.assertIn("Desktop", script)
+        # The icon must be trusted before it launches: mark it, then
+        # check the marking took, and say plainly how to allow it
+        # by hand when it did not.
+        self.assertIn("metadata::trusted", script)
+        self.assertIn("Allow Launching", script)
+        self.assertIn("Added the DUO icon to the desktop.", script)
+
+    def test_install_sh_tries_to_install_missing_dependencies(self):
+        script = self._read("install.sh")
+        # Missing pieces are installed, not handed back as a chore.
+        self.assertIn("sudo apt install -y python3-venv", script)
+        self.assertIn("sudo apt install -y libegl1 libgl1", script)
+        # ...and when the automatic install cannot happen, the
+        # manual command is still printed plainly.
+        self.assertIn("Could not install python3-venv automatically",
+                      script)
+        self.assertIn("Run: sudo apt install python3-venv", script)
+
+    def test_install_sh_end_message_names_the_desktop_icon(self):
+        script = self._read("install.sh")
+        self.assertIn(
+            "Double-click the DUO icon on the desktop to run it.",
+            script)
+
+    def test_install_sh_pauses_when_launched_from_the_desktop(self):
+        script = self._read("install.sh")
+        self.assertIn('"--pause"', script)
+        self.assertIn("Press Enter to close", script)
+
+    def test_install_sh_pause_waits_for_enter_then_exits(self):
+        # The --pause flag, behaviourally: a run that fails at the
+        # Python version check waits at the pause (stdin held open)
+        # and exits once Enter arrives; with stdin closed it exits
+        # straight away instead of hanging.
+        work = tempfile.mkdtemp(prefix="duo-install-pause-")
+        bindir = tempfile.mkdtemp(prefix="duo-install-pause-bin-")
+        try:
+            shutil.copy(os.path.join(self._tree(), "install.sh"),
+                        os.path.join(work, "install.sh"))
+            # A python3 that fails the version check but answers
+            # --version, so the script reaches the pause.
+            with open(os.path.join(bindir, "python3"), "w") as fh:
+                fh.write("#!/bin/sh\n"
+                         "if [ \"$1\" = \"--version\" ]; then "
+                         "echo \"Python 3.9.9\"; exit 0; fi\n"
+                         "exit 1\n")
+            os.chmod(os.path.join(bindir, "python3"), 0o755)
+            env = dict(os.environ)
+            env["PATH"] = bindir + os.pathsep + env.get("PATH", "")
+            # Stdin held open: the run waits at the pause.
+            proc = subprocess.Popen(
+                ["bash", "install.sh", "--pause"], cwd=work, env=env,
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT, text=True)
+            try:
+                time.sleep(2)
+                self.assertIsNone(proc.poll())
+                proc.stdin.write("\n")
+                proc.stdin.flush()
+                rc = proc.wait(timeout=10)
+                self.assertEqual(rc, 1)
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                proc.wait()
+                proc.stdin.close()
+                proc.stdout.close()
+            # Stdin closed: no hang, same exit.
+            proc = subprocess.run(
+                ["bash", "install.sh", "--pause"], cwd=work, env=env,
+                stdin=subprocess.DEVNULL,
+                capture_output=True, text=True, timeout=30)
+            self.assertEqual(proc.returncode, 1)
+            self.assertIn("DUO needs Python 3.10 or newer",
+                          proc.stdout)
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+            shutil.rmtree(bindir, ignore_errors=True)
+
+    def test_install_sh_creates_desktop_icon_and_menu_entry(self):
+        # The whole install, end to end in a fake HOME: the
+        # installer writes BOTH the desktop icon and the menu
+        # entry, both executable, both with the real app folder
+        # baked in and no @APP_DIR@ left. The venv is pre-made (a
+        # link to the interpreter running this suite, which
+        # already has the pinned PySide6), so no venv creation and
+        # no network; a stub sudo that refuses stands in for a
+        # machine without sudo, so no real package install can
+        # happen.
+        work = tempfile.mkdtemp(prefix="duo-install-launcher-")
+        home = tempfile.mkdtemp(prefix="duo-install-home-")
+        bindir = tempfile.mkdtemp(prefix="duo-install-bin-")
+        try:
+            for name in os.listdir(self._tree()):
+                if name in ("__pycache__", ".venv"):
+                    continue
+                src = os.path.join(self._tree(), name)
+                dst = os.path.join(work, name)
+                if os.path.isdir(src):
+                    shutil.copytree(
+                        src, dst,
+                        ignore=shutil.ignore_patterns("__pycache__"))
+                else:
+                    shutil.copy(src, dst)
+            venv_bin = os.path.join(work, ".venv", "bin")
+            os.makedirs(venv_bin)
+            os.symlink(sys.executable,
+                       os.path.join(venv_bin, "python"))
+            with open(os.path.join(bindir, "sudo"), "w") as fh:
+                fh.write("#!/bin/sh\nexit 1\n")
+            os.chmod(os.path.join(bindir, "sudo"), 0o755)
+            env = dict(os.environ)
+            env["HOME"] = home
+            env["PATH"] = bindir + os.pathsep + env.get("PATH", "")
+            env["PIP_NO_INDEX"] = "1"
+            env["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
+            # The pre-made .venv is a link, not a real venv, so pip's
+            # PEP 668 guard trips on it; the shipped script always
+            # uses a real venv, where the guard never fires. And the
+            # linked interpreter resolves to the system python, so
+            # this suite's site-packages need to be on the path for
+            # the install's import and pip checks to see PySide6.
+            env["PIP_BREAK_SYSTEM_PACKAGES"] = "1"
+            site_packages = [p for p in sys.path
+                             if p.endswith("site-packages")]
+            if site_packages:
+                env["PYTHONPATH"] = (
+                    site_packages[0] + os.pathsep
+                    + env.get("PYTHONPATH", ""))
+            env["QT_QPA_PLATFORM"] = "offscreen"
+            proc = subprocess.run(
+                ["bash", "install.sh"], cwd=work, env=env,
+                capture_output=True, text=True, timeout=300)
+            self.assertEqual(proc.returncode, 0,
+                             proc.stdout + proc.stderr)
+            self.assertIn("Double-click the DUO icon on the desktop",
+                          proc.stdout)
+            self.assertIn("Added DUO to the app menu.", proc.stdout)
+            self.assertIn("Added the DUO icon to the desktop.",
+                          proc.stdout)
+            apps = os.path.join(home, ".local", "share", "applications")
+            menu_entry = os.path.join(apps, "DUO.desktop")
+            icon = os.path.join(home, "Desktop", "DUO.desktop")
+            for path in (menu_entry, icon):
+                self.assertTrue(os.path.isfile(path), path)
+                self.assertTrue(os.access(path, os.X_OK), path)
+                with open(path, encoding="utf-8") as fh:
+                    text = fh.read()
+                self.assertNotIn("@APP_DIR@", text)
+                self.assertIn('Exec="%s/run.sh"' % work, text)
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+            shutil.rmtree(home, ignore_errors=True)
+            shutil.rmtree(bindir, ignore_errors=True)
+
+    def test_readme_install_is_double_click_first(self):
+        readme = self._read("README.md")
+        self.assertIn("Install DUO", readme)
+        self.assertIn("double-click the DUO icon", readme)
+        self.assertIn("bash install.sh", readme)
 
 
 # ---------------------------------------------------------------------------
@@ -9038,6 +9292,12 @@ class MessageStructureTests(unittest.TestCase):
             script = fh.read()
         self.assertIn('"duo_accessibility.py": 0o100644', script)
 
+    def test_zip_includes_the_install_launcher(self):
+        with open(os.path.join(self._tree(), "build_zip.py"),
+                  encoding="utf-8") as fh:
+            script = fh.read()
+        self.assertIn('"Install DUO.desktop": 0o100755', script)
+
 class UpdateCheckTests(unittest.TestCase):
     """v0.28 (audit T17): the update check's pure core -- version
     parsing and comparison, and the GitHub latest-release lookup
@@ -9903,11 +10163,12 @@ class MenuBarTextTests(unittest.TestCase):
                          duo_menu.about_text(APP_VERSION))
         self.assertNotIn("\u2014", duo_menu.how_to_use_text())
 
-    def test_how_to_use_index_has_the_ten_sections(self):
+    def test_how_to_use_index_has_the_eleven_sections(self):
         import duo_menu
         headings = [heading for heading, _ in
                     duo_menu.HOW_TO_USE_SECTIONS]
         self.assertEqual(headings, [
+            "Installing DUO",
             "The two panes", "Sending a message", "The relay",
             "Tasks", "Attaching files",
             "Transcripts and conversations",
