@@ -48,6 +48,13 @@ class _SignalObject:
             # check_for_update's ("newer"/"latest"/"failed", version)
             # and manual says whether the button asked for it.
             update_checked = Signal(object, bool)
+            # Update download (v0.55): (result, ) where result is
+            # download_and_stage's ("staged"/"failed"/"cancelled",
+            # version-or-reason) tuple, and (downloaded, total)
+            # byte counts as the zip comes down (total is -1 when
+            # the release doesn't state the size).
+            update_downloaded = Signal(object)
+            update_progress = Signal(int, int)
             # Phone deck send: (text, target, holder dict with a
             # "done" Event and an "error" slot the GUI thread fills).
             phone_send = Signal(str, str, object)
@@ -62,6 +69,8 @@ class _SignalObject:
         self.models_loaded = self._inner.models_loaded
         self.models_failed = self._inner.models_failed
         self.update_checked = self._inner.update_checked
+        self.update_downloaded = self._inner.update_downloaded
+        self.update_progress = self._inner.update_progress
         self.phone_send = self._inner.phone_send
 
 
@@ -109,6 +118,52 @@ class _ModelLoader:
                         pass  # Window gone; nothing left to update.
 
         self.thread = _Thread()
+
+
+class _UpdateDownloader:
+    """Pulls the latest release off the GUI thread (the download
+    can take a while on a slow connection). Emits the result
+    through signals.update_downloaded and byte counts through
+    signals.update_progress as the zip comes down.
+
+    download_fn (optional) is the pull to run: it takes
+    progress= and cancel= keyword arguments, where progress is
+    called with (downloaded, total) byte counts and cancel is a
+    threading.Event the download checks between chunks.
+    dual_chat.py passes its own download_and_stage name, so
+    tests can stub the network by patching
+    dual_chat.download_and_stage -- the seam the v0.28 check
+    uses. When omitted the module's own download_and_stage runs.
+    cancel() stops a download in flight (the window's close
+    handler calls it before waiting for the thread)."""
+
+    def __init__(self, signals, download_fn=None):
+        import threading
+
+        from PySide6.QtCore import QThread
+
+        self._cancel = threading.Event()
+
+        class _Thread(QThread):
+            def run(inner_self):
+                if download_fn is not None:
+                    fn = download_fn
+                else:
+                    from duo_updater import download_and_stage
+                    fn = download_and_stage
+                result = fn(
+                    progress=lambda d, t: signals.update_progress
+                    .emit(d, t),
+                    cancel=self._cancel)
+                try:
+                    signals.update_downloaded.emit(result)
+                except RuntimeError:
+                    pass  # Window gone; nothing left to update.
+
+        self.thread = _Thread()
+
+    def cancel(self):
+        self._cancel.set()
 
 
 class _UpdateChecker:

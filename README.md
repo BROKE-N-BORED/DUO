@@ -89,8 +89,11 @@ Everything in one app:
 - **Update check** — DUO checks GitHub once at startup and says in
   the status bar when a newer Release is out (silently saying
   nothing when offline), and a "Check for updates" button runs the
-  same check whenever you like. It never downloads or installs
-  anything — you download from GitHub yourself.
+  same check whenever you like. When an update is out, a popup
+  asks whether to install it; only if you say yes does DUO pull
+  it down, check it against the release's checksum, and ask
+  whether to restart now to finish (Later waits until the next
+  time DUO starts).
 
 ## What you need
 
@@ -187,8 +190,9 @@ menu. (Or run `bash run.sh` from the app folder.)
   Tasks start closed, and your choice is remembered.
 - DUO checks for a newer Release once at startup and says so in
   the status bar when one is out; the "Check for updates" button
-  next to Phone deck runs the same check on demand. It never
-  downloads or installs anything.
+  next to Phone deck runs the same check on demand. When an
+  update is out, a popup asks whether to install it, and DUO
+  checks the download against the release's checksum first.
 - If Ollama isn't running, the pane says so in plain words.
 
 ## Relay

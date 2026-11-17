@@ -22,7 +22,9 @@ MSG_PHONE_TASK = "A task is running. Wait for it to finish, then send again."
 # is current, and what it says when the check itself failed. The
 # automatic startup check only ever shows the first one -- when
 # this copy is current or the check fails, it stays silent.
-MSG_UPDATE_AVAILABLE = "DUO %s is out. See the Releases page on GitHub."
+MSG_UPDATE_AVAILABLE = "DUO %s is out. Use Check for updates to get it."
+MSG_UPDATE_DOWNLOADING = "Downloading DUO %s..."
+MSG_UPDATE_PENDING = "The update will finish the next time DUO starts."
 MSG_UPDATE_LATEST = "You're on the latest version."
 MSG_UPDATE_FAILED = "Couldn't check for updates. Are you online?"
 MSG_PYSIDE6_MISSING = (

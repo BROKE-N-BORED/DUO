@@ -2,8 +2,22 @@
 
 Every version, newest first. v0.1–v0.17 were built on 2026-11-12;
 v0.18–v0.35 on 2026-11-13; v0.36–v0.49 on 2026-11-14; v0.50 on
-2026-11-15; v0.51–v0.52 on 2026-11-16; v0.53–v0.54 on
+2026-11-15; v0.51–v0.52 on 2026-11-16; v0.53–v0.55 on
 2026-11-17.
+
+## v0.55 — 2026-11-17
+
+DUO updates itself now, when you say so. It still checks
+silently at startup and says nothing when you are up to date,
+but when a newer Release is out a popup asks whether to update.
+Only if you tap Update does it pull the new version, and it
+checks the download against the release's checksum before
+installing anything, so a broken or tampered download never
+touches your copy. Once the download is checked, a second popup
+asks whether to restart now to finish: Yes restarts DUO on its
+own with the update applied, Later waits and the update finishes
+the next time DUO starts. Your saved pairs, transcripts and
+settings are untouched by an update.
 
 ## v0.54 — 2026-11-17
 

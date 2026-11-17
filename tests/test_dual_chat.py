@@ -5,7 +5,9 @@ Run from the project root:  python3 -m unittest discover -s tests -v
 """
 import copy
 import datetime
+import hashlib
 import inspect
+import io
 import json
 import os
 import shutil
@@ -18,6 +20,7 @@ import threading
 import time
 import unittest
 import urllib.error
+import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest import mock
 
@@ -39,7 +42,8 @@ from dual_chat import (  # noqa: E402
     MAX_ATTACHMENT_BYTES, MODEL_FIT_RESERVE_BYTES, MSG_EMPTY,
     MSG_MODEL_FAILED, MSG_OLLAMA_DOWN, MSG_OLLAMA_SLOW,
     MSG_PHONE_BUSY, MSG_PHONE_RELAY, MSG_PHONE_TARGET,
-    MSG_UPDATE_AVAILABLE, MSG_UPDATE_FAILED, MSG_UPDATE_LATEST,
+    MSG_UPDATE_AVAILABLE, MSG_UPDATE_DOWNLOADING, MSG_UPDATE_FAILED,
+    MSG_UPDATE_LATEST, MSG_UPDATE_PENDING,
     SETTINGS_APP, SETTINGS_ORG, SETTING_DIRECTOR_COLLAPSED,
     SETTING_ENTER_TO_SEND,
     SETTING_FIRST_RUN_DONE,
@@ -94,6 +98,8 @@ from dual_chat import (  # noqa: E402
     single_instance_name,
     valid_temperature, write_text_atomic,
 )
+
+import duo_updater  # noqa: E402  (the v0.55 self-update module)
 
 # One shared debug logger for the GUI tests, writing to a temp dir so
 # the test runs never leave a duo-debug.log in the project tree. (One
@@ -8954,7 +8960,8 @@ class ModuleSplitTests(unittest.TestCase):
                "duo_storage", "duo_runner", "duo_icon", "duo_menu",
                "duo_deck", "duo_workers", "duo_debug",
                "duo_attachments", "duo_single", "duo_motion",
-               "duo_constants", "duo_sparkline", "duo_accessibility")
+               "duo_constants", "duo_sparkline", "duo_accessibility",
+               "duo_updater")
 
     def _tree(self):
         return os.path.dirname(
@@ -9000,6 +9007,7 @@ class ModuleSplitTests(unittest.TestCase):
         import duo_tasks
         import duo_text
         import duo_transcript
+        import duo_updater
         import duo_workers
         pairs = [
             (dual_chat.make_app_icon, duo_icon.make_app_icon),
@@ -9078,6 +9086,14 @@ class ModuleSplitTests(unittest.TestCase):
             (dual_chat.live_rate, duo_sparkline.live_rate),
             (dual_chat.SPARKLINE_SAMPLE_MS,
              duo_sparkline.SPARKLINE_SAMPLE_MS),
+            (dual_chat.apply_pending_update,
+             duo_updater.apply_pending_update),
+            (dual_chat.download_and_stage,
+             duo_updater.download_and_stage),
+            (dual_chat.install_update_wiring,
+             duo_updater.install_update_wiring),
+            (dual_chat.offer_update, duo_updater.offer_update),
+            (dual_chat.restart_quietly, duo_updater.restart_quietly),
         ]
         for through_dual_chat, original in pairs:
             self.assertIs(through_dual_chat, original, original)
@@ -9593,6 +9609,11 @@ class UpdateCheckGuiTests(unittest.TestCase):
         self._patcher = mock.patch("dual_chat.check_for_update",
                                    side_effect=self._stub_check)
         self._patcher.start()
+        # v0.55: a "newer" result also pops the update offer; these
+        # tests pin the status note, so the popup answers Not now.
+        self._offer_patcher = mock.patch(
+            "dual_chat.offer_update", return_value=False)
+        self._offer_patcher.start()
         self.client.reset()
 
     def tearDown(self):
@@ -9602,6 +9623,7 @@ class UpdateCheckGuiTests(unittest.TestCase):
             self.window.close()
         self.app.processEvents()
         self._patcher.stop()
+        self._offer_patcher.stop()
 
     def _stub_check(self, *args, **kwargs):
         call_no = len(self.check_calls)
@@ -9750,6 +9772,767 @@ class UpdateCheckGuiTests(unittest.TestCase):
         self.assertTrue(self._wait_for(
             lambda: self._message()
             == MSG_UPDATE_AVAILABLE % "0.30"), self._message())
+
+
+class UpdaterTests(unittest.TestCase):
+    """v0.55 (standing order 2026-11-17): the self-update's pure
+    core -- finding the release's files, the verified download,
+    staging, and applying -- against stubbed HTTP responses and
+    temp app folders. No Qt, no network, no real app folder: every
+    path here points at a temp dir the test owns."""
+
+    RELEASE_URL = "http://127.0.0.1/fake/releases/latest"
+    ZIP_URL = "http://127.0.0.1/fake/duo-0.99.zip"
+    SHA_URL = "http://127.0.0.1/fake/duo-0.99.zip.sha256"
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="duo-update-test-")
+        self.addCleanup(shutil.rmtree, self.root, True)
+
+    class _Response:
+        """A urlopen answer: read() works with or without a size,
+        like a real HTTP response."""
+
+        def __init__(self, body):
+            self._body = body
+            self._pos = 0
+
+        def read(self, size=-1):
+            if size is None or size < 0:
+                chunk = self._body[self._pos:]
+                self._pos = len(self._body)
+                return chunk
+            chunk = self._body[self._pos:self._pos + size]
+            self._pos += len(chunk)
+            return chunk
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def _open(self, mapping, error=None):
+        """A urlopen stub: serves mapping[url] bytes, raises
+        `error` for every request when given."""
+
+        def opener(request, timeout=None):
+            if error is not None:
+                raise error
+            url = (request.full_url if hasattr(request, "full_url")
+                   else request)
+            if url not in mapping:
+                raise urllib.error.URLError("no such URL: " + url)
+            return self._Response(mapping[url])
+
+        return opener
+
+    def _release_body(self, tag="v0.99", with_zip=True,
+                      with_sha=True, zip_size=None):
+        assets = []
+        if with_zip:
+            asset = {"name": "duo-0.99.zip",
+                     "browser_download_url": self.ZIP_URL}
+            if zip_size is not None:
+                asset["size"] = zip_size
+            assets.append(asset)
+        if with_sha:
+            assets.append({"name": "duo-0.99.zip.sha256",
+                           "browser_download_url": self.SHA_URL})
+        return json.dumps({"tag_name": tag,
+                           "assets": assets}).encode("utf-8")
+
+    def _make_zip(self, members):
+        """A release zip in memory: members are (name, bytes) or
+        (name, bytes, mode) tuples, names under duo/."""
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as archive:
+            for member in members:
+                if len(member) == 3:
+                    name, data, mode = member
+                    info = zipfile.ZipInfo(name)
+                    info.external_attr = mode << 16
+                    archive.writestr(info, data)
+                else:
+                    name, data = member
+                    archive.writestr(name, data)
+        return buf.getvalue()
+
+    def _stage(self, zip_bytes, sha_hex, version="0.99"):
+        """Hand-build a staged update in the temp app folder."""
+        staging = duo_updater.staging_dir(self.root)
+        os.makedirs(staging, exist_ok=True)
+        with open(os.path.join(staging, duo_updater.UPDATE_ZIP_NAME),
+                  "wb") as fh:
+            fh.write(zip_bytes)
+        with open(os.path.join(staging, duo_updater.UPDATE_SHA_NAME),
+                  "w", encoding="utf-8") as fh:
+            fh.write(sha_hex)
+        with open(os.path.join(
+                staging, duo_updater.UPDATE_VERSION_NAME),
+                "w", encoding="utf-8") as fh:
+            fh.write(version)
+        with open(os.path.join(staging, duo_updater.UPDATE_READY_NAME),
+                  "w", encoding="utf-8") as fh:
+            fh.write(version)
+        return staging
+
+    def _sha(self, data):
+        return hashlib.sha256(data).hexdigest()
+
+    # -- the checksum sidecar --------------------------------------
+
+    def test_parse_sidecar_bare_hex(self):
+        digest = "a" * 64
+        self.assertEqual(duo_updater.parse_sha256_sidecar(digest),
+                         digest)
+
+    def test_parse_sidecar_sha256sum_format(self):
+        digest = "b" * 64
+        self.assertEqual(
+            duo_updater.parse_sha256_sidecar(
+                "%s  duo-0.99.zip\n" % digest),
+            digest)
+
+    def test_parse_sidecar_garbage_is_none(self):
+        for bad in ("", "not a digest", "a" * 63, "g" * 64,
+                    "a" * 65, None, 5):
+            self.assertIsNone(duo_updater.parse_sha256_sidecar(bad),
+                              bad)
+
+    # -- finding the release's files --------------------------------
+
+    def test_fetch_assets_happy_path(self):
+        result = duo_updater.fetch_release_assets(
+            url=self.RELEASE_URL,
+            urlopen=self._open({self.RELEASE_URL:
+                                self._release_body(zip_size=1234)}))
+        self.assertEqual(result, ("0.99", self.ZIP_URL, self.SHA_URL,
+                                  1234))
+
+    def test_fetch_assets_missing_sha_refuses(self):
+        with self.assertRaises(duo_updater.UpdateError) as caught:
+            duo_updater.fetch_release_assets(
+                url=self.RELEASE_URL,
+                urlopen=self._open(
+                    {self.RELEASE_URL:
+                     self._release_body(with_sha=False)}))
+        self.assertIn("checksum", str(caught.exception))
+
+    def test_fetch_assets_missing_zip_refuses(self):
+        with self.assertRaises(duo_updater.UpdateError):
+            duo_updater.fetch_release_assets(
+                url=self.RELEASE_URL,
+                urlopen=self._open(
+                    {self.RELEASE_URL:
+                     self._release_body(with_zip=False)}))
+
+    def test_fetch_assets_bad_tag_refuses(self):
+        with self.assertRaises(duo_updater.UpdateError):
+            duo_updater.fetch_release_assets(
+                url=self.RELEASE_URL,
+                urlopen=self._open(
+                    {self.RELEASE_URL: self._release_body(
+                        tag="banana")}))
+
+    def test_fetch_assets_bad_json_refuses(self):
+        with self.assertRaises(duo_updater.UpdateError):
+            duo_updater.fetch_release_assets(
+                url=self.RELEASE_URL,
+                urlopen=self._open(
+                    {self.RELEASE_URL: b"not json at all"}))
+
+    def test_fetch_assets_http_error_refuses(self):
+        error = urllib.error.HTTPError(
+            self.RELEASE_URL, 403, "Forbidden", {}, None)
+        with self.assertRaises(duo_updater.UpdateError) as caught:
+            duo_updater.fetch_release_assets(
+                url=self.RELEASE_URL,
+                urlopen=self._open({}, error=error))
+        self.assertIn("403", str(caught.exception))
+
+    def test_fetch_assets_network_error_refuses(self):
+        with self.assertRaises(duo_updater.UpdateError):
+            duo_updater.fetch_release_assets(
+                url=self.RELEASE_URL,
+                urlopen=self._open(
+                    {}, error=urllib.error.URLError("no route")))
+
+    # -- the verified download --------------------------------------
+
+    def _download_mapping(self, zip_bytes, sha_hex=None,
+                          with_sha=True):
+        if sha_hex is None:
+            sha_hex = self._sha(zip_bytes)
+        mapping = {
+            self.RELEASE_URL: self._release_body(
+                with_sha=with_sha, zip_size=len(zip_bytes)),
+            self.ZIP_URL: zip_bytes,
+        }
+        if with_sha:
+            mapping[self.SHA_URL] = (
+                "%s  duo-0.99.zip\n" % sha_hex).encode("utf-8")
+        return mapping
+
+    def test_download_stages_verified_update(self):
+        zip_bytes = self._make_zip([
+            ("duo/dual_chat.py", b"NEW"),
+            ("duo/run.sh", b"NEW", 0o100755),
+        ])
+        progress = []
+        result = duo_updater.download_and_stage(
+            root=self.root, url=self.RELEASE_URL,
+            urlopen=self._open(self._download_mapping(zip_bytes)),
+            progress=lambda d, t: progress.append((d, t)))
+        self.assertEqual(result, ("staged", "0.99"))
+        staging = duo_updater.staging_dir(self.root)
+        with open(os.path.join(staging,
+                               duo_updater.UPDATE_ZIP_NAME),
+                  "rb") as fh:
+            self.assertEqual(fh.read(), zip_bytes)
+        self.assertTrue(os.path.isfile(os.path.join(
+            staging, duo_updater.UPDATE_READY_NAME)))
+        self.assertTrue(duo_updater.has_pending_update(self.root))
+        # One chunk (the zip is small): progress reports the full
+        # download against the release's stated size.
+        self.assertEqual(progress, [(len(zip_bytes),
+                                     len(zip_bytes))])
+
+    def test_download_reports_progress_per_chunk(self):
+        # Random bytes: incompressible, so the zip stays big
+        # whatever compression the writer picks.
+        big = os.urandom(duo_updater.DOWNLOAD_CHUNK * 2 + 100)
+        zip_bytes = self._make_zip([("duo/big.bin", big)])
+        progress = []
+        result = duo_updater.download_and_stage(
+            root=self.root, url=self.RELEASE_URL,
+            urlopen=self._open(self._download_mapping(zip_bytes)),
+            progress=lambda d, t: progress.append((d, t)))
+        self.assertEqual(result, ("staged", "0.99"))
+        self.assertGreater(len(progress), 1)
+        self.assertEqual(progress[-1],
+                         (len(zip_bytes), len(zip_bytes)))
+        downloaded = [d for d, _ in progress]
+        self.assertEqual(downloaded, sorted(downloaded))
+
+    def test_download_checksum_mismatch_fails_clean(self):
+        zip_bytes = self._make_zip([("duo/dual_chat.py", b"NEW")])
+        result = duo_updater.download_and_stage(
+            root=self.root, url=self.RELEASE_URL,
+            urlopen=self._open(self._download_mapping(
+                zip_bytes, sha_hex="0" * 64)))
+        self.assertEqual(result[0], "failed")
+        self.assertIn("checksum", result[1])
+        self.assertFalse(duo_updater.has_pending_update(self.root))
+        staging = duo_updater.staging_dir(self.root)
+        self.assertFalse(os.path.isfile(os.path.join(
+            staging, duo_updater.UPDATE_ZIP_NAME)))
+
+    def test_download_missing_sidecar_fails(self):
+        zip_bytes = self._make_zip([("duo/dual_chat.py", b"NEW")])
+        result = duo_updater.download_and_stage(
+            root=self.root, url=self.RELEASE_URL,
+            urlopen=self._open(self._download_mapping(
+                zip_bytes, with_sha=False)))
+        self.assertEqual(result[0], "failed")
+        self.assertIn("checksum", result[1])
+
+    def test_download_cancelled_before_first_chunk(self):
+        zip_bytes = self._make_zip([("duo/dual_chat.py", b"NEW")])
+        cancel = threading.Event()
+        cancel.set()
+        result = duo_updater.download_and_stage(
+            root=self.root, url=self.RELEASE_URL,
+            urlopen=self._open(self._download_mapping(zip_bytes)),
+            cancel=cancel)
+        self.assertEqual(result, ("cancelled", None))
+        self.assertFalse(duo_updater.has_pending_update(self.root))
+
+    def test_download_never_raises(self):
+        result = duo_updater.download_and_stage(
+            root=self.root, url=self.RELEASE_URL,
+            urlopen=self._open({}, error=RuntimeError("boom")))
+        self.assertEqual(result[0], "failed")
+
+    # -- staging -----------------------------------------------------
+
+    def test_has_pending_update_needs_the_marker(self):
+        staging = duo_updater.staging_dir(self.root)
+        os.makedirs(staging, exist_ok=True)
+        with open(os.path.join(staging,
+                               duo_updater.UPDATE_ZIP_NAME),
+                  "wb") as fh:
+            fh.write(b"zip")
+        self.assertFalse(duo_updater.has_pending_update(self.root))
+        for name in (duo_updater.UPDATE_SHA_NAME,
+                     duo_updater.UPDATE_VERSION_NAME,
+                     duo_updater.UPDATE_READY_NAME):
+            with open(os.path.join(staging, name), "w") as fh:
+                fh.write("x")
+        self.assertTrue(duo_updater.has_pending_update(self.root))
+
+    def test_discard_removes_staging(self):
+        self._stage(b"zip", "a" * 64)
+        self.assertTrue(os.path.isdir(
+            duo_updater.staging_dir(self.root)))
+        duo_updater.discard_staged_update(self.root)
+        self.assertFalse(os.path.exists(
+            duo_updater.staging_dir(self.root)))
+        duo_updater.discard_staged_update(self.root)  # twice is fine
+
+    # -- applying ----------------------------------------------------
+
+    def _fake_app_root(self):
+        with open(os.path.join(self.root, "dual_chat.py"),
+                  "w") as fh:
+            fh.write("OLD")
+        with open(os.path.join(self.root, "duo_updater.py"),
+                  "w") as fh:
+            fh.write("OLD")
+        run_sh = os.path.join(self.root, "run.sh")
+        with open(run_sh, "w") as fh:
+            fh.write("OLD")
+        os.chmod(run_sh, 0o644)
+        with open(os.path.join(self.root, "duo-pairs.json"),
+                  "w") as fh:
+            fh.write("MY PAIRS")
+        with open(os.path.join(self.root, "duo-debug.log"),
+                  "w") as fh:
+            fh.write("MY LOG")
+
+    def _read(self, name):
+        with open(os.path.join(self.root, name)) as fh:
+            return fh.read()
+
+    def test_apply_installs_staged_update(self):
+        self._fake_app_root()
+        zip_bytes = self._make_zip([
+            ("duo/dual_chat.py", b"NEW"),
+            ("duo/run.sh", b"NEW", 0o100755),
+            ("duo/new_module.py", b"NEW"),
+        ])
+        self._stage(zip_bytes, self._sha(zip_bytes))
+        result = duo_updater.apply_pending_update(self.root)
+        self.assertEqual(result, ("applied", "0.99"))
+        self.assertEqual(self._read("dual_chat.py"), "NEW")
+        self.assertEqual(self._read("run.sh"), "NEW")
+        self.assertEqual(oct(os.stat(
+            os.path.join(self.root, "run.sh")).st_mode & 0o777),
+            "0o755")
+        self.assertEqual(self._read("new_module.py"), "NEW")
+        # The user's own files are untouched.
+        self.assertEqual(self._read("duo-pairs.json"), "MY PAIRS")
+        self.assertEqual(self._read("duo-debug.log"), "MY LOG")
+        # Files the release does not ship stay as they were (the
+        # known limitation in duo_updater's docstring).
+        self.assertEqual(self._read("duo_updater.py"), "OLD")
+        self.assertFalse(os.path.exists(
+            duo_updater.staging_dir(self.root)))
+
+    def test_apply_nothing_staged_is_none(self):
+        self.assertEqual(duo_updater.apply_pending_update(self.root),
+                         ("none", None))
+
+    def test_apply_checksum_mismatch_discards(self):
+        self._fake_app_root()
+        zip_bytes = self._make_zip([("duo/dual_chat.py", b"NEW")])
+        self._stage(zip_bytes, "0" * 64)
+        result = duo_updater.apply_pending_update(self.root)
+        self.assertEqual(result[0], "failed")
+        self.assertIn("check out", result[1])
+        self.assertEqual(self._read("dual_chat.py"), "OLD")
+        self.assertFalse(os.path.exists(
+            duo_updater.staging_dir(self.root)))
+
+    def test_apply_rejects_path_escape(self):
+        self._fake_app_root()
+        zip_bytes = self._make_zip([
+            ("duo/dual_chat.py", b"NEW"),
+            ("duo/../../evil.txt", b"EVIL"),
+        ])
+        self._stage(zip_bytes, self._sha(zip_bytes))
+        result = duo_updater.apply_pending_update(self.root)
+        self.assertEqual(result[0], "failed")
+        self.assertEqual(self._read("dual_chat.py"), "OLD")
+        self.assertFalse(os.path.exists(os.path.join(
+            os.path.dirname(self.root), "evil.txt")))
+        self.assertFalse(os.path.exists(
+            duo_updater.staging_dir(self.root)))
+
+    def test_apply_rejects_member_outside_prefix(self):
+        self._fake_app_root()
+        zip_bytes = self._make_zip([
+            ("duo/dual_chat.py", b"NEW"),
+            ("other/file.txt", b"EVIL"),
+        ])
+        self._stage(zip_bytes, self._sha(zip_bytes))
+        result = duo_updater.apply_pending_update(self.root)
+        self.assertEqual(result[0], "failed")
+        self.assertEqual(self._read("dual_chat.py"), "OLD")
+        self.assertFalse(os.path.exists(
+            os.path.join(self.root, "other")))
+        self.assertFalse(os.path.exists(
+            duo_updater.staging_dir(self.root)))
+
+    def test_apply_bad_zip_discards(self):
+        self._fake_app_root()
+        garbage = b"this is not a zip file"
+        self._stage(garbage, self._sha(garbage))
+        result = duo_updater.apply_pending_update(self.root)
+        self.assertEqual(result[0], "failed")
+        self.assertEqual(self._read("dual_chat.py"), "OLD")
+        self.assertFalse(os.path.exists(
+            duo_updater.staging_dir(self.root)))
+
+    # -- restarting ---------------------------------------------------
+
+    def test_restart_argv_shape(self):
+        argv = ["/home/joshua/DUO/dual_chat.py",
+                "--ollama-url", "http://127.0.0.1:11434"]
+        with mock.patch.object(sys, "argv", argv):
+            self.assertEqual(
+                duo_updater.restart_argv(),
+                [sys.executable] + argv)
+
+    def test_apply_and_restart_sets_flag_closes_and_quits(self):
+        self._fake_app_root()
+        zip_bytes = self._make_zip([("duo/dual_chat.py", b"NEW")])
+        self._stage(zip_bytes, self._sha(zip_bytes))
+
+        class _FakeWindow:
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        class _FakeApp:
+            def __init__(self):
+                self.quit_called = False
+
+            def quit(self):
+                self.quit_called = True
+
+        fake_app = _FakeApp()
+
+        class _FakeQtWidgets:
+            class QApplication:
+                @staticmethod
+                def instance():
+                    return fake_app
+
+        window = _FakeWindow()
+        state = {}
+        with mock.patch("duo_updater._qt_widgets",
+                        return_value=_FakeQtWidgets):
+            result = duo_updater.apply_and_restart(
+                window, state, root=self.root)
+        self.assertEqual(result, ("applied", "0.99"))
+        self.assertTrue(state["restart_for_update"])
+        self.assertTrue(window.closed)
+        self.assertTrue(fake_app.quit_called)
+        self.assertEqual(self._read("dual_chat.py"), "NEW")
+
+    def test_apply_and_restart_failed_keeps_window_open(self):
+        class _FakeWindow:
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        window = _FakeWindow()
+        state = {}
+        result = duo_updater.apply_and_restart(
+            window, state, root=self.root)
+        self.assertEqual(result[0], "failed")
+        self.assertNotIn("restart_for_update", state)
+        self.assertFalse(window.closed)
+
+
+@unittest.skipUnless(os.environ.get("DUAL_CHAT_GUI_TESTS") == "1",
+                     "GUI tests run with DUAL_CHAT_GUI_TESTS=1")
+class UpdaterGuiTests(unittest.TestCase):
+    """v0.55: the update popups and the download flow in the window
+    -- the offer on a newer check, the download worker, the
+    restart ask. The network is stubbed at dual_chat's seam
+    (check_for_update, download_and_stage); the popups are real
+    QMessageBoxes, answered by a QTimer that fires inside the
+    dialog's own event loop (exec() blocks the GUI thread, so
+    nothing else could click them)."""
+
+    @classmethod
+    def setUpClass(cls):
+        from PySide6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+        cls.client = FakeGuiClient()
+
+    def setUp(self):
+        self.check_result = ("latest", None)
+        self.check_first_result = None
+        self.check_gate = None
+        self.check_calls = []
+        self.download_result = ("failed", "no download stubbed")
+        self.download_calls = []
+        self.download_gate = None
+        self.download_wait_cancel = False
+        self.download_progress = None
+        self.ask_result = False
+        self.ask_calls = []
+        self.window = None
+        self._modal_clicks = []
+        self._clicker = None
+        self._patcher = mock.patch("dual_chat.check_for_update",
+                                   side_effect=self._stub_check)
+        self._patcher.start()
+        self._download_patcher = mock.patch(
+            "dual_chat.download_and_stage",
+            side_effect=self._stub_download)
+        self._download_patcher.start()
+        # ask_restart/apply_and_restart are called from
+        # duo_updater's namespace (the wiring lives there), so
+        # they are patched there, not on dual_chat.
+        self._ask_patcher = mock.patch(
+            "duo_updater.ask_restart",
+            side_effect=self._stub_ask_restart)
+        self._ask_patcher.start()
+        self.client.reset()
+
+    def tearDown(self):
+        if self.check_gate is not None:
+            self.check_gate.set()
+        if self.download_gate is not None:
+            self.download_gate.set()
+        if self._clicker is not None:
+            self._clicker.stop()
+        if self.window is not None:
+            self.window.close()
+        self.app.processEvents()
+        self._patcher.stop()
+        self._download_patcher.stop()
+        self._ask_patcher.stop()
+
+    def _stub_check(self, *args, **kwargs):
+        call_no = len(self.check_calls)
+        self.check_calls.append(args)
+        if self.check_gate is not None and call_no == 0:
+            self.check_gate.wait(timeout=10)
+        if call_no == 0 and self.check_first_result is not None:
+            return self.check_first_result
+        return self.check_result
+
+    def _stub_download(self, *args, **kwargs):
+        self.download_calls.append((args, kwargs))
+        progress = kwargs.get("progress")
+        if (self.download_progress is not None
+                and progress is not None):
+            progress(*self.download_progress)
+        if self.download_wait_cancel:
+            cancel = kwargs.get("cancel")
+            if cancel is not None:
+                cancel.wait(timeout=15)
+            return ("cancelled", None)
+        if self.download_gate is not None:
+            self.download_gate.wait(timeout=10)
+        return self.download_result
+
+    def _stub_ask_restart(self, parent, version):
+        self.ask_calls.append(version)
+        return self.ask_result
+
+    def _build_window(self):
+        from dual_chat import build_window
+        self.window = build_window(self.client, logger=TEST_LOGGER)
+        self.window.show()
+        self.state = self.window._dual_chat
+        self.assertTrue(self._wait_for(
+            lambda: self.state["widgets"]["A"]["picker"].count() == 2),
+            "pickers should load the fake models")
+
+    def _wait_for(self, cond, timeout=10.0):
+        from PySide6.QtTest import QTest
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            QTest.qWait(50)
+            if cond():
+                return True
+        return cond()
+
+    def _message(self):
+        return self.state["status_label"].text()
+
+    def _arm_modal_clicker(self, text):
+        """Click the button labelled `text` in the next modal
+        dialog. The timer fires inside the dialog's own event
+        loop; it stops itself once it has clicked."""
+        from PySide6.QtCore import QTimer
+        from PySide6.QtWidgets import QApplication, QPushButton
+
+        def _click():
+            modal = QApplication.activeModalWidget()
+            if modal is None:
+                return
+            for btn in modal.findChildren(QPushButton):
+                if btn.text() == text and btn.isEnabled():
+                    self._modal_clicks.append(text)
+                    btn.click()
+                    self._clicker.stop()
+                    return
+
+        self._clicker = QTimer(self.window)
+        self._clicker.timeout.connect(_click)
+        self._clicker.start(50)
+
+    def _manual_check_newer(self):
+        self.assertTrue(self._wait_for(
+            lambda: len(self.check_calls) >= 1))
+        self.check_result = ("newer", "0.99")
+        self.state["update_btn"].click()
+
+    def test_offer_not_now_keeps_note_and_downloads_nothing(self):
+        self._build_window()
+        self._arm_modal_clicker("Not now")
+        self._manual_check_newer()
+        self.assertTrue(self._wait_for(
+            lambda: self._message()
+            == MSG_UPDATE_AVAILABLE % "0.99"), self._message())
+        self.assertIn("Not now", self._modal_clicks)
+        self.assertEqual(self.download_calls, [])
+        self.assertEqual(self.state["update_downloaders"], [])
+
+    def test_startup_check_newer_offers_the_popup(self):
+        # Hold the startup check until the model list has loaded,
+        # or "Ollama connected" lands over the update note.
+        self.check_gate = threading.Event()
+        self.check_first_result = ("newer", "0.99")
+        self._build_window()
+        self._arm_modal_clicker("Not now")
+        self.assertEqual(self._message(),
+                         "Ollama connected: 2 model(s) found.")
+        self.check_gate.set()
+        self.assertTrue(self._wait_for(
+            lambda: self._message()
+            == MSG_UPDATE_AVAILABLE % "0.99"), self._message())
+        self.assertIn("Not now", self._modal_clicks)
+        self.assertEqual(self.download_calls, [])
+
+    def test_offer_update_starts_download_and_later_leaves_note(self):
+        self.download_result = ("staged", "0.99")
+        self.ask_result = False
+        self._build_window()
+        self._arm_modal_clicker("Update")
+        self._manual_check_newer()
+        self.assertTrue(self._wait_for(
+            lambda: self._message() == MSG_UPDATE_PENDING),
+            self._message())
+        self.assertEqual(len(self.download_calls), 1)
+        self.assertEqual(self.ask_calls, ["0.99"])
+
+    def test_restart_now_calls_apply_and_restart(self):
+        self.download_result = ("staged", "0.99")
+        self.ask_result = True
+        apply_calls = []
+        with mock.patch(
+                "duo_updater.apply_and_restart",
+                side_effect=lambda w, s: apply_calls.append(
+                    (w, s)) or ("applied", "0.99")):
+            self._build_window()
+            self._arm_modal_clicker("Update")
+            self._manual_check_newer()
+            self.assertTrue(self._wait_for(
+                lambda: len(apply_calls) == 1))
+        window, state = apply_calls[0]
+        self.assertIs(window, self.window)
+        self.assertIs(state, self.state["state"])
+
+    def test_download_failed_shows_reason(self):
+        reason = "The download broke off. Are you still online?"
+        self.download_result = ("failed", reason)
+        self._build_window()
+        self._arm_modal_clicker("Update")
+        self._manual_check_newer()
+        self.assertTrue(self._wait_for(
+            lambda: self._message() == reason), self._message())
+        self.assertEqual(self.ask_calls, [])
+
+    def test_download_progress_shows_kilobytes(self):
+        self.download_progress = (512 * 1024, 1024 * 1024)
+        self.download_gate = threading.Event()
+        self.download_result = ("staged", "0.99")
+        self.ask_result = False
+        self._build_window()
+        self._arm_modal_clicker("Update")
+        self._manual_check_newer()
+        self.assertTrue(self._wait_for(
+            lambda: self._message()
+            == "Downloading update... 512 KB of 1024 KB"),
+            self._message())
+        self.download_gate.set()
+        self.assertTrue(self._wait_for(
+            lambda: self._message() == MSG_UPDATE_PENDING),
+            self._message())
+
+    def test_second_download_tap_while_running_starts_no_second(self):
+        self.download_wait_cancel = True
+        self._build_window()
+        self.state["run_update_download"]("0.99")
+        self.assertTrue(self._wait_for(
+            lambda: len(self.state["update_downloaders"]) == 1
+            and self.state["update_downloaders"][0].thread
+            .isRunning()))
+        self.state["run_update_download"]("0.99")
+        self.app.processEvents()
+        self.assertEqual(len(self.state["update_downloaders"]), 1)
+        self.assertEqual(len(self.download_calls), 1)
+        # Closing cancels the download and waits for the thread.
+        self.window.close()
+        self.app.processEvents()
+        self.assertFalse(self.window.isVisible())
+
+    def test_closing_while_a_download_runs_waits_for_it(self):
+        # v0.31: destroying a running QThread aborts the whole
+        # process (exit 134). Closing mid-download must cancel
+        # the download and wait for the thread instead.
+        self.download_wait_cancel = True
+        self._build_window()
+        self.state["run_update_download"]("0.99")
+        downloaders = self.state["update_downloaders"]
+        self.assertTrue(self._wait_for(
+            lambda: len(downloaders) == 1
+            and downloaders[0].thread.isRunning(),
+            timeout=10),
+            "the download should be running")
+        downloader = downloaders[0]
+        self.window.close()
+        self.app.processEvents()
+        self.assertFalse(self.window.isVisible())
+        self.assertTrue(downloader.thread.isFinished())
+        self.assertTrue(self._wait_for(lambda: downloaders == []),
+                        "the finished downloader should be cleaned up")
+
+    def test_offer_skipped_over_another_dialog(self):
+        from PySide6.QtWidgets import QDialog
+        self._build_window()
+        dialog = QDialog(self.window)
+        dialog.setModal(True)
+        dialog.show()
+        self.app.processEvents()
+        try:
+            self.assertFalse(duo_updater.offer_update(
+                self.window, "0.99", self.state["state"]))
+        finally:
+            dialog.close()
+        self.assertNotIn("update_offer_open",
+                         self.state["state"])
+
+    def test_offer_flag_blocks_a_second_offer(self):
+        self._build_window()
+        self.state["state"]["update_offer_open"] = True
+        try:
+            self.assertFalse(duo_updater.offer_update(
+                self.window, "0.99", self.state["state"]))
+        finally:
+            self.state["state"]["update_offer_open"] = False
 
 
 # ---------------------------------------------------------------------------
@@ -10279,7 +11062,7 @@ class MenuBarTextTests(unittest.TestCase):
     def test_update_notes_use_plain_punctuation(self):
         self.assertEqual(
             MSG_UPDATE_AVAILABLE,
-            "DUO %s is out. See the Releases page on GitHub.")
+            "DUO %s is out. Use Check for updates to get it.")
         self.assertEqual(
             MSG_UPDATE_FAILED,
             "Couldn't check for updates. Are you online?")

@@ -168,6 +168,12 @@ v0.31: the director bar collapses (audit T19). One "Director"
   between runs. Collapsing never touches running work. The phone
   deck moved to its own module (duo_deck.py) to make room: the
   window file was 16 lines under its 4,000-line bound.
+v0.55: the update story grows up (standing order 2026-11-17).
+  When a newer Release is out, a popup asks whether to update;
+  on the user's tap DUO pulls it, checks the zip against the
+  release's checksum before installing anything, and asks
+  whether to restart now to finish -- Yes restarts DUO on its
+  own, No leaves the update staged for the next launch.
 """
 
 import html
@@ -205,6 +211,7 @@ from duo_constants import (
     MSG_STOPPED, MSG_RELAY_NEEDS_BOTH, MSG_RELAY_STOPPED_BY_YOU,
     MSG_PHONE_BUSY, MSG_PHONE_RELAY, MSG_PHONE_TASK,
     MSG_UPDATE_AVAILABLE, MSG_UPDATE_LATEST, MSG_UPDATE_FAILED,
+    MSG_UPDATE_DOWNLOADING, MSG_UPDATE_PENDING,
     MSG_PYSIDE6_MISSING, SIDE_STATES, ERROR_STATE_HOLD_MS,
     RELAY_CHIP_STATES, METER_REFRESH_MS, SETTINGS_ORG, SETTINGS_APP,
     SETTING_ENTER_TO_SEND, SETTING_DIRECTOR_COLLAPSED,
@@ -273,12 +280,15 @@ from duo_transcript import (
     default_full_filename, default_side_filename,
     format_both_transcript, format_full_transcript, format_side_transcript,
     load_side_transcript_file, parse_side_transcript, sanitize_filename_part,)
+from duo_updater import (apply_pending_update, download_and_stage,
+                         install_update_wiring, offer_update,
+                         restart_quietly,)
 from duo_workers import (_ModelLoader, _SignalObject,
                          _Signals, _UpdateChecker, _qt,)
 
 
 APP_NAME = "DUO"
-APP_VERSION = "0.54"
+APP_VERSION = "0.55"
 
 
 
@@ -3512,6 +3522,10 @@ def build_window(client=None, logger=None, deck_port=None):
             logger.action("update available: DUO %s" % version)
             set_status_message(
                 MSG_UPDATE_AVAILABLE % version)
+            # The popup asks (v0.55): one at a time, never over
+            # another dialog -- the status note stays as backup.
+            if offer_update(window, version, state):
+                window._dual_chat["run_update_download"](version)
         elif manual and status == "latest":
             logger.info("update check: up to date")
             set_status_message(MSG_UPDATE_LATEST)
@@ -3762,6 +3776,12 @@ def build_window(client=None, logger=None, deck_port=None):
         "set_tasks_collapsed": _set_tasks_collapsed,
     }
 
+    # The download half of the update flow (v0.55): the worker,
+    # its progress and result slots. The close handler below
+    # waits for the downloaders it returns.
+    update_downloaders = install_update_wiring(
+        window, alive, download_fn=download_and_stage)
+
     # Closing the window stops only DUO: Ollama keeps running, the
     # way DUO found it -- DUO never starts or stops a server.
     _orig_close_event = window.closeEvent
@@ -3775,7 +3795,12 @@ def build_window(client=None, logger=None, deck_port=None):
         # its retries, the update check by its 5s timeout), so the
         # wait always ends; the workers only do network I/O and
         # emit one signal, so waiting here cannot deadlock.
-        for _holders in (loaders, update_checkers):
+        # A download in flight is cancelled first: without this,
+        # the wait below could last as long as the download.
+        for _holder in list(update_downloaders):
+            _holder.cancel()
+        for _holders in (loaders, update_checkers,
+                         update_downloaders):
             for _holder in list(_holders):
                 if _holder.thread.isRunning():
                     _holder.thread.wait()
@@ -3901,6 +3926,10 @@ def _show_missing_pyside6():
 
 
 def main(argv=None):
+    # A staged update from the last run (v0.55): apply it before
+    # anything starts, then restart so the new version runs.
+    if apply_pending_update()[0] == "applied":
+        restart_quietly()
     argv = list(sys.argv[1:] if argv is None else argv)
     base_url = None
     if "--ollama-url" in argv:
@@ -3939,7 +3968,12 @@ def main(argv=None):
         window._dual_chat["big_text"].offer(window)
         window._dual_chat["menu_actions"]["big_text"].setChecked(
             window._dual_chat["big_text"].value)
-    return app.exec()
+    code = app.exec()
+    # Restart for update (v0.55): the Restart-now path set the
+    # flag and closed the window; re-exec on the new files.
+    if window._dual_chat["state"].get("restart_for_update"):
+        restart_quietly()
+    return code
 
 
 if __name__ == "__main__":

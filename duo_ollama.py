@@ -175,8 +175,9 @@ def parse_ps_payload(payload):
 
 
 # --- Update check (v0.28, audit T17) ---------------------------------------
-# DUO tells the user when a newer Release exists. It never downloads
-# or installs anything -- the user downloads from GitHub themselves.
+# DUO tells the user when a newer Release exists. Since v0.55 the
+# popup offers to pull it (duo_updater.py) -- this check only ever
+# looks, and never downloads anything itself.
 # The source of truth is the GitHub API's latest-release endpoint
 # for this repo, unauthenticated, with a short timeout so a slow
 # network never holds the app up. DUO_UPDATE_CHECK_URL points the

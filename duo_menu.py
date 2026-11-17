@@ -115,9 +115,11 @@ HOW_TO_USE_SECTIONS = (
     ("The update check",
      "DUO checks GitHub once when it starts and says in the "
      "status bar when a newer version is out. Check for updates "
-     "runs the same check whenever you like. DUO never downloads "
-     "or installs anything. You download a new version from "
-     "GitHub yourself."),
+     "runs the same check whenever you like. When an update is "
+     "out, a popup asks whether to install it; DUO only pulls "
+     "it down when you say yes, checks it against the release "
+     "checksum first, and asks whether to restart now to "
+     "finish. Later waits until the next time DUO starts."),
     ("Bigger text",
      "Big text in the Help menu makes all of DUO's text bigger. "
      "It works right away, and DUO remembers your choice."),
