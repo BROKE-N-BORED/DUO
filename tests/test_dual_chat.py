@@ -2246,16 +2246,59 @@ class DirectorGuiTests(unittest.TestCase):
         _, messages = self.client.messages_seen[1]
         self.assertEqual(messages, [{"role": "user", "content": "apple pie"}])
 
-    def test_review_skip_ends_relay(self):
-        self.client.replies = {"fake-a:latest": ["apple pie"]}
-        self._start_review_relay("Talk about fruit.", cap=10)
+    def test_review_skip_advances_relay(self):
+        self.client.replies = {"fake-a:latest": ["apple pie"],
+                               "fake-b:latest": ["banana split"]}
+        self._start_review_relay("Talk about fruit.", cap=3)
         self.assertTrue(self._wait_for_review())
         self.state["review_skip"].click()
+        # The relay keeps going: B takes its turn, answering the
+        # seed (the skipped reply never reached it), then the relay
+        # pauses again before the hop back.
+        self.assertTrue(self._wait_for_review())
+        # B received the seed, not the skipped reply.
+        model, messages = self.client.messages_seen[1]
+        self.assertEqual(model, "fake-b:latest")
+        self.assertEqual(messages,
+                         [{"role": "user",
+                           "content": "Talk about fruit."}])
+        # B's pane shows the seed and the skip note, not the reply.
+        self.assertIn("Talk about fruit.", self._transcript("B"))
+        self.assertIn("(Hop from Model A skipped.)", self._transcript("B"))
+        self.assertNotIn("apple pie", self._transcript("B"))
+        # ... and the relay still ends at the cap after forwarding on.
+        self.state["review_forward"].click()
         self.assertTrue(self._wait_for_relay_stopped())
-        self.assertIn("skipped", self.state["relay_status"].text())
-        self.assertEqual(self.client.calls, ["fake-a:latest"])
-        self.assertFalse(self.state["review_frame"].isVisible())
-        self.assertFalse(self.state["state"]["busy"])
+        self.assertIn("turn cap reached", self.state["relay_status"].text())
+
+    def test_review_skip_later_hop_keeps_relay_going(self):
+        self.client.replies = {"fake-a:latest": ["apple pie",
+                                                 "apple tart"],
+                               "fake-b:latest": ["banana split"]}
+        self._start_review_relay("Talk about fruit.", cap=4)
+        self.assertTrue(self._wait_for_review())
+        self.state["review_forward"].click()
+        self.assertTrue(self._wait_for_review())
+        # B's reply is under review now; skip it.
+        self.assertEqual(self.state["review_edit"].toPlainText(),
+                         "banana split")
+        self.state["review_skip"].click()
+        # The relay keeps going: A takes its turn from its own
+        # history (the skipped reply never reached it), then the
+        # relay pauses again before the hop back.
+        self.assertTrue(self._wait_for_review())
+        # A's second job ran on its own history: the seed plus its
+        # own first reply, with no forwarded message from B.
+        model, messages = self.client.messages_seen[2]
+        self.assertEqual(model, "fake-a:latest")
+        self.assertEqual(messages, [
+            {"role": "user", "content": "Talk about fruit."},
+            {"role": "assistant", "content": "apple pie"}])
+        self.assertIn("(Hop from Model B skipped.)", self._transcript("A"))
+        self.assertNotIn("banana split", self._transcript("A"))
+        self.state["review_forward"].click()
+        self.assertTrue(self._wait_for_relay_stopped())
+        self.assertIn("turn cap reached", self.state["relay_status"].text())
 
     def test_review_stop_ends_relay_and_next_send_still_works(self):
         self.client.replies = {"fake-a:latest": ["apple pie"]}
@@ -10133,10 +10176,15 @@ class ActivityIndicatorGuiTests(unittest.TestCase):
             timeout=15))
         self._assert_side("B", "review")
         self.state["review_skip"].click()
+        # The skip hands B its turn: the amber light goes out at
+        # once (B is queued or already generating), and the relay
+        # runs on to the cap instead of ending at the pause.
+        self.assertNotEqual(self._side_state("B"), "review")
         self.assertTrue(self._wait_for(
             lambda: self.state["relay_status"].text().startswith(
                 "Relay stopped"), timeout=15))
-        # The relay ended from the pause: no stuck amber light.
+        self.assertIn("turn cap reached", self.state["relay_status"].text())
+        self.assertIn("fake-b:latest", self.client.calls)
         self._assert_side("B", "idle")
 
     def test_summarize_shows_summarizing(self):

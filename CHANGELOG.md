@@ -2,7 +2,20 @@
 
 Every version, newest first. v0.1–v0.17 were built on 2026-11-12;
 v0.18–v0.35 on 2026-11-13; v0.36–v0.49 on 2026-11-14; v0.50 on
-2026-11-15; v0.51–v0.52 on 2026-11-16.
+2026-11-15; v0.51–v0.52 on 2026-11-16; v0.53 on 2026-11-17.
+
+## v0.53 — 2026-11-17
+
+"Skip this hop" no longer ends the whole relay. It used to stop
+everything, which made it a second Stop button wearing a
+different label. Now skipping a hop drops that one reply and the
+relay carries on: the other model takes its turn without ever
+seeing the skipped reply, and a short note in its pane says the
+hop was skipped. If you skip the very first hop, the other model
+answers your first message instead, since it has nothing else to
+answer yet. The skipped reply stays in the pane of the model
+that wrote it, and it still counts toward the turn cap, since
+the turn did run.
 
 ## v0.52 — 2026-11-16
 

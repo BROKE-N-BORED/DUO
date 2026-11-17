@@ -221,6 +221,14 @@ class RelaySession:
         self.turns_done = 0
         self.active = True
         self.stop_reason = None
+        # The seed message, set by the window when the relay starts
+        # (v0.53, P1-1): a skipped first hop hands it to the other
+        # side, which answers it instead. ``seed`` is the full text
+        # the first side received (attachments inline);
+        # ``seed_display`` is the short form the window shows, or
+        # None when there is nothing to shorten.
+        self.seed = None
+        self.seed_display = None
 
     @staticmethod
     def other(side):

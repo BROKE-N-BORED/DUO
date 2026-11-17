@@ -278,7 +278,7 @@ from duo_workers import (_ModelLoader, _SignalObject,
 
 
 APP_NAME = "DUO"
-APP_VERSION = "0.52"
+APP_VERSION = "0.53"
 
 
 
@@ -1979,6 +1979,53 @@ def build_window(client=None, logger=None, deck_port=None):
             next_side, convo.sides[next_side].model,
             convo.sides[next_side].messages_for_model()))
 
+    def skip_hop(session, from_side):
+        """Skip a reviewed hop: the reply is not forwarded, and the
+        relay advances to the other side's turn (v0.53, P1-1).
+
+        The skipped reply stays in the speaker's pane -- it did say
+        it -- but never reaches the other model. The other side
+        generates from its own history as it stands, which ends in
+        its own last reply: it picks up its own thread, and the
+        relay keeps flowing with the skipped hop dropped from the
+        exchange. The skipped turn still counts toward the cap --
+        it ran, tokens and all.
+
+        The first hop is the one exception: the other side has no
+        history yet, so there is nothing for it to answer. It takes
+        over as the first speaker instead and answers the seed, as
+        if the relay had started on it.
+        """
+        next_side = RelaySession.other(from_side)
+        next_obj = convo.sides[next_side]
+        if not next_obj.messages and not session.seed:
+            # Nothing to answer and no seed to hand over: the relay
+            # cannot continue. Unreachable from the window -- a
+            # relay always starts with a seed -- but never submit an
+            # empty job to a model.
+            end_relay("hop skipped; Model %s has nothing to answer"
+                      % next_side)
+            return
+        append_note(next_side,
+                    "(Hop from Model %s skipped.)" % from_side)
+        if not next_obj.messages:
+            next_obj.add_user(session.seed,
+                              display=session.seed_display)
+            shown = session.seed_display or session.seed
+            append_message(next_side, "You", shown)
+            log_event(next_side, "You", shown)
+            refresh_history_list(next_side)
+        logger.action("relay hop skipped: Model %s to Model %s"
+                      % (from_side, next_side))
+        session.current_side = next_side
+        session.hop_from = from_side
+        state["queued"].add(next_side)
+        set_side_state(next_side, "queued")
+        set_relay_chip("running", session.status_running())
+        runner.submit(next_side, make_job_fn(
+            next_side, next_obj.model,
+            next_obj.messages_for_model()))
+
     def end_task(status_message=None):
         """End the active task. The statusbar says how it ended."""
         if state.get("task") is None:
@@ -2048,8 +2095,8 @@ def build_window(client=None, logger=None, deck_port=None):
                        "Relay paused for review: turn %d/%d."
                        % (session.turns_done + 1, session.turn_cap))
         # The receiving side waits on the user now: amber, "Waiting
-        # for you to review…". Forwarding flips it to queued;
-        # skipping or stopping ends the relay, which clears it.
+        # for you to review…". Forwarding or skipping flips it to
+        # queued; stopping ends the relay, which clears it.
         set_side_state(next_side, "review")
         refresh_buttons()
 
@@ -2758,6 +2805,10 @@ def build_window(client=None, logger=None, deck_port=None):
         if attachments:
             display = "%s\n%s" % (
                 text, attachment_tag([a["name"] for a in attachments]))
+        # The seed lives on the session so a skipped first hop can
+        # hand it to the other side (v0.53, P1-1).
+        session.seed = full
+        session.seed_display = display
         composer.clear()
         clear_attachments()
         side_obj = convo.sides[start_side]
@@ -2879,8 +2930,16 @@ def build_window(client=None, logger=None, deck_port=None):
 
     def on_review_skip():
         hop = state.get("pending_hop")
-        from_side = hop["from_side"] if hop is not None else None
-        end_relay("hop skipped by you", note_side=from_side)
+        if hop is None:
+            return
+        state["pending_hop"] = None
+        review_frame.setVisible(False)
+        session = hop["session"]
+        if session is None or not session.active:
+            refresh_buttons()
+            return
+        skip_hop(session, hop["from_side"])
+        refresh_buttons()
 
     review_forward.clicked.connect(on_review_forward)
     review_forward_edited.clicked.connect(on_review_forward_edited)
