@@ -278,7 +278,7 @@ from duo_workers import (_ModelLoader, _SignalObject,
 
 
 APP_NAME = "DUO"
-APP_VERSION = "0.53"
+APP_VERSION = "0.54"
 
 
 
@@ -970,11 +970,9 @@ def build_window(client=None, logger=None, deck_port=None):
     review_layout.addWidget(review_edit)
     review_btn_row = QtWidgets.QHBoxLayout()
     review_forward = QtWidgets.QPushButton("Forward")
-    review_forward_edited = QtWidgets.QPushButton("Forward edited")
     review_skip = QtWidgets.QPushButton("Skip this hop")
     review_stop = QtWidgets.QPushButton("Stop relay")
-    for btn in (review_forward, review_forward_edited,
-                review_skip, review_stop):
+    for btn in (review_forward, review_skip, review_stop):
         review_btn_row.addWidget(btn)
     review_btn_row.addStretch(1)
     review_layout.addLayout(review_btn_row)
@@ -2916,12 +2914,12 @@ def build_window(client=None, logger=None, deck_port=None):
     task_follow_up.currentIndexChanged.connect(refresh_buttons)
 
     # --- hop review --------------------------------------------------------
+    # Forward sends exactly what is in the review box (v0.54, P1-2):
+    # it used to forward the original text and silently throw away
+    # any edit, with a second button ("Forward edited") for the
+    # edited text. One button, one behavior -- what you see is what
+    # the other model gets. An empty box forwards nothing.
     def on_review_forward():
-        hop = state.get("pending_hop")
-        if hop is not None:
-            do_forward(hop["framed"])
-
-    def on_review_forward_edited():
         text = review_edit.toPlainText()
         if not text.strip():
             set_status_message(MSG_REVIEW_EMPTY)
@@ -2942,7 +2940,6 @@ def build_window(client=None, logger=None, deck_port=None):
         refresh_buttons()
 
     review_forward.clicked.connect(on_review_forward)
-    review_forward_edited.clicked.connect(on_review_forward_edited)
     review_skip.clicked.connect(on_review_skip)
     review_stop.clicked.connect(on_relay_button)
 
@@ -3699,7 +3696,6 @@ def build_window(client=None, logger=None, deck_port=None):
         "review_check": review_check, "review_frame": review_frame,
         "review_label": review_label, "review_edit": review_edit,
         "review_forward": review_forward,
-        "review_forward_edited": review_forward_edited,
         "review_skip": review_skip, "review_stop": review_stop,
         "pair_combo": pair_combo, "pair_name": pair_name,
         "pair_save": pair_save, "pair_delete": pair_delete,

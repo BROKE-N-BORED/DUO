@@ -2,7 +2,22 @@
 
 Every version, newest first. v0.1–v0.17 were built on 2026-11-12;
 v0.18–v0.35 on 2026-11-13; v0.36–v0.49 on 2026-11-14; v0.50 on
-2026-11-15; v0.51–v0.52 on 2026-11-16; v0.53 on 2026-11-17.
+2026-11-15; v0.51–v0.52 on 2026-11-16; v0.53–v0.54 on
+2026-11-17.
+
+## v0.54 — 2026-11-17
+
+Forward in the review box sends what is actually in the box.
+It used to send the original reply and silently throw away
+anything you had typed, with a second button, Forward edited,
+as the only way to send your changes. Editing and then clicking
+the leftmost, most obvious button lost your edit with no
+warning. Now there is one Forward button and it sends exactly
+what you see in the box, edited or not. Clearing the box and
+clicking Forward sends nothing and tells you so, and the relay
+stays paused until you put text back. The guide is fixed too:
+it still said Skip this hop ends the relay, which stopped being
+true in v0.53.
 
 ## v0.53 — 2026-11-17
 

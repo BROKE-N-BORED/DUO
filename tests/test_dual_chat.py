@@ -2216,7 +2216,7 @@ class DirectorGuiTests(unittest.TestCase):
         # Nothing was forwarded yet: B has no job.
         self.assertEqual(self.client.calls, ["fake-a:latest"])
         self.state["review_edit"].setPlainText("apple crumble")
-        self.state["review_forward_edited"].click()
+        self.state["review_forward"].click()
         # B replies, then the relay pauses again before the hop back.
         self.assertTrue(self._wait_for_review())
         self.assertEqual(self.state["review_edit"].toPlainText(),
@@ -2235,7 +2235,7 @@ class DirectorGuiTests(unittest.TestCase):
         self.assertIn("apple crumble", self._transcript("B"))
         self.assertIn("[relay from Model A]", self._transcript("B"))
 
-    def test_review_forward_ignores_edits(self):
+    def test_review_forward_uses_edited_text(self):
         self.client.replies = {"fake-a:latest": ["apple pie"],
                                "fake-b:latest": ["banana split"]}
         self._start_review_relay("Talk about fruit.", cap=2)
@@ -2243,8 +2243,28 @@ class DirectorGuiTests(unittest.TestCase):
         self.state["review_edit"].setPlainText("CHANGED")
         self.state["review_forward"].click()
         self.assertTrue(self._wait_for_relay_stopped())
+        # Forward sends what is in the box, not the original text.
         _, messages = self.client.messages_seen[1]
-        self.assertEqual(messages, [{"role": "user", "content": "apple pie"}])
+        self.assertEqual(messages, [{"role": "user", "content": "CHANGED"}])
+
+    def test_review_forward_empty_box_stays_paused(self):
+        self.client.replies = {"fake-a:latest": ["apple pie"],
+                               "fake-b:latest": ["banana split"]}
+        self._start_review_relay("Talk about fruit.", cap=2)
+        self.assertTrue(self._wait_for_review())
+        self.state["review_edit"].setPlainText("   ")
+        self.state["review_forward"].click()
+        # Nothing forwarded: the relay is still paused on the hop,
+        # and the status line says why.
+        self.assertTrue(self.state["review_frame"].isVisible())
+        self.assertIsNotNone(self.state["state"].get("pending_hop"))
+        self.assertEqual(self.client.calls, ["fake-a:latest"])
+        self.assertIn("Nothing to forward",
+                      self.state["status_label"].text())
+        # Put the text back and the relay carries on.
+        self.state["review_edit"].setPlainText("apple pie")
+        self.state["review_forward"].click()
+        self.assertTrue(self._wait_for_relay_stopped())
 
     def test_review_skip_advances_relay(self):
         self.client.replies = {"fake-a:latest": ["apple pie"],

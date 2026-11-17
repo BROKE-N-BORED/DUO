@@ -225,8 +225,9 @@ menu. (Or run `bash run.sh` from the app folder.)
   only available while nothing is generating.
 - Review each hop: tick this before starting a relay and the relay
   pauses before every hop, showing you the exact text the other model
-  would get. Forward sends it as-is, Forward edited sends your edited
-  version, Skip this hop ends the relay without forwarding.
+  would get. You can edit it in the box; Forward sends what is in the
+  box. Skip this hop drops the reply and the relay carries on with the
+  other model's turn.
 - Instructions: the Instructions button above each pane opens a
   system-prompt field for that side. Whatever you type there is sent
   as the system message for that model on every turn. Leave it empty
