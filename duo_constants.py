@@ -99,6 +99,14 @@ HIST_TRANSCRIPT_MIN_HEIGHT = 100
 # expanded; the director's scroll area gives back past this height
 # instead of squeezing the panes further.
 PANES_MIN_HEIGHT = 250
+
+# v0.57 (P1-11): the total time closing waits for background
+# threads (model loads, update checks, downloads) before it
+# closes anyway. A model-list load can take ~42 s with Ollama
+# down (tags retries plus the CLI fallback); the window must
+# never freeze that long. Threads still running after this are
+# orphaned, never destroyed mid-flight (see _orphan_holder).
+CLOSE_WAIT_MS = 5000
 # v0.56 (P1-8): the director's sections scroll past this height
 # instead of demanding more room -- 130 px shows the Relay
 # section's core controls (start, turns, stop-on), and the panes
@@ -144,6 +152,12 @@ EXPLAIN_RELAY_ROW1 = ("Start with picks which side answers first. "
                       "Turns caps the relay. "
                       "Blind hides that the other side is an AI.")
 EXPLAIN_STOP = "A reply containing one of these stops the relay."
+# v0.57 (P1-9): what counts as agreement, in plain words -- the
+# two firm phrases match anywhere, the two loose ones only when
+# the whole reply is just that phrase.
+EXPLAIN_AGREE = ('Stops when a reply says "I agree" or "agreed", '
+                 'or when the whole reply is just "Sounds good" '
+                 'or "That works".')
 EXPLAIN_INSTR = "Sent to this side's model with every message."
 EXPLAIN_TASK = "Describe the work, then press Run Task."
 EXPLAIN_TASK_ROW = ("Worker picks which side does the task. "

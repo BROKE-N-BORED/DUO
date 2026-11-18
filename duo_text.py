@@ -26,3 +26,20 @@ def phrase_matches(phrase, text):
         return False
     pattern = r"(?<!\w)" + re.escape(phrase) + r"(?!\w)"
     return re.search(pattern, text, re.IGNORECASE) is not None
+
+
+def phrase_is_whole_reply(phrase, text):
+    """Whether text is just this phrase, nothing else.
+
+    Case-insensitive. Leading and trailing whitespace, quotes,
+    and sentence punctuation are ignored, and inner whitespace
+    is collapsed, so "  Sounds good! " and "Sounds  good." both
+    count as "sounds good" -- but "Sounds good, let's go." does
+    not. The relay's loose agreement phrases (v0.57, P1-9) only
+    stop the relay when the whole reply is the phrase: polite
+    filler in the middle of a longer reply is not agreement.
+    """
+    if not phrase or not text:
+        return False
+    cleaned = " ".join(text.split()).strip(" .!?,;:'\"").lower()
+    return cleaned == " ".join(phrase.split()).lower()

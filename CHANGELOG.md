@@ -5,6 +5,20 @@ v0.18–v0.35 on 2026-11-13; v0.36–v0.49 on 2026-11-14; v0.50 on
 2026-11-15; v0.51–v0.52 on 2026-11-16; v0.53–v0.56 on
 2026-11-17.
 
+## v0.57 — 2026-11-17
+
+Stop on agreement finally says what counts. The relay section
+now explains that a reply saying "I agree" or "agreed" ends the
+relay, and that "Sounds good" and "That works" only count when
+the whole reply is just that, so polite filler in the middle of
+a longer reply no longer ends a relay early. Screen readers get
+real names on the controls that used to read as bare words: the
+per-pane Stop, Save, and Refresh buttons now say which model
+they belong to, and the history editor's small buttons say what
+they do. And closing DUO while the model list is still loading
+no longer freezes the window; it waits a few seconds and then
+closes anyway.
+
 ## v0.56 — 2026-11-17
 
 The window gets room to breathe, and room to grow. The send row

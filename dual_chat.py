@@ -227,12 +227,13 @@ from duo_constants import (
     SETTING_SECTION_COLLAPSED, SETTING_WINDOW_GEOMETRY,
     SETTING_SPLITTER_STATE, SETTING_HIST_SPLITTER_STATE,
     HIST_TRANSCRIPT_MIN_HEIGHT, HIST_EDITOR_MIN_HEIGHT,
-    PANES_MIN_HEIGHT, DIRECTOR_SCROLL_MAX_HEIGHT,
+    PANES_MIN_HEIGHT, DIRECTOR_SCROLL_MAX_HEIGHT, CLOSE_WAIT_MS,
     HIST_EDITOR_DEFAULT_HEIGHT, SETTING_TEMPERATURE,
     TEMPERATURE_DEFAULT, TEMPERATURE_MIN, TEMPERATURE_MAX,
     SETTING_FIRST_RUN_DONE, FIRST_RUN_HEADER, FIRST_RUN_STEP1,
     FIRST_RUN_STEP2, FIRST_RUN_STEP3, FIRST_RUN_TICK, EXPLAIN_TEMP,
-    EXPLAIN_RELAY_ROW1, EXPLAIN_STOP, EXPLAIN_INSTR, EXPLAIN_TASK,
+    EXPLAIN_RELAY_ROW1, EXPLAIN_STOP, EXPLAIN_AGREE, EXPLAIN_INSTR,
+    EXPLAIN_TASK,
     EXPLAIN_TASK_ROW, EXPLAIN_STYLE, first_run_guide_html,
     HISTORY_BUDGET_CHARS, SUMMARIZE_PROMPT, COMPARE_PREFIX,
     MSG_TASK_EMPTY, MSG_TASK_NEEDS_WORKER, MSG_TASK_NEEDS_FOLLOW_UP,
@@ -280,7 +281,8 @@ from duo_tasks import (
     TASK_CONTINUE_TEMPLATE, TASK_FOLLOW_UPS, TASK_REVIEW_TEMPLATE,
     TASK_REVISE_TEMPLATE, TASK_ROUNDS_DEFAULT, TASK_ROUNDS_MAX,
     TASK_ROUNDS_MIN, TaskSession,)
-from duo_text import parse_stop_phrases, phrase_matches
+from duo_text import (parse_stop_phrases, phrase_is_whole_reply,
+                      phrase_matches)
 from duo_transcript import (
     FULL_LOG_MAX_ENTRIES, FULL_LOG_TRIMMED_NOTE, TranscriptError,
     append_full_log_entry, default_both_filename,
@@ -296,7 +298,7 @@ from duo_workers import (_ModelLoader, _SignalObject,
 
 
 APP_NAME = "DUO"
-APP_VERSION = "0.56"
+APP_VERSION = "0.57"
 
 # P1-5 (v0.56): closing with an unsaved conversation asks first.
 # The GUI tests close windows with messages in every tearDown, so
@@ -315,6 +317,30 @@ def close_needs_confirm(convo, state):
     work_in_flight = (state["busy"] or state.get("relay") is not None
                       or state.get("task") is not None)
     return has_messages or work_in_flight
+
+
+# Holders whose threads outlived their window (P1-11, v0.57).
+# Destroying a running QThread aborts the process (exit 134,
+# probed 2026-11-17), so a thread still running after the
+# bounded close wait keeps its holder here until a daemon
+# reaper sees it finish. The reaper never blocks process exit;
+# if the process goes first, the OS reaps the thread with it.
+_ORPHANED_HOLDERS = []
+
+
+def _orphan_holder(holder):
+    """Keep a still-running holder alive until its thread ends."""
+    import threading
+    _ORPHANED_HOLDERS.append(holder)
+
+    def _reap():
+        holder.thread.wait()
+        try:
+            _ORPHANED_HOLDERS.remove(holder)
+        except ValueError:
+            pass
+
+    threading.Thread(target=_reap, daemon=True).start()
 
 
 
@@ -697,7 +723,7 @@ def build_window(client=None, logger=None, deck_port=None):
             "title": title,
             "picker": picker, "refresh": refresh, "transcript": transcript,
             "temperature": temp_spin,
-            "temp_explain": temp_explain,
+            "temp_label": temp_label, "temp_explain": temp_explain,
             "status": status, "stop": stop, "clear": clear,
             "save": save, "import": import_btn,
             "search_edit": search_edit, "search_count": search_count,
@@ -725,6 +751,39 @@ def build_window(client=None, logger=None, deck_port=None):
             # so on_done can color it when the turn finishes.
             "reply_label_len": None,
         }
+
+        # Accessible names (v0.57, P1-10): without these a screen
+        # reader hears bare widget text -- "Stop" three times, two
+        # "Refresh" buttons, two "Save" buttons -- with no hint
+        # which pane a control belongs to. Every duplicated
+        # per-pane control names its side; the Temperature label
+        # is the spinbox's buddy, so the reader pairs them.
+        model = "Model " + side
+        temp_label.setBuddy(temp_spin)
+        for widget, name in (
+                (picker, model + " picker"),
+                (refresh, "Refresh " + model + " list"),
+                (temp_spin, "Temperature for " + model),
+                (instr_toggle, "Instructions for " + model),
+                (instr_edit, "Instructions text for " + model),
+                (transcript, "Conversation with " + model),
+                (search_edit, "Search " + model + " conversation"),
+                (search_prev, "Previous match in " + model),
+                (search_next, "Next match in " + model),
+                (summarize_btn, "Summarize " + model + " history"),
+                (hist_list, model + " message history"),
+                (hist_up, "Move message up in " + model + " history"),
+                (hist_down,
+                 "Move message down in " + model + " history"),
+                (hist_delete,
+                 "Delete message from " + model + " history"),
+                (use_this, "Continue from " + model + " reply"),
+                (stop, "Stop " + model),
+                (clear, "Clear " + model + " conversation"),
+                (save, "Save " + model + " transcript"),
+                (import_btn, "Import conversation into " + model),
+                (hist_toggle, "History for " + model)):
+            widget.setAccessibleName(name)
         return frame
 
     panes.addWidget(make_pane("A"))
@@ -739,6 +798,9 @@ def build_window(client=None, logger=None, deck_port=None):
     d_layout.setSpacing(6)
     composer = QtWidgets.QPlainTextEdit()
     composer.setPlaceholderText("Type a message for the models...")
+    # A placeholder is not a name (v0.57, P1-10): a screen reader
+    # needs the real one.
+    composer.setAccessibleName("Message to the models")
     # No block cap on purpose: a chat composer must never drop typed
     # or pasted text. (v0.12 and earlier capped it at 5 blocks, which
     # silently threw away the oldest paragraphs of a long paste.)
@@ -932,6 +994,10 @@ def build_window(client=None, logger=None, deck_port=None):
     review_check = QtWidgets.QCheckBox("Review each hop")
     relay_row2.addWidget(review_check)
     relay_layout.addLayout(relay_row2)
+    # What counts as agreement (v0.57, P1-9): its own line under
+    # the row, naming the phrases -- the checkbox alone never said.
+    agree_explain = _make_explanation(EXPLAIN_AGREE)
+    relay_layout.addWidget(agree_explain)
 
     # --- relay presets -----------------------------------------------------
     # Same layout as the saved-pairs row: a dropdown of what is saved,
@@ -1076,6 +1142,9 @@ def build_window(client=None, logger=None, deck_port=None):
     chip_layout.addWidget(relay_status)
     chip_layout.addStretch(1)
     relay_chip_stop = QtWidgets.QPushButton("Stop")
+    # The third "Stop" in the window (v0.57, P1-10): this one
+    # stops the relay, not a side.
+    relay_chip_stop.setAccessibleName("Stop relay")
     relay_chip_stop.setVisible(False)
     chip_layout.addWidget(relay_chip_stop)
     root.addWidget(relay_chip)
@@ -2386,6 +2455,10 @@ def build_window(client=None, logger=None, deck_port=None):
             row.addWidget(name)
             row.addStretch(1)
             drop = QtWidgets.QPushButton("x")
+            # "x" reads as nothing (v0.57, P1-10): name the action
+            # and describe which file it drops.
+            drop.setAccessibleName("Remove attachment")
+            drop.setAccessibleDescription(att["name"])
             drop.setFixedWidth(28)
             drop.clicked.connect(
                 (lambda i: lambda: remove_attachment(i))(index))
@@ -3572,6 +3645,7 @@ def build_window(client=None, logger=None, deck_port=None):
         "relay_btn": relay_btn, "start_picker": start_picker,
         "cap_spin": cap_spin, "mode_picker": mode_picker,
         "stop_edit": stop_edit, "agree_check": agree_check,
+        "agree_explain": agree_explain,
         "relay_explain": relay_explain, "stop_explain": stop_explain,
         "relay_status": relay_status,
         "relay_chip": relay_chip, "relay_dot": relay_dot,
@@ -3630,7 +3704,7 @@ def build_window(client=None, logger=None, deck_port=None):
         "on_phone_send": on_phone_send,
         "update_btn": update_btn, "run_update_check": run_update_check,
         "on_update_checked": on_update_checked,
-        "update_checkers": update_checkers,
+        "update_checkers": update_checkers, "loaders": loaders,
         "menu_bar": menu_bar, "menu_actions": menu_actions,
         "motion": motion, "big_text": big_text, "prefs": prefs,
         "director": director, "director_toggle": director_toggle,
@@ -3674,22 +3748,34 @@ def build_window(client=None, logger=None, deck_port=None):
                 event.ignore()
                 return
         # Threads this window started (model loads, update checks)
-        # must finish before the window goes away: destroying a
-        # running QThread aborts the whole process ("QThread:
-        # Destroyed while thread '' is still running", exit 134 in
-        # the full suite). Each worker is bounded (the model load by
-        # its retries, the update check by its 5s timeout), so the
-        # wait always ends; the workers only do network I/O and
-        # emit one signal, so waiting here cannot deadlock.
+        # must finish before their QThread objects go away:
+        # destroying a running QThread aborts the whole process
+        # ("QThread: Destroyed while thread '' is still running",
+        # exit 134 in the full suite). But waiting without a bound
+        # freezes the window for up to ~42 s when Ollama is down
+        # (P1-11, v0.57): the model load is bounded only by its
+        # retries plus the CLI fallback. So the wait shares one
+        # CLOSE_WAIT_MS deadline across all three lists, then the
+        # window closes anyway. A thread still running after that
+        # is orphaned, never destroyed mid-flight: its holder
+        # stays alive until a daemon reaper sees it finish (see
+        # _orphan_holder). The workers only do network I/O and
+        # emit one signal, so waiting here cannot deadlock, and
+        # every emit is guarded against a dead window.
         # A download in flight is cancelled first: without this,
         # the wait below could last as long as the download.
         for _holder in list(update_downloaders):
             _holder.cancel()
+        _deadline = time.monotonic() + CLOSE_WAIT_MS / 1000.0
         for _holders in (loaders, update_checkers,
                          update_downloaders):
             for _holder in list(_holders):
-                if _holder.thread.isRunning():
-                    _holder.thread.wait()
+                if not _holder.thread.isRunning():
+                    continue
+                _left = _deadline - time.monotonic()
+                if _left <= 0 or not _holder.thread.wait(
+                        int(_left * 1000)):
+                    _orphan_holder(_holder)
         # Remember the window for next time: size/position and the
         # pane split. Saved on close (not on every move/resize) so a
         # crash mid-session keeps the last clean state. The geometry

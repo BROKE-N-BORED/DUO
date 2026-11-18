@@ -31,7 +31,8 @@ from dual_chat import (  # noqa: E402
     CHAT_RETRY_DELAYS, CHAT_TIMEOUT, COMPARE_PREFIX,
     CONVERSATION_FORMAT_VERSION, DECK_PAGE_HTML,
     DECK_PORT, ERROR_STATE_HOLD_MS,
-    EXPLAIN_INSTR, EXPLAIN_RELAY_ROW1, EXPLAIN_STOP, EXPLAIN_STYLE,
+    EXPLAIN_AGREE, EXPLAIN_INSTR, EXPLAIN_RELAY_ROW1, EXPLAIN_STOP,
+    EXPLAIN_STYLE,
     EXPLAIN_TASK, EXPLAIN_TASK_ROW, EXPLAIN_TEMP,
     FIRST_RUN_HEADER, FIRST_RUN_STEP1, FIRST_RUN_STEP2, FIRST_RUN_STEP3,
     FIRST_RUN_TICK, FULL_LOG_MAX_ENTRIES,
@@ -89,7 +90,8 @@ from dual_chat import (  # noqa: E402
     parse_cpu_times, parse_meminfo,
     parse_ollama_list_output, parse_ps_payload,
     parse_side_transcript, parse_stop_phrases, parse_tags_payload,
-    parse_tags_sizes, parse_version, phrase_matches,
+    parse_tags_sizes, parse_version, phrase_is_whole_reply,
+    phrase_matches,
     read_system_meter, read_total_ram,
     render_qr_pixmap,
     sanitize_filename_part,
@@ -469,8 +471,37 @@ class RelaySessionTests(unittest.TestCase):
         self.assertEqual(session.find_agreement("agreed"), "agreed")
         self.assertEqual(session.find_agreement("Agreed, moving on."),
                          "agreed")
-        self.assertEqual(session.find_agreement("That works for me."),
+        self.assertEqual(session.find_agreement("That works."),
                          "that works")
+
+    # v0.57 (P1-9): the loose phrases only count when the whole
+    # reply is just the phrase -- filler in a longer reply is not
+    # agreement, and used to end relays early for no visible reason.
+    def test_agreement_loose_phrases_must_stand_alone(self):
+        session = RelaySession("A", stop_on_agreement=True)
+        self.assertIsNone(session.find_agreement("That works for me."))
+        self.assertIsNone(session.find_agreement(
+            "Sounds good, let's go with that."))
+        self.assertIsNone(session.find_agreement(
+            "That works, but what about the rest?"))
+        self.assertEqual(session.find_agreement("Sounds good!"),
+                         "sounds good")
+        self.assertEqual(session.find_agreement("  That works.  "),
+                         "that works")
+        self.assertEqual(session.find_agreement('"Sounds good"'),
+                         "sounds good")
+
+    def test_phrase_is_whole_reply(self):
+        self.assertTrue(phrase_is_whole_reply("sounds good",
+                                              "Sounds good!"))
+        self.assertTrue(phrase_is_whole_reply("sounds good",
+                                              "  Sounds  good.  "))
+        self.assertFalse(phrase_is_whole_reply("sounds good",
+                                               "Sounds good, yes."))
+        self.assertFalse(phrase_is_whole_reply("sounds good",
+                                               "That sounds good."))
+        self.assertFalse(phrase_is_whole_reply("sounds good", ""))
+        self.assertFalse(phrase_is_whole_reply("", "sounds good"))
 
     def test_stop_phrase_whole_words(self):
         session = RelaySession("A", stop_phrases=["cap"])
@@ -1320,14 +1351,30 @@ class RelayGuiTests(unittest.TestCase):
         self.assertIn("pineapple", self._transcript("A"))
 
     def test_agreement_stop_halts(self):
+        # v0.57 (P1-9): the loose phrases only count when the
+        # whole reply is just the phrase, so the stopping reply
+        # is "Sounds good" on its own now.
         self.client.replies = {
             "fake-a:latest": ["What do you think?"],
-            "fake-b:latest": ["Sounds good, let's do it"]}
+            "fake-b:latest": ["Sounds good"]}
         self._start_relay("Decide something.", cap=10, agreement=True)
         self.assertTrue(self._wait_for_relay_stopped())
         self.assertEqual(self.client.calls,
                          ["fake-a:latest", "fake-b:latest"])
         self.assertIn("agreement", self.state["relay_status"].text())
+
+    def test_agreement_filler_does_not_halt(self):
+        # v0.57 (P1-9): "Sounds good" in the middle of a longer
+        # reply is polite filler, not agreement -- the relay
+        # runs to its cap instead of stopping early.
+        self.client.replies = {
+            "fake-a:latest": ["What do you think?"],
+            "fake-b:latest": ["Sounds good, let's do it"]}
+        self._start_relay("Decide something.", cap=3, agreement=True)
+        self.assertTrue(self._wait_for_relay_stopped())
+        self.assertEqual(len(self.client.calls), 3)
+        self.assertIn("turn cap reached",
+                      self.state["relay_status"].text())
 
     def test_no_agreement_stop_when_disabled(self):
         self.client.replies = {
@@ -9094,6 +9141,8 @@ class ModuleSplitTests(unittest.TestCase):
             (dual_chat.ConversationError, duo_storage.ConversationError),
             (dual_chat.TaskSession, duo_tasks.TaskSession),
             (dual_chat.phrase_matches, duo_text.phrase_matches),
+            (dual_chat.phrase_is_whole_reply,
+             duo_text.phrase_is_whole_reply),
             (dual_chat.format_side_transcript,
              duo_transcript.format_side_transcript),
             (dual_chat.parse_side_transcript,
@@ -10492,6 +10541,191 @@ class CloseConfirmGuiTests(unittest.TestCase):
             QMessageBox.StandardButton.No)
         self.assertEqual(asked.call_count, 1)
         self.assertTrue(self.window.isVisible())
+
+
+@unittest.skipUnless(os.environ.get("DUAL_CHAT_GUI_TESTS") == "1",
+                     "GUI tests run with DUAL_CHAT_GUI_TESTS=1")
+class CloseWaitGuiTests(unittest.TestCase):
+    """P1-11 (v0.57): closing during a model-list load does not
+    freeze the window for the load's whole ~42 s. The close waits
+    at most CLOSE_WAIT_MS, then closes anyway; the still-running
+    loader is orphaned until its thread finishes, never destroyed
+    mid-flight (which would abort the process, exit 134)."""
+
+    @classmethod
+    def setUpClass(cls):
+        from PySide6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self):
+        self.window = None
+        self.load_gate = threading.Event()
+
+    def tearDown(self):
+        # Release the gate first: a test that failed before
+        # releasing it must not leave a loader blocked.
+        self.load_gate.set()
+        if self.window is not None:
+            self.window.close()
+        self.app.processEvents()
+
+    def _build_window(self):
+        from dual_chat import build_window
+        gate = self.load_gate
+
+        class GatedClient(FakeGuiClient):
+            def list_models_with_sizes(self, timeout=5):
+                gate.wait(timeout=30)
+                return super().list_models_with_sizes(timeout=timeout)
+
+        self.client = GatedClient()
+        self.window = build_window(self.client, logger=TEST_LOGGER)
+        self.window.show()
+        self.state = self.window._dual_chat
+        self.assertTrue(self._wait_for(
+            lambda: len(self.state["loaders"]) == 1
+            and self.state["loaders"][0].thread.isRunning(),
+            timeout=10),
+            "the startup load should be running, held on the gate")
+
+    def _wait_for(self, cond, timeout=10.0):
+        from PySide6.QtTest import QTest
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            QTest.qWait(50)
+            if cond():
+                return True
+        return cond()
+
+    def test_closing_during_a_load_closes_within_the_bound(self):
+        import dual_chat
+        self._build_window()
+        loader = self.state["loaders"][0]
+        started = time.monotonic()
+        self.window.close()
+        self.app.processEvents()
+        elapsed = time.monotonic() - started
+        # The bound is 5 s; 15 s leaves room for a loaded box.
+        # The old code waited the load out -- up to ~42 s.
+        self.assertLess(elapsed, 15.0)
+        self.assertFalse(self.window.isVisible())
+        # Orphaned, not destroyed: the holder stays alive until
+        # its thread finishes.
+        self.assertIn(loader, dual_chat._ORPHANED_HOLDERS)
+        self.assertTrue(loader.thread.isRunning())
+        # Release the gate: the load finishes, the reaper drops
+        # the holder, and the suite carries on -- no abort.
+        self.load_gate.set()
+        self.assertTrue(self._wait_for(
+            lambda: loader not in dual_chat._ORPHANED_HOLDERS,
+            timeout=10),
+            "the reaper should drop the holder once it finishes")
+        self.assertFalse(loader.thread.isRunning())
+
+
+@unittest.skipUnless(os.environ.get("DUAL_CHAT_GUI_TESTS") == "1",
+                     "GUI tests run with DUAL_CHAT_GUI_TESTS=1")
+class AccessibleNamesGuiTests(unittest.TestCase):
+    """v0.57 (P1-10): screen readers get real names. Before this,
+    the duplicated per-pane controls read as bare widget text --
+    "Stop" three times, two "Refresh" buttons, two "Save" buttons
+    -- with no hint which pane a control belongs to, and the
+    attachment's "x" read as nothing at all."""
+
+    @classmethod
+    def setUpClass(cls):
+        from PySide6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+        cls.client = FakeGuiClient()
+
+    def setUp(self):
+        self.window = None
+        self.client.reset()
+        self.tmp = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        if self.window is not None:
+            self.window.close()
+        self.app.processEvents()
+        self.tmp.cleanup()
+
+    def _build_window(self):
+        from dual_chat import build_window
+        self.window = build_window(self.client, logger=TEST_LOGGER)
+        self.window.show()
+        self.state = self.window._dual_chat
+        self.assertTrue(self._wait_for(
+            lambda: self.state["widgets"]["A"]["picker"].count() == 2),
+            "pickers should load the fake models")
+
+    def _wait_for(self, cond, timeout=10.0):
+        from PySide6.QtTest import QTest
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            QTest.qWait(50)
+            if cond():
+                return True
+        return cond()
+
+    def test_per_pane_controls_name_their_side(self):
+        self._build_window()
+        expected = {
+            "picker": "Model %s picker",
+            "refresh": "Refresh Model %s list",
+            "temperature": "Temperature for Model %s",
+            "instr_toggle": "Instructions for Model %s",
+            "instr_edit": "Instructions text for Model %s",
+            "transcript": "Conversation with Model %s",
+            "search_edit": "Search Model %s conversation",
+            "search_prev": "Previous match in Model %s",
+            "search_next": "Next match in Model %s",
+            "summarize": "Summarize Model %s history",
+            "hist_list": "Model %s message history",
+            "hist_up": "Move message up in Model %s history",
+            "hist_down": "Move message down in Model %s history",
+            "hist_delete": "Delete message from Model %s history",
+            "use_this": "Continue from Model %s reply",
+            "stop": "Stop Model %s",
+            "clear": "Clear Model %s conversation",
+            "save": "Save Model %s transcript",
+            "import": "Import conversation into Model %s",
+            "hist_toggle": "History for Model %s",
+        }
+        for side in ("A", "B"):
+            widgets = self.state["widgets"][side]
+            for key, template in expected.items():
+                self.assertEqual(widgets[key].accessibleName(),
+                                 template % side, (side, key))
+
+    def test_temperature_label_is_the_spinbox_buddy(self):
+        self._build_window()
+        for side in ("A", "B"):
+            widgets = self.state["widgets"][side]
+            self.assertIs(widgets["temp_label"].buddy(),
+                          widgets["temperature"])
+
+    def test_composer_and_chip_stop_have_names(self):
+        self._build_window()
+        self.assertEqual(self.state["composer"].accessibleName(),
+                         "Message to the models")
+        self.assertEqual(self.state["relay_chip_stop"].accessibleName(),
+                         "Stop relay")
+
+    def test_attachment_remove_button_names_the_file(self):
+        from PySide6.QtWidgets import QPushButton
+        self._build_window()
+        path = os.path.join(self.tmp.name, "notes.txt")
+        with open(path, "w") as fh:
+            fh.write("hello")
+        self.assertEqual(self.state["add_attachments"]([path]), 1)
+        self.app.processEvents()
+        drops = [btn for btn in
+                 self.state["attach_frame"].findChildren(QPushButton)
+                 if btn.text() == "x"]
+        self.assertEqual(len(drops), 1)
+        self.assertEqual(drops[0].accessibleName(),
+                         "Remove attachment")
+        self.assertEqual(drops[0].accessibleDescription(), "notes.txt")
 
 
 @unittest.skipUnless(os.environ.get("DUAL_CHAT_GUI_TESTS") == "1",
@@ -12858,18 +13092,26 @@ class DirectorSectionsGuiTests(unittest.TestCase):
             window2.close()
 
     def test_relay_controls_sit_in_two_rows(self):
-        # The relay body holds three rows: start row, stop row,
-        # preset row. The start controls and the stop controls
-        # are in different rows, and the stop-phrase field is in
-        # the second row with the two checkboxes.
+        # The relay body holds four items: start row, stop row,
+        # the agreement explanation line (v0.57, P1-9), preset
+        # row. The start controls and the stop controls are in
+        # different rows, and the stop-phrase field is in the
+        # second row with the two checkboxes.
         layout = self.state["relay_section"].layout()
-        self.assertEqual(layout.count(), 3)
+        self.assertEqual(layout.count(), 4)
         rows = []
         for i in range(layout.count()):
-            row = layout.itemAt(i).layout()
+            item = layout.itemAt(i)
+            if item.widget() is not None:
+                # The explanation line, not a row.
+                self.assertIs(item.widget(),
+                              self.state["agree_explain"])
+                continue
+            row = item.layout()
             self.assertIsNotNone(row)
             rows.append([row.itemAt(j).widget()
                          for j in range(row.count())])
+        self.assertEqual(len(rows), 3)
         self.assertIn(self.state["relay_btn"], rows[0])
         self.assertIn(self.state["start_picker"], rows[0])
         self.assertIn(self.state["cap_spin"], rows[0])
@@ -13232,6 +13474,11 @@ class FieldExplanationTests(unittest.TestCase):
             EXPLAIN_STOP, "A reply containing one of these stops "
                           "the relay.")
         self.assertEqual(
+            EXPLAIN_AGREE,
+            'Stops when a reply says "I agree" or "agreed", or '
+            'when the whole reply is just "Sounds good" or '
+            '"That works".')
+        self.assertEqual(
             EXPLAIN_INSTR, "Sent to this side's model with every "
                            "message.")
         self.assertEqual(
@@ -13249,8 +13496,8 @@ class FieldExplanationTests(unittest.TestCase):
 
     def test_no_explanation_has_an_em_dash(self):
         for text in (EXPLAIN_TEMP, EXPLAIN_RELAY_ROW1, EXPLAIN_STOP,
-                     EXPLAIN_INSTR, EXPLAIN_TASK, EXPLAIN_TASK_ROW,
-                     EXPLAIN_STYLE):
+                     EXPLAIN_AGREE, EXPLAIN_INSTR, EXPLAIN_TASK,
+                     EXPLAIN_TASK_ROW, EXPLAIN_STYLE):
             self.assertNotIn("\u2014", text)
 
 
@@ -14074,6 +14321,15 @@ class FieldExplanationsGuiTests(unittest.TestCase):
         # and wrapping would push the row taller.
         self.assertFalse(stop_label.wordWrap())
         self.assertTrue(stop_label.isVisible())
+        # v0.57 (P1-9): what counts as agreement, on its own line
+        # under the row -- it wraps, and it names the phrases.
+        agree_label = self.state["agree_explain"]
+        self.assertEqual(agree_label.text(), EXPLAIN_AGREE)
+        self.assertEqual(agree_label.styleSheet(), EXPLAIN_STYLE)
+        self.assertTrue(agree_label.wordWrap())
+        self.assertTrue(agree_label.isVisible())
+        self.assertIn('"I agree"', agree_label.text())
+        self.assertIn('"Sounds good"', agree_label.text())
 
     def test_instructions_explanations_follow_the_toggle(self):
         for side in ("A", "B"):

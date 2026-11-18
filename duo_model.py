@@ -18,7 +18,7 @@ session logic, no Qt, and it belongs with the conversation model.
 
 from dataclasses import dataclass
 
-from duo_text import phrase_matches
+from duo_text import phrase_is_whole_reply, phrase_matches
 
 
 MSG_NO_MODEL = "Pick a model for {side} first."
@@ -190,9 +190,14 @@ class Conversation:
         return [self.sides[s] for s in wanted]
 
 
-# Agreement stop: simple case-insensitive substring matching on this
-# fixed list. No LLM judge -- the 2B models are slow enough already.
+# Agreement stop: case-insensitive whole-word matching on this fixed
+# list. No LLM judge -- the 2B models are slow enough already. The
+# two loose phrases (v0.57, P1-9) only count when the whole reply
+# is just the phrase: "sounds good" and "that works" are common
+# polite filler, and matching them anywhere ended relays early for
+# reasons the user could not predict.
 AGREEMENT_PHRASES = ("i agree", "agreed", "sounds good", "that works")
+AGREEMENT_PHRASES_STANDALONE = ("sounds good", "that works")
 AWARE_TEMPLATE = ("You are talking with another AI assistant (Model %s). "
                   "It said: %s")
 RELAY_CAP_MIN = 1
@@ -262,12 +267,19 @@ class RelaySession:
 
         Only when stop-on-agreement is enabled. Case-insensitive
         whole-word match on the fixed AGREEMENT_PHRASES list, so
-        "disagreed" never counts as "agreed".
+        "disagreed" never counts as "agreed" -- except the two
+        loose phrases ("sounds good", "that works"), which only
+        count when the whole reply is just the phrase (v0.57,
+        P1-9): filler in the middle of a longer reply is not
+        agreement.
         """
         if not self.stop_on_agreement:
             return None
         for phrase in AGREEMENT_PHRASES:
-            if phrase_matches(phrase, text):
+            if phrase in AGREEMENT_PHRASES_STANDALONE:
+                if phrase_is_whole_reply(phrase, text):
+                    return phrase
+            elif phrase_matches(phrase, text):
                 return phrase
         return None
 
