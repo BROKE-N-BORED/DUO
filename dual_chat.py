@@ -174,6 +174,15 @@ v0.55: the update story grows up (standing order 2026-11-17).
   release's checksum before installing anything, and asks
   whether to restart now to finish -- Yes restarts DUO on its
   own, No leaves the update staged for the next launch.
+v0.56: the window gets room to breathe, and room to grow.
+  The saved-pair and relay-preset handlers move to duo_pairs.py
+  (P1-12), which buys back 200 lines under the bound. The relay
+  button greys out on an empty composer (P1-3), history delete
+  and closing with an unsaved conversation ask first (P1-4,
+  P1-5), the panes keep a guaranteed minimum so transcripts stop
+  squeezing (P1-6), the send row loses the four buttons the File
+  menu already has (P1-7), and the director scrolls instead of
+  running off the bottom of a short window (P1-8).
 """
 
 import html
@@ -218,6 +227,7 @@ from duo_constants import (
     SETTING_SECTION_COLLAPSED, SETTING_WINDOW_GEOMETRY,
     SETTING_SPLITTER_STATE, SETTING_HIST_SPLITTER_STATE,
     HIST_TRANSCRIPT_MIN_HEIGHT, HIST_EDITOR_MIN_HEIGHT,
+    PANES_MIN_HEIGHT, DIRECTOR_SCROLL_MAX_HEIGHT,
     HIST_EDITOR_DEFAULT_HEIGHT, SETTING_TEMPERATURE,
     TEMPERATURE_DEFAULT, TEMPERATURE_MIN, TEMPERATURE_MAX,
     SETTING_FIRST_RUN_DONE, FIRST_RUN_HEADER, FIRST_RUN_STEP1,
@@ -226,7 +236,7 @@ from duo_constants import (
     EXPLAIN_TASK_ROW, EXPLAIN_STYLE, first_run_guide_html,
     HISTORY_BUDGET_CHARS, SUMMARIZE_PROMPT, COMPARE_PREFIX,
     MSG_TASK_EMPTY, MSG_TASK_NEEDS_WORKER, MSG_TASK_NEEDS_FOLLOW_UP,
-    MSG_PAIR_NEEDS_NAME, MSG_PRESET_NEEDS_NAME, MSG_REVIEW_EMPTY,
+    MSG_REVIEW_EMPTY,
     _open_link_in_browser,
 )
 from duo_debug import _NullLogger, _debug_log, make_debug_logger
@@ -250,6 +260,7 @@ from duo_ollama import (
     OllamaClient, OllamaError, check_for_update,
     parse_ollama_list_output, parse_ps_payload, parse_tags_payload,
     parse_tags_sizes, parse_version,)
+from duo_pairs import PairPresetController
 from duo_runner import SerialRunner
 from duo_single import (SINGLE_INSTANCE_ENV, SINGLE_INSTANCE_NAME,
                         SingleInstance, notify_existing,
@@ -263,11 +274,8 @@ from duo_stats import (
     read_total_ram,)
 from duo_storage import (
     CONVERSATION_FORMAT_VERSION, ConversationError, conversation_to_data,
-    data_to_conversation, delete_pair, delete_preset, is_valid_preset,
-    load_conversation_file, load_pairs, load_presets, pair_tooltip,
-    pairs_path, preset_tooltip, presets_file_corrupt, presets_path,
-    save_conversation_file, save_pair, save_preset, valid_temperature,
-    write_text_atomic,)
+    data_to_conversation, load_conversation_file,
+    save_conversation_file, write_text_atomic,)
 from duo_tasks import (
     TASK_CONTINUE_TEMPLATE, TASK_FOLLOW_UPS, TASK_REVIEW_TEMPLATE,
     TASK_REVISE_TEMPLATE, TASK_ROUNDS_DEFAULT, TASK_ROUNDS_MAX,
@@ -288,7 +296,25 @@ from duo_workers import (_ModelLoader, _SignalObject,
 
 
 APP_NAME = "DUO"
-APP_VERSION = "0.55"
+APP_VERSION = "0.56"
+
+# P1-5 (v0.56): closing with an unsaved conversation asks first.
+# The GUI tests close windows with messages in every tearDown, so
+# the test module turns the ask off globally (setUpModule) and the
+# close-confirm tests turn it back on around their checks.
+CLOSE_CONFIRM_ENABLED = True
+
+
+def close_needs_confirm(convo, state):
+    """True when closing would lose something: either pane has
+    messages, or work is in flight (a generation, a relay, or a
+    task). There is no autosave -- Save conversation is the only
+    persistence -- so any of these is worth asking about."""
+    has_messages = (bool(convo.sides["A"].messages)
+                    or bool(convo.sides["B"].messages))
+    work_in_flight = (state["busy"] or state.get("relay") is not None
+                      or state.get("task") is not None)
+    return has_messages or work_in_flight
 
 
 
@@ -380,6 +406,11 @@ def build_window(client=None, logger=None, deck_port=None):
     root.setSpacing(4)
 
     panes = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+    # P1-6 (v0.56): the panes get a guaranteed minimum height, so
+    # the transcript keeps its 100 px floor even with the director
+    # fully expanded at the minimum window height. The director's
+    # scroll area (below) absorbs the squeeze instead.
+    panes.setMinimumHeight(PANES_MIN_HEIGHT)
     root.addWidget(panes, stretch=1)
 
     # Persisted preferences (QSettings): created here, before the
@@ -756,10 +787,8 @@ def build_window(client=None, logger=None, deck_port=None):
     d_layout.addWidget(attach_frame)
 
     btn_row = QtWidgets.QHBoxLayout()
-    # No hint label here: the row holds eleven buttons now, and a
-    # label gets clipped to a stub ("Send to A, B, or bc", v0.28).
-    # The buttons say what they do; the stretch keeps them
-    # right-aligned, where they were.
+    # No hint label here: the buttons say what they do; the stretch
+    # keeps them right-aligned, where they were.
     btn_row.addStretch(1)
     send_a = QtWidgets.QPushButton("Send to A")
     send_b = QtWidgets.QPushButton("Send to B")
@@ -767,14 +796,6 @@ def build_window(client=None, logger=None, deck_port=None):
     for btn in (send_a, send_b, send_both):
         btn.setEnabled(False)
         btn_row.addWidget(btn)
-    save_both = QtWidgets.QPushButton("Save both")
-    btn_row.addWidget(save_both)
-    save_full = QtWidgets.QPushButton("Save full transcript")
-    btn_row.addWidget(save_full)
-    save_convo = QtWidgets.QPushButton("Save conversation")
-    btn_row.addWidget(save_convo)
-    open_convo = QtWidgets.QPushButton("Open conversation")
-    btn_row.addWidget(open_convo)
     debug_btn = QtWidgets.QPushButton("Debug report")
     btn_row.addWidget(debug_btn)
     phone_btn = QtWidgets.QPushButton("Phone deck")
@@ -782,6 +803,47 @@ def build_window(client=None, logger=None, deck_port=None):
     update_btn = QtWidgets.QPushButton("Check for updates")
     btn_row.addWidget(update_btn)
     d_layout.addLayout(btn_row)
+
+    # P1-7 (v0.56): the row held ten buttons and four labels
+    # clipped at the 900 px minimum width. The save/open actions
+    # move to a second row -- the File menu already mirrors them,
+    # but the buttons stay for one-click saving.
+    btn_row2 = QtWidgets.QHBoxLayout()
+    btn_row2.addStretch(1)
+    save_both = QtWidgets.QPushButton("Save both")
+    btn_row2.addWidget(save_both)
+    save_full = QtWidgets.QPushButton("Save full transcript")
+    btn_row2.addWidget(save_full)
+    save_convo = QtWidgets.QPushButton("Save conversation")
+    btn_row2.addWidget(save_convo)
+    open_convo = QtWidgets.QPushButton("Open conversation")
+    btn_row2.addWidget(open_convo)
+    d_layout.addLayout(btn_row2)
+
+    # --- director sections, scrollable (P1-8, v0.56) ---------------
+    # The sections used to sit directly in the director frame, so
+    # with Relay + Pairs + Tasks open they ran off the bottom of a
+    # short window with no way to reach them -- on a 768 px screen
+    # there is no taller resize to escape to. They now live in a
+    # vertical scroll area; the composer and the send rows above
+    # stay pinned, and the sections scroll under them. The review
+    # frame stays pinned below the scroll area: it is an
+    # interruption, and it must never be scrolled out of sight.
+    director_scroll = QtWidgets.QScrollArea()
+    director_scroll.setWidgetResizable(True)
+    director_scroll.setHorizontalScrollBarPolicy(
+        QtCore.Qt.ScrollBarAlwaysOff)
+    director_scroll.setVerticalScrollBarPolicy(
+        QtCore.Qt.ScrollBarAsNeeded)
+    director_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+    director_scroll.setMinimumHeight(60)
+    director_scroll.setMaximumHeight(DIRECTOR_SCROLL_MAX_HEIGHT)
+    sections = QtWidgets.QWidget()
+    sections_layout = QtWidgets.QVBoxLayout(sections)
+    sections_layout.setContentsMargins(0, 0, 0, 0)
+    sections_layout.setSpacing(6)
+    director_scroll.setWidget(sections)
+    d_layout.addWidget(director_scroll, stretch=1)
 
     # --- director sections (v0.37, R4) -------------------------------
     # Progressive disclosure: the director's controls live in three
@@ -829,8 +891,8 @@ def build_window(client=None, logger=None, deck_port=None):
     # relay settings.
     relay_toggle, relay_body, relay_layout, _set_relay_collapsed = \
         _make_section("Relay", "relay", False)
-    d_layout.addWidget(relay_toggle)
-    d_layout.addWidget(relay_body)
+    sections_layout.addWidget(relay_toggle)
+    sections_layout.addWidget(relay_body)
     relay_row1 = QtWidgets.QHBoxLayout()
     relay_btn = QtWidgets.QPushButton("Start Relay")
     relay_btn.setEnabled(False)
@@ -892,8 +954,8 @@ def build_window(client=None, logger=None, deck_port=None):
     # --- pairs section -------------------------------------------------
     pairs_toggle, pairs_body, pairs_layout, _set_pairs_collapsed = \
         _make_section("Pairs", "pairs", True)
-    d_layout.addWidget(pairs_toggle)
-    d_layout.addWidget(pairs_body)
+    sections_layout.addWidget(pairs_toggle)
+    sections_layout.addWidget(pairs_body)
 
     # --- saved pairs -------------------------------------------------------
     pair_row = QtWidgets.QHBoxLayout()
@@ -914,8 +976,8 @@ def build_window(client=None, logger=None, deck_port=None):
     # --- tasks section -------------------------------------------------
     tasks_toggle, tasks_body, tasks_layout, _set_tasks_collapsed = \
         _make_section("Tasks", "tasks", True)
-    d_layout.addWidget(tasks_toggle)
-    d_layout.addWidget(tasks_body)
+    sections_layout.addWidget(tasks_toggle)
+    sections_layout.addWidget(tasks_body)
 
     # --- task row ---------------------------------------------------------
     # Tasks (Item 6): hand a job to one model, and optionally have the
@@ -1575,8 +1637,13 @@ def build_window(client=None, logger=None, deck_port=None):
         for btn in attach_frame.findChildren(QtWidgets.QPushButton):
             btn.setEnabled(attach_idle)
         relay_btn.setText("Stop Relay" if relay_active else "Start Relay")
+        # P1-3 (v0.56): a relay needs a seed message, so the button
+        # greys out on an empty composer, mirroring the send
+        # buttons. While a relay runs the button is Stop, and the
+        # composer is irrelevant then.
         relay_btn.setEnabled(
-            relay_active or (not busy and a_ready and b_ready))
+            relay_active or (not busy and a_ready and b_ready
+                             and composer_has_text))
         for widget in (start_picker, cap_spin, mode_picker, stop_edit,
                        agree_check, review_check):
             widget.setEnabled(not relay_active)
@@ -1620,7 +1687,8 @@ def build_window(client=None, logger=None, deck_port=None):
             menu_actions["save_full"].setEnabled(save_idle)
             menu_actions["save_both"].setEnabled(save_idle)
             menu_actions["start_relay"].setEnabled(
-                not relay_active and not busy and a_ready and b_ready)
+                not relay_active and not busy and a_ready and b_ready
+                and composer_has_text)
             menu_actions["stop_relay"].setEnabled(relay_active)
         # Run Task: idle only, and only once the task text and both
         # pickers are set. Nothing is pre-selected, ever. The task
@@ -3015,6 +3083,16 @@ def build_window(client=None, logger=None, deck_port=None):
             row = lst.currentRow()
             if row < 0:
                 return
+            # P1-4 (v0.56): deleting a message is irreversible,
+            # like Clear -- ask first, defaulting to No.
+            answer = QtWidgets.QMessageBox.question(
+                window, "Delete message?",
+                "Delete this message from Model %s? This can't be "
+                "undone." % side,
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                QtWidgets.QMessageBox.No)
+            if answer != QtWidgets.QMessageBox.Yes:
+                return
             convo.sides[side].delete_at(row)
             render_transcript(side)
             refresh_history_list(side)
@@ -3080,231 +3158,24 @@ def build_window(client=None, logger=None, deck_port=None):
         w["search_next"].clicked.connect(
             (lambda s: lambda: step_search(s, +1))(side))
 
-    # --- saved pairs ---------------------------------------------------------
-    def refresh_pair_combo(select=None):
-        """Reload the pair dropdown from the JSON file. Nothing is
-        loaded by default -- the dropdown just lists what is saved."""
-        pairs = load_pairs(pairs_path())
-        pair_combo.blockSignals(True)
-        pair_combo.clear()
-        names = sorted(pairs)
-        for index, name in enumerate(names):
-            pair_combo.addItem(name)
-            # Hovering shows what loading this pair would set (v0.41,
-            # R6): models, temperatures, instructions preview.
-            pair_combo.setItemData(index, pair_tooltip(pairs[name]),
-                                   QtCore.Qt.ToolTipRole)
-        if select in names:
-            pair_combo.setCurrentIndex(names.index(select))
-        else:
-            pair_combo.setCurrentIndex(-1)
-        pair_combo.blockSignals(False)
-        # The Delete button follows the selection, and this rebuild
-        # runs with signals blocked, so refresh the buttons here.
-        refresh_buttons()
-        return pairs
-
-    def on_pair_save():
-        name = pair_name.text().strip()
-        if not name:
-            set_status_message(MSG_PAIR_NEEDS_NAME)
-            return
-        setup = {
-            "model_a": convo.sides["A"].model,
-            "model_b": convo.sides["B"].model,
-            "temperature_a": widgets["A"]["temperature"].value(),
-            "temperature_b": widgets["B"]["temperature"].value(),
-            "instruction_a": widgets["A"]["instr_edit"].toPlainText(),
-            "instruction_b": widgets["B"]["instr_edit"].toPlainText(),
-        }
-        try:
-            save_pair(pairs_path(), name, setup)
-        except OSError as exc:
-            reason = exc.strerror or str(exc)
-            set_status_message(
-                "Couldn't save pair '%s': %s" % (name, reason))
-            return
-        refresh_pair_combo(select=name)
-        set_status_message("Pair '%s' saved." % name)
-
-    def on_pair_selected(index):
-        if index < 0:
-            return
-        name = pair_combo.currentText()
-        setup = load_pairs(pairs_path()).get(name)
-        if setup is None:
-            return
-        missing = []
-        for side, key in (("A", "model_a"), ("B", "model_b")):
-            model = setup.get(key)
-            if not model:
-                continue
-            picker = widgets[side]["picker"]
-            # The plain model name is the item data (v0.33); the
-            # visible text carries size and fit too.
-            found = picker.findData(model)
-            if found >= 0:
-                picker.setCurrentIndex(found)
-            else:
-                missing.append(model)
-        # Temperatures and instructions follow the pair too (v0.41,
-        # R6). A key missing from an old pair leaves the current value
-        # alone -- only keys the pair actually has are applied, so a
-        # pair saved before temperatures were stored can't reset them.
-        for side, tkey, ikey in (
-                ("A", "temperature_a", "instruction_a"),
-                ("B", "temperature_b", "instruction_b")):
-            temp = valid_temperature(setup.get(tkey))
-            if temp is not None:
-                widgets[side]["temperature"].setValue(temp)
-            if isinstance(setup.get(ikey), str):
-                widgets[side]["instr_edit"].setPlainText(setup[ikey])
-        if missing:
-            set_status_message(
-                "Pair '%s' loaded, but not installed: %s."
-                % (name, ", ".join(missing)))
-        else:
-            set_status_message("Pair '%s' loaded." % name)
-        refresh_buttons()
-
-    def on_pair_delete():
-        index = pair_combo.currentIndex()
-        if index < 0:
-            return
-        name = pair_combo.currentText()
-        answer = QtWidgets.QMessageBox.question(
-            window, "Delete pair?",
-            "Delete the saved pair '%s'? This can't be undone." % name,
-            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
-            QtWidgets.QMessageBox.No)
-        if answer != QtWidgets.QMessageBox.Yes:
-            return
-        try:
-            delete_pair(pairs_path(), name)
-        except OSError as exc:
-            reason = exc.strerror or str(exc)
-            set_status_message(
-                "Couldn't delete pair '%s': %s" % (name, reason))
-            return
-        refresh_pair_combo()
-        set_status_message("Pair '%s' deleted." % name)
-
-    pair_save.clicked.connect(on_pair_save)
-    pair_delete.clicked.connect(on_pair_delete)
-    # Both signals: currentIndexChanged covers picking a different pair,
-    # activated covers re-picking the pair that is already selected
-    # (choosing the same item again fires no index change, but the user
-    # still expects the load). Loading twice is harmless -- it applies
-    # the same setup.
-    pair_combo.currentIndexChanged.connect(on_pair_selected)
-    pair_combo.activated.connect(on_pair_selected)
-
-    # --- relay presets -------------------------------------------------------
-    # Same shape as the saved pairs above: reload the dropdown from
-    # the JSON file, save the row as it stands, load a preset back
-    # onto the row, delete with a confirmation first.
-    def refresh_preset_combo(select=None):
-        """Reload the preset dropdown from the JSON file. Nothing is
-        loaded by default -- the dropdown just lists what is saved.
-        A file that exists but won't parse earns a plain note; the
-        row itself is left exactly as it is."""
-        presets = load_presets(presets_path())
-        preset_combo.blockSignals(True)
-        preset_combo.clear()
-        names = sorted(presets)
-        for index, name in enumerate(names):
-            preset_combo.addItem(name)
-            # Hovering shows the six relay fields this preset sets.
-            preset_combo.setItemData(index, preset_tooltip(presets[name]),
-                                     QtCore.Qt.ToolTipRole)
-        if select in names:
-            preset_combo.setCurrentIndex(names.index(select))
-        else:
-            preset_combo.setCurrentIndex(-1)
-        preset_combo.blockSignals(False)
-        if presets_file_corrupt(presets_path()):
-            set_status_message(
-                "Couldn't read the saved relay presets.")
-        # The Delete button follows the selection, and this rebuild
-        # runs with signals blocked, so refresh the buttons here.
-        refresh_buttons()
-        return presets
-
-    def on_preset_save():
-        name = preset_name.text().strip()
-        if not name:
-            set_status_message(MSG_PRESET_NEEDS_NAME)
-            return
-        config = {
-            "start_side": start_picker.currentText(),
-            "mode": ("aware" if mode_picker.currentText() == "Aware"
-                     else "blind"),
-            "turn_cap": cap_spin.value(),
-            "stop_phrases": parse_stop_phrases(stop_edit.text()),
-            "stop_on_agreement": agree_check.isChecked(),
-            "review_each_hop": review_check.isChecked(),
-        }
-        try:
-            save_preset(presets_path(), name, config)
-        except OSError as exc:
-            reason = exc.strerror or str(exc)
-            set_status_message(
-                "Couldn't save relay preset '%s': %s" % (name, reason))
-            return
-        refresh_preset_combo(select=name)
-        set_status_message("Relay preset '%s' saved." % name)
-
-    def on_preset_selected(index):
-        if index < 0:
-            return
-        name = preset_combo.currentText()
-        config = load_presets(presets_path()).get(name)
-        if config is None:
-            # Gone (or gone bad) since the dropdown was filled --
-            # say so plainly and leave the row alone.
-            set_status_message(
-                "Relay preset '%s' couldn't be loaded." % name)
-            return
-        start_picker.setCurrentText(config["start_side"])
-        mode_picker.setCurrentText(
-            "Aware" if config["mode"] == "aware" else "Blind")
-        cap_spin.setValue(config["turn_cap"])
-        stop_edit.setText(", ".join(config["stop_phrases"]))
-        agree_check.setChecked(config["stop_on_agreement"])
-        review_check.setChecked(config["review_each_hop"])
-        set_status_message("Relay preset '%s' loaded." % name)
-        refresh_buttons()
-
-    def on_preset_delete():
-        index = preset_combo.currentIndex()
-        if index < 0:
-            return
-        name = preset_combo.currentText()
-        answer = QtWidgets.QMessageBox.question(
-            window, "Delete relay preset?",
-            "Delete the saved relay preset '%s'? This can't be "
-            "undone." % name,
-            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
-            QtWidgets.QMessageBox.No)
-        if answer != QtWidgets.QMessageBox.Yes:
-            return
-        try:
-            delete_preset(presets_path(), name)
-        except OSError as exc:
-            reason = exc.strerror or str(exc)
-            set_status_message(
-                "Couldn't delete relay preset '%s': %s" % (name, reason))
-            return
-        refresh_preset_combo()
-        set_status_message("Relay preset '%s' deleted." % name)
-
-    preset_save.clicked.connect(on_preset_save)
-    preset_delete.clicked.connect(on_preset_delete)
-    # Both signals, as with pairs: currentIndexChanged covers picking
-    # a different preset, activated covers re-picking the preset that
-    # is already selected.
-    preset_combo.currentIndexChanged.connect(on_preset_selected)
-    preset_combo.activated.connect(on_preset_selected)
+    # --- saved pairs + relay presets --------------------------------------
+    # v0.56 (P1-12): the dropdown handlers live in duo_pairs now
+    # (PairPresetController) -- same eight handlers, same wiring,
+    # constructed here with the widgets they touch.
+    pair_presets = PairPresetController(
+        window, convo, widgets, set_status_message, refresh_buttons,
+        pair_combo=pair_combo, pair_name=pair_name,
+        pair_save=pair_save, pair_delete=pair_delete,
+        preset_combo=preset_combo, preset_name=preset_name,
+        preset_save=preset_save, preset_delete=preset_delete,
+        start_picker=start_picker, mode_picker=mode_picker,
+        cap_spin=cap_spin, stop_edit=stop_edit,
+        agree_check=agree_check, review_check=review_check)
+    pair_presets.wire()
+    refresh_pair_combo = pair_presets.refresh_pair_combo
+    refresh_preset_combo = pair_presets.refresh_preset_combo
+    on_pair_delete = pair_presets.on_pair_delete
+    on_preset_delete = pair_presets.on_preset_delete
 
     # --- per-side buttons --------------------------------------------------
     def make_stop(side):
@@ -3763,6 +3634,7 @@ def build_window(client=None, logger=None, deck_port=None):
         "menu_bar": menu_bar, "menu_actions": menu_actions,
         "motion": motion, "big_text": big_text, "prefs": prefs,
         "director": director, "director_toggle": director_toggle,
+        "director_scroll": director_scroll,
         "set_director_collapsed": _set_director_collapsed,
         "director_spring": director_spring,
         "relay_section": relay_body,
@@ -3787,6 +3659,20 @@ def build_window(client=None, logger=None, deck_port=None):
     _orig_close_event = window.closeEvent
 
     def _on_close(event):
+        # P1-5 (v0.56): closing loses an unsaved conversation, and
+        # there is no autosave. Ask first when either pane has
+        # messages or work is in flight, defaulting to No. The ask
+        # comes before anything is cancelled, waited on, or saved:
+        # saying No leaves the window exactly as it was.
+        if CLOSE_CONFIRM_ENABLED and close_needs_confirm(convo, state):
+            answer = QtWidgets.QMessageBox.question(
+                window, "Close DUO?",
+                "You have an unsaved conversation. Close anyway?",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                QtWidgets.QMessageBox.No)
+            if answer != QtWidgets.QMessageBox.Yes:
+                event.ignore()
+                return
         # Threads this window started (model loads, update checks)
         # must finish before the window goes away: destroying a
         # running QThread aborts the whole process ("QThread:

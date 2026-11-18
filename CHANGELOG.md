@@ -2,8 +2,25 @@
 
 Every version, newest first. v0.1–v0.17 were built on 2026-11-12;
 v0.18–v0.35 on 2026-11-13; v0.36–v0.49 on 2026-11-14; v0.50 on
-2026-11-15; v0.51–v0.52 on 2026-11-16; v0.53–v0.55 on
+2026-11-15; v0.51–v0.52 on 2026-11-16; v0.53–v0.56 on
 2026-11-17.
+
+## v0.56 — 2026-11-17
+
+The window gets room to breathe, and room to grow. The send row
+used to hold ten buttons and four labels clipped at the narrowest
+window size; the save and open buttons now sit on a second row,
+and every label fits. The director's sections used to run off
+the bottom of a short window with no way to reach them; they now
+scroll under the composer and the send rows, which stay pinned.
+The panes keep a guaranteed minimum height, so the transcript
+holds its floor even with the director fully open. Start Relay
+greys out on an empty composer, the way the send buttons already
+do. Deleting a message from history asks first, and closing DUO
+with an unsaved conversation asks first too, with No as the
+safe default both times. Underneath, the saved-pair and relay
+preset handlers move to their own module, duo_pairs.py, which
+buys the window file two hundred lines of headroom.
 
 ## v0.55 — 2026-11-17
 

@@ -472,7 +472,9 @@ def apply_and_restart(window, state, root=None):
     the window and quit so main() restarts DUO on the new files.
     Returns ("applied", version) on success, ("failed", reason)
     when the install failed (the window stays open and the reason
-    is for the status bar)."""
+    is for the status bar). A close the user refuses (P1-5) is a
+    ("failed", reason) too: the files are already installed, so
+    the update simply finishes on the next launch instead."""
     applied, payload = apply_pending_update(root)
     if applied == "none":
         # The staging vanished between the download and the tap
@@ -484,6 +486,16 @@ def apply_and_restart(window, state, root=None):
         return (applied, payload)
     state["restart_for_update"] = True
     window.close()
+    if window.isVisible():
+        # P1-5 (v0.56): the close confirm said No -- the window is
+        # still up, so the restart is off and the app must not quit
+        # anyway. The new files are already installed, so the next
+        # launch runs them; clear the flag so a later plain quit
+        # doesn't restart instead.
+        state.pop("restart_for_update", None)
+        return ("failed",
+                "The update is installed and will run the next time "
+                "DUO starts.")
     QtWidgets = _qt_widgets()
     app = QtWidgets.QApplication.instance()
     if app is not None:

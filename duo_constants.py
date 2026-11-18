@@ -94,6 +94,18 @@ SETTING_HIST_SPLITTER_STATE = "history_splitter/%s"
 # the transcript below 100 px or the editor below 60 px; the editor
 # opens at 110 px, the height it had when it was fixed.
 HIST_TRANSCRIPT_MIN_HEIGHT = 100
+# v0.56 (P1-6/P1-8): the panes keep at least this much height, so
+# the transcript holds its 100 px floor with the director fully
+# expanded; the director's scroll area gives back past this height
+# instead of squeezing the panes further.
+PANES_MIN_HEIGHT = 250
+# v0.56 (P1-8): the director's sections scroll past this height
+# instead of demanding more room -- 130 px shows the Relay
+# section's core controls (start, turns, stop-on), and the panes
+# keep the rest. Taller caps shrink the panes below the height
+# the first-run guide needs (the guide test pins it: the search
+# row must start below the guide's last line at 1100x700).
+DIRECTOR_SCROLL_MAX_HEIGHT = 130
 HIST_EDITOR_MIN_HEIGHT = 60
 HIST_EDITOR_DEFAULT_HEIGHT = 110
 # Model parameters (v0.19): each side's temperature is remembered

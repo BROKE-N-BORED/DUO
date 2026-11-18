@@ -67,36 +67,45 @@ from dual_chat import (  # noqa: E402
     SingleInstance,
     TaskSession, TranscriptError, append_full_log_entry, attachment_tag,
     build_attached_message,
-    build_deck_state, check_for_update, compute_turn_stats,
+    build_deck_state, check_for_update, close_needs_confirm,
+    compute_turn_stats,
     conversation_to_data, cpu_percent_between,
     data_to_conversation, default_both_filename,
     default_conversation_filename, default_debug_filename,
-    default_full_filename, default_side_filename, delete_pair,
-    delete_preset,
+    default_full_filename, default_side_filename,
     format_both_transcript,
     format_full_transcript, format_model_entry, format_ram,
     format_session_line,
     format_side_transcript,
     format_stats_line, format_system_meter, first_run_guide_html,
     get_lan_ip,
-    is_valid_preset, load_attachment,
-    load_conversation_file, load_pairs, load_presets,
+    load_attachment,
+    load_conversation_file,
     load_side_transcript_file,
     make_debug_logger,
     markdown_to_html,
     model_fits,
     notify_existing,
-    pair_tooltip, pairs_path, parse_cpu_times, parse_meminfo,
+    parse_cpu_times, parse_meminfo,
     parse_ollama_list_output, parse_ps_payload,
     parse_side_transcript, parse_stop_phrases, parse_tags_payload,
     parse_tags_sizes, parse_version, phrase_matches,
-    preset_tooltip, presets_file_corrupt, presets_path,
     read_system_meter, read_total_ram,
     render_qr_pixmap,
     sanitize_filename_part,
-    save_conversation_file, save_pair, save_preset,
+    save_conversation_file,
     single_instance_name,
-    valid_temperature, write_text_atomic,
+    write_text_atomic,
+)
+
+# v0.56: the pair/preset storage names moved out of dual_chat with
+# the handlers (duo_pairs.py); the tests import them from duo_storage
+# directly now.
+from duo_storage import (  # noqa: E402
+    delete_pair, delete_preset, is_valid_preset, load_pairs,
+    load_presets, pair_tooltip, pairs_path, preset_tooltip,
+    presets_file_corrupt, presets_path, save_pair, save_preset,
+    valid_temperature,
 )
 
 import duo_updater  # noqa: E402  (the v0.55 self-update module)
@@ -1010,6 +1019,20 @@ def _answer_no():
         return_value=QMessageBox.StandardButton.No)
 
 
+def setUpModule():
+    # P1-5 (v0.56): closing with an unsaved conversation asks
+    # first. The GUI tests close windows with messages in every
+    # tearDown, so the ask is off for the whole module; the
+    # close-confirm tests turn it back on around their checks.
+    import dual_chat
+    dual_chat.CLOSE_CONFIRM_ENABLED = False
+
+
+def tearDownModule():
+    import dual_chat
+    dual_chat.CLOSE_CONFIRM_ENABLED = True
+
+
 @unittest.skipUnless(os.environ.get("DUAL_CHAT_GUI_TESTS") == "1",
                      "GUI tests run with DUAL_CHAT_GUI_TESTS=1")
 class GuiTests(unittest.TestCase):
@@ -1222,6 +1245,11 @@ class RelayGuiTests(unittest.TestCase):
             self.app.processEvents()
             self.assertFalse(state["relay_btn"].isEnabled())
             state["widgets"]["B"]["picker"].setCurrentIndex(1)
+            self.app.processEvents()
+            # P1-3 (v0.56): the button also needs a seed in the
+            # composer now -- type one so the both-models state
+            # shows as enabled.
+            state["composer"].setPlainText("seed")
             self.app.processEvents()
             self.assertTrue(state["relay_btn"].isEnabled())
         finally:
@@ -2156,7 +2184,8 @@ class DirectorGuiTests(unittest.TestCase):
         lst = self.state["widgets"]["A"]["hist_list"]
         lst.setCurrentRow(0)  # "You: first message"
         self.app.processEvents()
-        self.state["widgets"]["A"]["hist_delete"].click()
+        with _answer_yes():
+            self.state["widgets"]["A"]["hist_delete"].click()
         self.app.processEvents()
         convo = self.state["convo"]
         self.assertEqual(
@@ -2170,6 +2199,28 @@ class DirectorGuiTests(unittest.TestCase):
             {"role": "assistant", "content": "alpha two"},
             {"role": "user", "content": "third message"},
         ])
+
+    def test_delete_asks_first_and_no_keeps_the_message(self):
+        # P1-4 (v0.56): history delete asks, defaulting to No.
+        self.client.replies = {"fake-a:latest": ["alpha one"]}
+        self.assertTrue(self._send_to_a_and_wait("first message"))
+        self._open_history("A")
+        lst = self.state["widgets"]["A"]["hist_list"]
+        lst.setCurrentRow(0)  # "You: first message"
+        self.app.processEvents()
+        from PySide6.QtWidgets import QMessageBox
+        with mock.patch.object(
+                QMessageBox, "question",
+                return_value=QMessageBox.StandardButton.No) as asked:
+            self.state["widgets"]["A"]["hist_delete"].click()
+        self.app.processEvents()
+        self.assertEqual(asked.call_count, 1)
+        # The default button is No: a stray Enter keeps the message.
+        self.assertEqual(asked.call_args.args[4],
+                         QMessageBox.StandardButton.No)
+        self.assertEqual(
+            [m.content for m in self.state["convo"].sides["A"].messages],
+            ["first message", "alpha one"])
 
     def test_history_buttons_follow_selection(self):
         self.assertTrue(self._send_to_a_and_wait("hello"))
@@ -4819,7 +4870,8 @@ class Item9GuiTests(unittest.TestCase):
         self.app.processEvents()
         lst.setCurrentRow(0)
         self.app.processEvents()
-        self.state["widgets"]["A"]["hist_delete"].click()
+        with _answer_yes():
+            self.state["widgets"]["A"]["hist_delete"].click()
         self.app.processEvents()
         # The history changed, but the log is what actually happened.
         self.assertEqual(
@@ -8961,7 +9013,7 @@ class ModuleSplitTests(unittest.TestCase):
                "duo_deck", "duo_workers", "duo_debug",
                "duo_attachments", "duo_single", "duo_motion",
                "duo_constants", "duo_sparkline", "duo_accessibility",
-               "duo_updater")
+               "duo_updater", "duo_pairs")
 
     def _tree(self):
         return os.path.dirname(
@@ -8999,6 +9051,7 @@ class ModuleSplitTests(unittest.TestCase):
         import duo_model
         import duo_motion
         import duo_ollama
+        import duo_pairs
         import duo_runner
         import duo_single
         import duo_sparkline
@@ -9030,13 +9083,14 @@ class ModuleSplitTests(unittest.TestCase):
             (dual_chat.check_for_update, duo_ollama.check_for_update),
             (dual_chat.parse_version, duo_ollama.parse_version),
             (dual_chat.SerialRunner, duo_runner.SerialRunner),
+            (dual_chat.PairPresetController,
+             duo_pairs.PairPresetController),
             (dual_chat.compute_turn_stats, duo_stats.compute_turn_stats),
             (dual_chat.format_stats_line, duo_stats.format_stats_line),
             (dual_chat.read_system_meter, duo_stats.read_system_meter),
             (dual_chat.format_system_meter,
              duo_stats.format_system_meter),
             (dual_chat.write_text_atomic, duo_storage.write_text_atomic),
-            (dual_chat.save_pair, duo_storage.save_pair),
             (dual_chat.ConversationError, duo_storage.ConversationError),
             (dual_chat.TaskSession, duo_tasks.TaskSession),
             (dual_chat.phrase_matches, duo_text.phrase_matches),
@@ -10206,6 +10260,9 @@ class UpdaterTests(unittest.TestCase):
             def close(self):
                 self.closed = True
 
+            def isVisible(self):
+                return not self.closed
+
         class _FakeApp:
             def __init__(self):
                 self.quit_called = False
@@ -10233,6 +10290,49 @@ class UpdaterTests(unittest.TestCase):
         self.assertTrue(fake_app.quit_called)
         self.assertEqual(self._read("dual_chat.py"), "NEW")
 
+    def test_apply_and_restart_close_refused_keeps_running(self):
+        # P1-5 (v0.56): the close confirm said No -- the window
+        # stays up, so the restart is off and the app must not quit
+        # anyway. The new files are already installed; the next
+        # launch runs them.
+        self._fake_app_root()
+        zip_bytes = self._make_zip([("duo/dual_chat.py", b"NEW")])
+        self._stage(zip_bytes, self._sha(zip_bytes))
+
+        class _FakeWindow:
+            def close(self):
+                # The close confirm refused: close() is ignored.
+                pass
+
+            def isVisible(self):
+                return True
+
+        class _FakeApp:
+            def __init__(self):
+                self.quit_called = False
+
+            def quit(self):
+                self.quit_called = True
+
+        fake_app = _FakeApp()
+
+        class _FakeQtWidgets:
+            class QApplication:
+                @staticmethod
+                def instance():
+                    return fake_app
+
+        window = _FakeWindow()
+        state = {}
+        with mock.patch("duo_updater._qt_widgets",
+                        return_value=_FakeQtWidgets):
+            result = duo_updater.apply_and_restart(
+                window, state, root=self.root)
+        self.assertEqual(result[0], "failed")
+        self.assertNotIn("restart_for_update", state)
+        self.assertFalse(fake_app.quit_called)
+        self.assertEqual(self._read("dual_chat.py"), "NEW")
+
     def test_apply_and_restart_failed_keeps_window_open(self):
         class _FakeWindow:
             def __init__(self):
@@ -10248,6 +10348,285 @@ class UpdaterTests(unittest.TestCase):
         self.assertEqual(result[0], "failed")
         self.assertNotIn("restart_for_update", state)
         self.assertFalse(window.closed)
+
+
+class CloseConfirmTests(unittest.TestCase):
+    """P1-5 (v0.56): the close ask fires when closing would lose
+    something -- messages in either pane, or work in flight."""
+
+    def _convo(self, messages_a=(), messages_b=()):
+        convo = Conversation()
+        for text in messages_a:
+            convo.sides["A"].messages.append(
+                ChatMessage("user", text, "You"))
+        for text in messages_b:
+            convo.sides["B"].messages.append(
+                ChatMessage("user", text, "You"))
+        return convo
+
+    def _state(self, busy=False, relay=None, task=None):
+        return {"busy": busy, "relay": relay, "task": task}
+
+    def test_empty_and_idle_needs_no_confirm(self):
+        self.assertFalse(close_needs_confirm(
+            self._convo(), self._state()))
+
+    def test_messages_in_a_need_confirm(self):
+        self.assertTrue(close_needs_confirm(
+            self._convo(messages_a=["hello"]), self._state()))
+
+    def test_messages_in_b_need_confirm(self):
+        self.assertTrue(close_needs_confirm(
+            self._convo(messages_b=["hello"]), self._state()))
+
+    def test_busy_needs_confirm_even_with_no_messages(self):
+        self.assertTrue(close_needs_confirm(
+            self._convo(), self._state(busy=True)))
+
+    def test_relay_needs_confirm_even_with_no_messages(self):
+        self.assertTrue(close_needs_confirm(
+            self._convo(), self._state(relay=mock.Mock())))
+
+    def test_task_needs_confirm_even_with_no_messages(self):
+        self.assertTrue(close_needs_confirm(
+            self._convo(), self._state(task=mock.Mock())))
+
+
+@unittest.skipUnless(os.environ.get("DUAL_CHAT_GUI_TESTS") == "1",
+                     "GUI tests run with DUAL_CHAT_GUI_TESTS=1")
+class CloseConfirmGuiTests(unittest.TestCase):
+    """P1-5 (v0.56): the close dialog in the window -- No keeps
+    it open, Yes closes it, and a window with nothing to lose
+    closes without asking."""
+
+    @classmethod
+    def setUpClass(cls):
+        from PySide6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+        cls.client = FakeGuiClient()
+
+    def setUp(self):
+        self.window = None
+        self.client.reset()
+
+    def tearDown(self):
+        # The ask is off here (setUpModule): closing in tearDown
+        # never blocks on a dialog.
+        if self.window is not None:
+            self.window.close()
+        self.app.processEvents()
+
+    def _build_window(self):
+        from dual_chat import build_window
+        self.window = build_window(self.client, logger=TEST_LOGGER)
+        self.window.show()
+        self.state = self.window._dual_chat
+        self.assertTrue(self._wait_for(
+            lambda: self.state["widgets"]["A"]["picker"].count() == 2),
+            "pickers should load the fake models")
+
+    def _wait_for(self, cond, timeout=10.0):
+        from PySide6.QtTest import QTest
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            QTest.qWait(50)
+            if cond():
+                return True
+        return cond()
+
+    def _close_with_answer(self, answer):
+        """Close with the confirm on, answering the dialog
+        `answer`. Returns the question mock, so the test can
+        check the ask happened. The confirm is off again before
+        this returns."""
+        import dual_chat
+        from PySide6.QtWidgets import QMessageBox
+        dual_chat.CLOSE_CONFIRM_ENABLED = True
+        try:
+            with mock.patch.object(
+                    QMessageBox, "question",
+                    return_value=answer) as asked:
+                self.window.close()
+            self.app.processEvents()
+            return asked
+        finally:
+            dual_chat.CLOSE_CONFIRM_ENABLED = False
+
+    def _add_message(self, side="A"):
+        self.state["convo"].sides[side].messages.append(
+            ChatMessage("user", "hello", "You"))
+
+    def test_no_keeps_the_window_open_and_yes_closes_it(self):
+        self._build_window()
+        self._add_message()
+        from PySide6.QtWidgets import QMessageBox
+        asked = self._close_with_answer(
+            QMessageBox.StandardButton.No)
+        self.assertEqual(asked.call_count, 1)
+        self.assertTrue(self.window.isVisible())
+        asked = self._close_with_answer(
+            QMessageBox.StandardButton.Yes)
+        self.assertEqual(asked.call_count, 1)
+        self.assertFalse(self.window.isVisible())
+
+    def test_nothing_to_lose_closes_without_asking(self):
+        self._build_window()
+        import dual_chat
+        from PySide6.QtWidgets import QMessageBox
+        dual_chat.CLOSE_CONFIRM_ENABLED = True
+        try:
+            with mock.patch.object(
+                    QMessageBox, "question") as asked:
+                self.window.close()
+            self.app.processEvents()
+        finally:
+            dual_chat.CLOSE_CONFIRM_ENABLED = False
+        self.assertEqual(asked.call_count, 0)
+        self.assertFalse(self.window.isVisible())
+
+    def test_work_in_flight_asks_even_with_no_messages(self):
+        self._build_window()
+        self.state["state"]["task"] = mock.Mock()
+        from PySide6.QtWidgets import QMessageBox
+        asked = self._close_with_answer(
+            QMessageBox.StandardButton.No)
+        self.assertEqual(asked.call_count, 1)
+        self.assertTrue(self.window.isVisible())
+
+
+@unittest.skipUnless(os.environ.get("DUAL_CHAT_GUI_TESTS") == "1",
+                     "GUI tests run with DUAL_CHAT_GUI_TESTS=1")
+class LayoutGuiTests(unittest.TestCase):
+    """v0.56: the layout fixes -- the relay button greys out on an
+    empty composer (P1-3), the transcript keeps its floor at short
+    heights (P1-6), no send-row button clips at the minimum width
+    (P1-7), and the director's sections scroll (P1-8)."""
+
+    @classmethod
+    def setUpClass(cls):
+        from PySide6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+        cls.client = FakeGuiClient()
+
+    def setUp(self):
+        self.window = None
+        self.client.reset()
+
+    def tearDown(self):
+        if self.window is not None:
+            self.window.close()
+        self.app.processEvents()
+
+    def _build_window(self):
+        from dual_chat import build_window
+        self.window = build_window(self.client, logger=TEST_LOGGER)
+        self.window.show()
+        self.state = self.window._dual_chat
+        self.assertTrue(self._wait_for(
+            lambda: self.state["widgets"]["A"]["picker"].count() == 2),
+            "pickers should load the fake models")
+
+    def _wait_for(self, cond, timeout=10.0):
+        from PySide6.QtTest import QTest
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            QTest.qWait(50)
+            if cond():
+                return True
+        return cond()
+
+    def _pick_models(self):
+        self.state["widgets"]["A"]["picker"].setCurrentIndex(0)
+        self.state["widgets"]["B"]["picker"].setCurrentIndex(1)
+        self.app.processEvents()
+
+    def _expand_all_sections(self):
+        # Relay starts expanded; Pairs and Tasks start collapsed.
+        from PySide6.QtWidgets import QPushButton
+        for btn in self.window.findChildren(QPushButton):
+            if btn.text().startswith(("Pairs", "Tasks")) \
+                    and "\u25b8" in btn.text():
+                btn.click()
+        self.app.processEvents()
+
+    def test_relay_button_greys_out_on_empty_composer(self):
+        # P1-3: a relay needs a seed message. With both models
+        # picked and the composer empty, Start Relay and the menu's
+        # Start relay are both off; typing a seed turns them on.
+        self._build_window()
+        self._pick_models()
+        relay_btn = self.state["relay_btn"]
+        menu_start = self.state["menu_actions"]["start_relay"]
+        self.assertFalse(relay_btn.isEnabled())
+        self.assertFalse(menu_start.isEnabled())
+        self.state["composer"].setPlainText("seed")
+        self.app.processEvents()
+        self.assertTrue(relay_btn.isEnabled())
+        self.assertTrue(menu_start.isEnabled())
+        # Whitespace-only counts as empty, like the send buttons.
+        self.state["composer"].setPlainText("   \n")
+        self.app.processEvents()
+        self.assertFalse(relay_btn.isEnabled())
+        self.assertFalse(menu_start.isEnabled())
+
+    def test_transcript_keeps_its_floor_at_minimum_height(self):
+        # P1-6: all sections open at the 540 px minimum height --
+        # the transcript still holds its 100 px floor.
+        self._build_window()
+        self._expand_all_sections()
+        self.window.resize(1100, 540)
+        self.app.processEvents()
+        for side in ("A", "B"):
+            self.assertGreaterEqual(
+                self.state["widgets"][side]["transcript"].height(),
+                100)
+
+    def test_send_row_buttons_do_not_clip_at_minimum_width(self):
+        # P1-7: at the 900 px minimum width every send-row button
+        # is at least as wide as its size hint -- no clipped labels.
+        self._build_window()
+        self.window.resize(900, 700)
+        self.app.processEvents()
+        from PySide6.QtWidgets import QPushButton
+        names = ("Send to A", "Send to B", "Send to Both",
+                 "Save both", "Save full transcript",
+                 "Save conversation", "Open conversation",
+                 "Debug report", "Phone deck", "Check for updates")
+        found = [b for b in self.window.findChildren(QPushButton)
+                 if b.text() in names]
+        self.assertEqual(len(found), 10)
+        for btn in found:
+            self.assertGreaterEqual(btn.width(),
+                                    btn.sizeHint().width(),
+                                    "%r clips" % btn.text())
+
+    def test_director_sections_scroll_at_short_heights(self):
+        # P1-8: all sections open at the 540 px minimum height --
+        # the sections overflow the scroll area, and both ends of
+        # the list are reachable by scrolling. The composer stays
+        # pinned outside the scroll area.
+        self._build_window()
+        self._expand_all_sections()
+        self.window.resize(1100, 540)
+        self.app.processEvents()
+        scroll = self.state["director_scroll"]
+        bar = scroll.verticalScrollBar()
+        self.assertGreater(bar.maximum(), 0)
+        viewport = scroll.viewport()
+        bar.setValue(bar.maximum())
+        self.app.processEvents()
+        run_btn = self.state["task_run"]
+        pos = run_btn.mapTo(viewport, run_btn.rect().center())
+        self.assertTrue(0 <= pos.y() <= viewport.height(),
+                        "Run task button unreachable at max scroll")
+        bar.setValue(0)
+        self.app.processEvents()
+        relay_btn = self.state["relay_btn"]
+        pos = relay_btn.mapTo(viewport, relay_btn.rect().center())
+        self.assertTrue(0 <= pos.y() <= viewport.height(),
+                        "Start Relay button unreachable at top scroll")
+        self.assertTrue(self.state["composer"].isVisible())
+        self.assertFalse(scroll.isAncestorOf(self.state["composer"]))
 
 
 @unittest.skipUnless(os.environ.get("DUAL_CHAT_GUI_TESTS") == "1",
@@ -11297,6 +11676,10 @@ class MenuBarGuiTests(unittest.TestCase):
                          "Relay stopped: stopped by you.")
 
     def test_menu_states_mirror_buttons_when_busy(self):
+        # P1-3 (v0.56): Start relay needs a seed in the composer
+        # now, like the button -- type one before asserting it on.
+        self.state["composer"].setPlainText("seed")
+        self.app.processEvents()
         actions = self.state["menu_actions"]
         state = self.state["state"]
         self.assertTrue(actions["save_conversation"].isEnabled())
@@ -11316,6 +11699,10 @@ class MenuBarGuiTests(unittest.TestCase):
             self.assertTrue(actions[name].isEnabled(), name)
 
     def test_relay_menu_states_follow_the_relay(self):
+        # P1-3 (v0.56): Start relay needs a seed in the composer
+        # now, like the button -- type one before asserting it on.
+        self.state["composer"].setPlainText("seed")
+        self.app.processEvents()
         actions = self.state["menu_actions"]
         state = self.state["state"]
         self.assertTrue(actions["start_relay"].isEnabled())
@@ -12386,7 +12773,9 @@ class DirectorSectionsGuiTests(unittest.TestCase):
             body = self.state["%s_section" % name]
             self.assertIsInstance(toggle, QtWidgets.QPushButton)
             self.assertTrue(toggle.isVisible())
-            self.assertIs(body.parent(), director)
+            # P1-8 (v0.56): the sections live in the scroll area
+            # inside the director now, not directly in the frame.
+            self.assertTrue(director.isAncestorOf(body))
         self.assertTrue(self.state["relay_btn"].isVisible())
         self.assertTrue(self.state["review_frame"].isHidden())
 
@@ -14746,7 +15135,16 @@ class DirectorSpringGuiTests(unittest.TestCase):
         self.app.processEvents()
         self.state["set_director_collapsed"](False)
         from PySide6.QtTest import QTest
-        QTest.qWait(50)
+        # Wait for the spring to actually move, not a fixed 50 ms:
+        # under load the animation's first tick lands late, and a
+        # fixed wait read maximumHeight 0 on the shipped v0.55
+        # tree as well as this one (3/3 on both, 2026-11-17).
+        # The wait still fails if the spring never moves.
+        deadline = time.time() + 5.0
+        while (self._spring().is_animating()
+               and director.maximumHeight() <= 0
+               and time.time() < deadline):
+            QTest.qWait(10)
         self.assertTrue(self._spring().is_animating())
         mid = director.maximumHeight()
         self.assertGreater(mid, 0)
