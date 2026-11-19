@@ -59,6 +59,13 @@ MSG_OLLAMA_SLOW = "Ollama is slow or busy right now. Try again in a moment."
 MSG_MODEL_FAILED = "That model couldn't be loaded. Pick another model and try again."
 
 
+# v0.58 (P2-52): the runner's catch-all used to report every
+# unexpected failure as MSG_MODEL_FAILED, so any hiccup read as
+# "that model couldn't be loaded" even when the model was fine.
+# An unexpected failure gets honest, general words instead.
+MSG_TURN_FAILED = "Something went wrong with that turn. Try again."
+
+
 # DUO used to wait 300s -- on a slow CPU, Ollama's HTTP server can
 # stall briefly between relay hops while the CPU is pegged at 100%
 # generating, and DUO gave up on the first failure with no retry. Now
@@ -253,6 +260,31 @@ def check_for_update(current_version, url=None, timeout=UPDATE_CHECK_TIMEOUT,
     if latest > current:
         return ("newer", ".".join(str(n) for n in latest))
     return ("latest", None)
+
+
+def start_ollama():
+    """Launch `ollama serve` detached (v0.58, P2-53).
+
+    The down state's remedy used to be a terminal command; under
+    the no-terminal rule the app starts the service itself, on a
+    click. The process is detached (its own session, output
+    dropped) so it outlives DUO and never holds DUO's console.
+    Returns True when the process was spawned, False when ollama
+    is not installed or the spawn failed. Spawning proves nothing
+    about readiness: the caller waits, then re-checks the model
+    list, which is the real test.
+    """
+    exe = shutil.which("ollama")
+    if exe is None:
+        return False
+    try:
+        subprocess.Popen(
+            [exe, "serve"], stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True)
+    except Exception:
+        return False
+    return True
 
 
 def llama_start_timeout(detail):
@@ -551,6 +583,13 @@ class OllamaClient:
                 except ValueError:
                     continue
                 if chunk.get("error"):
+                    # v0.58 (P2-52): an error chunk before any
+                    # content is the model failing to start, but an
+                    # error chunk after content already streamed is
+                    # a mid-turn failure, not a load failure -- the
+                    # words must not blame the model for it.
+                    if full:
+                        raise OllamaError(MSG_OLLAMA_SLOW)
                     raise OllamaError(MSG_MODEL_FAILED)
                 content = (chunk.get("message") or {}).get("content", "")
                 if content:

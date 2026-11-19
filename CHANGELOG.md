@@ -3,7 +3,24 @@
 Every version, newest first. v0.1–v0.17 were built on 2026-11-12;
 v0.18–v0.35 on 2026-11-13; v0.36–v0.49 on 2026-11-14; v0.50 on
 2026-11-15; v0.51–v0.52 on 2026-11-16; v0.53–v0.56 on
-2026-11-17.
+2026-11-17; v0.58 on 2026-11-19.
+
+## v0.58 — 2026-11-19
+
+The fixes from a hands-on drive of v0.57, using the app the way
+a person would. The Tab key no longer gets trapped in the
+message box or the other text editors; it moves focus onward
+like it should, so the whole window can be driven from the
+keyboard. A failed turn no longer blames the model unless the
+model really failed to load: a failure partway through a reply
+and an unexpected hiccup now get honest words of their own.
+When Ollama is not running, the status bar offers a Start
+Ollama button that starts it and checks the model list again,
+no terminal needed. The small status word beside each pane's
+buttons uses short forms, so "Something went wrong" no longer
+clips to "Something w". And the stats line no longer ends a
+good turn with "not loaded"; when the memory reading cannot be
+trusted it says "RAM n/a" instead.
 
 ## v0.57 — 2026-11-17
 

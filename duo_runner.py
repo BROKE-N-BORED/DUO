@@ -7,7 +7,7 @@ Split out of dual_chat.py in v0.25 (audit T14).
 import queue
 import threading
 
-from duo_ollama import MSG_MODEL_FAILED, Cancelled, OllamaError
+from duo_ollama import MSG_TURN_FAILED, Cancelled, OllamaError
 
 
 class SerialRunner:
@@ -74,7 +74,10 @@ class SerialRunner:
                 except OllamaError as exc:
                     self.on_error(job, str(exc))
                 except Exception:
-                    self.on_error(job, MSG_MODEL_FAILED)
+                    # v0.58 (P2-52): an unexpected failure is not a
+                    # model load failure; the old catch-all blamed
+                    # the model for every hiccup.
+                    self.on_error(job, MSG_TURN_FAILED)
                 finally:
                     with self._cancel_lock:
                         self._current_id = None

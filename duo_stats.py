@@ -246,7 +246,7 @@ def format_stats_line(stats):
     stats is {"tok_per_sec": float|None, "eval_count": int|None,
     "prompt_eval_count": int|None, "ttft_s": float|None,
     "total_s": float|None, "ram": str|None} -- "ram" is preformatted,
-    e.g. "1.9 GB in RAM" or "not loaded". None (before any turn) shows
+    e.g. "1.9 GB in RAM"; None shows "RAM n/a". None (before any turn) shows
     dashes; a missing number shows "n/a". The token segment sits
     right after the speed: "42 out / 128 in" when Ollama reported
     both counts, "tokens n/a" when it reported neither, and the

@@ -41,7 +41,7 @@ from dual_chat import (  # noqa: E402
     HIST_TRANSCRIPT_MIN_HEIGHT,
     MAX_ATTACHMENTS,
     MAX_ATTACHMENT_BYTES, MODEL_FIT_RESERVE_BYTES, MSG_EMPTY,
-    MSG_MODEL_FAILED, MSG_OLLAMA_DOWN, MSG_OLLAMA_SLOW,
+    MSG_MODEL_FAILED, MSG_OLLAMA_DOWN, MSG_OLLAMA_SLOW, MSG_TURN_FAILED,
     MSG_PHONE_BUSY, MSG_PHONE_RELAY, MSG_PHONE_TARGET,
     MSG_UPDATE_AVAILABLE, MSG_UPDATE_DOWNLOADING, MSG_UPDATE_FAILED,
     MSG_UPDATE_LATEST, MSG_UPDATE_PENDING,
@@ -53,6 +53,7 @@ from dual_chat import (  # noqa: E402
     SETTING_WINDOW_GEOMETRY,
     SIDE_COLORS,
     SIDE_STATES,
+    SIDE_STATES_SHORT,
     SINGLE_INSTANCE_ENV, SINGLE_INSTANCE_NAME,
     TASK_CONTINUE_TEMPLATE, TASK_FOLLOW_UPS, TASK_REVIEW_TEMPLATE,
     TASK_REVISE_TEMPLATE, TASK_ROUNDS_DEFAULT, TASK_ROUNDS_MAX,
@@ -692,7 +693,66 @@ class TaskSessionTests(unittest.TestCase):
 # Serial runner: one at a time, in order, cancellable
 # ---------------------------------------------------------------------------
 
+class StartOllamaTests(unittest.TestCase):
+    """v0.58 (P2-53): the down state's click remedy spawns
+    `ollama serve` detached, and says False honestly when ollama
+    is missing or the spawn fails."""
+
+    def test_not_installed_returns_false(self):
+        import duo_ollama
+        with mock.patch.object(duo_ollama.shutil, "which",
+                               return_value=None):
+            self.assertFalse(duo_ollama.start_ollama())
+
+    def test_spawn_is_detached_serve(self):
+        import duo_ollama
+        popen = mock.Mock()
+        with mock.patch.object(duo_ollama.shutil, "which",
+                               return_value="/usr/bin/ollama"), \
+                mock.patch.object(duo_ollama.subprocess, "Popen", popen):
+            self.assertTrue(duo_ollama.start_ollama())
+        args, kwargs = popen.call_args
+        self.assertEqual(args[0], ["/usr/bin/ollama", "serve"])
+        self.assertTrue(kwargs["start_new_session"])
+
+    def test_spawn_failure_returns_false(self):
+        import duo_ollama
+        with mock.patch.object(duo_ollama.shutil, "which",
+                               return_value="/usr/bin/ollama"), \
+                mock.patch.object(duo_ollama.subprocess, "Popen",
+                                  side_effect=OSError("nope")):
+            self.assertFalse(duo_ollama.start_ollama())
+
+
 class SerialRunnerTests(unittest.TestCase):
+    def test_unexpected_error_is_not_blamed_on_the_model(self):
+        # v0.58 (P2-52): the catch-all used to report every failure
+        # as "that model couldn't be loaded", whatever went wrong.
+        errors = []
+        done = threading.Event()
+
+        def fn(emit, cancel_event):
+            raise ValueError("boom")
+
+        runner = SerialRunner(
+            on_error=lambda j, m: (errors.append(m), done.set()))
+        runner.submit("A", fn)
+        self.assertTrue(done.wait(timeout=5))
+        self.assertEqual(errors, [MSG_TURN_FAILED])
+
+    def test_ollama_error_message_passes_through(self):
+        errors = []
+        done = threading.Event()
+
+        def fn(emit, cancel_event):
+            raise OllamaError(MSG_OLLAMA_DOWN)
+
+        runner = SerialRunner(
+            on_error=lambda j, m: (errors.append(m), done.set()))
+        runner.submit("A", fn)
+        self.assertTrue(done.wait(timeout=5))
+        self.assertEqual(errors, [MSG_OLLAMA_DOWN])
+
     def test_jobs_run_one_at_a_time_in_order(self):
         events = []
         started = {"A": threading.Event(), "B": threading.Event()}
@@ -2754,10 +2814,14 @@ class Item4GuiTests(unittest.TestCase):
             "-- tok/s · -- out / -- in · first token -- · "
             "turn -- · RAM --")
 
-    def test_stats_ram_not_loaded(self):
+    def test_stats_ram_unknown_after_turn(self):
+        # v0.58 (P3-50): an empty /api/ps snapshot right after a
+        # turn cannot prove the model is unloaded -- the line says
+        # "RAM n/a", never the error-like "not loaded".
         self.client.ps = {}  # nothing running
         self.assertTrue(self._send_to_a_and_wait("Hello"))
-        self.assertIn("not loaded", self._stats("A"))
+        self.assertIn("RAM n/a", self._stats("A"))
+        self.assertNotIn("not loaded", self._stats("A"))
 
     def test_stats_na_when_timing_absent(self):
         self.client.metrics = {"fake-a:latest": {}}  # no timing fields
@@ -2766,7 +2830,7 @@ class Item4GuiTests(unittest.TestCase):
         self.assertEqual(
             self._stats("A"),
             "tok/s n/a · tokens n/a · first token n/a · turn n/a · "
-            "not loaded")
+            "RAM n/a")
 
     def test_stats_update_after_relay_turns(self):
         self.client.replies = {"fake-a:latest": ["apple pie"],
@@ -5201,6 +5265,10 @@ class FlakyOllamaHandler(FakeOllamaHandler):
     mode "fail_always": drop every /api/chat request. /api/tags still
     answers, so the probe says Ollama is up.
     mode "drop_after_two": stream two chunks, then cut the connection.
+    mode "error_first": answer 200 with an error chunk before any
+    content -- the model failed to start.
+    mode "error_after_two": stream two chunks, then an error chunk
+    -- the turn failed mid-stream (v0.58, P2-52).
     mode "llama_500_n": answer the first fail_n /api/chat requests
     with HTTP 500 "timed out waiting for llama-server to start"
     (Ollama's transient start timeout), then serve normally.
@@ -5290,6 +5358,22 @@ class FlakyOllamaHandler(FakeOllamaHandler):
             self.wfile.flush()
             time.sleep(0.2)
             self._drop()
+            return
+        if self.mode in ("error_first", "error_after_two"):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-ndjson")
+            self.end_headers()
+            if self.mode == "error_after_two":
+                for chunk in ("Hello ", "from A."):
+                    line = json.dumps(
+                        {"message": {"role": "assistant",
+                                     "content": chunk},
+                         "done": False}).encode("utf-8") + b"\n"
+                    self.wfile.write(line)
+            line = json.dumps(
+                {"error": "the model blew up"}).encode("utf-8") + b"\n"
+            self.wfile.write(line)
+            self.wfile.flush()
             return
         if self.mode == "stall":
             # Headers out, then nothing: read the body first so
@@ -5451,6 +5535,30 @@ class OllamaClientRetryTests(unittest.TestCase):
                 lambda t: None, threading.Event())
         self.assertEqual(str(ctx.exception), MSG_MODEL_FAILED)
         self.assertEqual(handler.chat_posts, 1)
+
+    def test_error_chunk_before_content_is_a_model_failure(self):
+        # v0.58 (P2-52): an error chunk before any content means
+        # the model failed to start -- the load-failure words fit.
+        handler, url = self._start("error_first")
+        client = OllamaClient(url)
+        with self.assertRaises(OllamaError) as ctx:
+            client.chat_stream(
+                "fake-a:latest", [{"role": "user", "content": "hi"}],
+                lambda t: None, threading.Event())
+        self.assertEqual(str(ctx.exception), MSG_MODEL_FAILED)
+
+    def test_error_chunk_after_content_is_not_a_load_failure(self):
+        # v0.58 (P2-52): an error chunk after content streamed is a
+        # mid-turn failure; blaming the model's loading was wrong.
+        handler, url = self._start("error_after_two")
+        client = OllamaClient(url)
+        chunks = []
+        with self.assertRaises(OllamaError) as ctx:
+            client.chat_stream(
+                "fake-a:latest", [{"role": "user", "content": "hi"}],
+                chunks.append, threading.Event())
+        self.assertEqual(chunks, ["Hello ", "from A."])
+        self.assertEqual(str(ctx.exception), MSG_OLLAMA_SLOW)
 
     def test_chat_sends_keep_alive(self):
         # v0.49 (Code Forge's Audit B20): every chat request carries
@@ -5953,11 +6061,13 @@ class DeckServerTests(unittest.TestCase):
 @unittest.skipUnless(os.environ.get("DUAL_CHAT_GUI_TESTS") == "1",
                      "GUI tests run with DUAL_CHAT_GUI_TESTS=1")
 class NoStartOllamaButtonGuiTests(unittest.TestCase):
-    """v0.49: the Start Ollama button is gone -- removed, not hidden.
-
-    DUO no longer starts Ollama; it stays connected to the one
-    that is running. No button, no state key, no starter anywhere
-    in the window."""
+    """v0.49 removed the Start Ollama button and its spawn manager
+    outright. v0.58 (P2-53) brings back a plain button only, under
+    the no-terminal rule: it lives in the status bar, hidden while
+    Ollama is up, shown only in the down state. The v0.49 manager
+    machinery (ollama_manager, do_start_ollama, set_ollama_down)
+    stays gone. The down-state behavior itself is pinned by
+    DriveFixesGuiTests."""
 
     @classmethod
     def setUpClass(cls):
@@ -5984,19 +6094,20 @@ class NoStartOllamaButtonGuiTests(unittest.TestCase):
                 return True
         return cond()
 
-    def test_no_start_ollama_button_anywhere(self):
-        # Not in the state dict, and no QPushButton in the whole
-        # window carries the text -- gone, not hidden.
-        from PySide6 import QtWidgets
-        self.assertNotIn("start_ollama_btn", self.state)
+    def test_start_ollama_button_hidden_while_ollama_is_up(self):
+        # The v0.49 manager keys stay gone.
         self.assertNotIn("ollama_manager", self.state)
         self.assertNotIn("do_start_ollama", self.state)
         self.assertNotIn("set_ollama_down", self.state)
-        texts = [btn.text() for btn in
+        # Exactly one Start Ollama button exists (v0.58), and with
+        # the model list loaded it stays hidden: it belongs to the
+        # down state only.
+        from PySide6 import QtWidgets
+        btn = self.state["start_ollama_btn"]
+        texts = [b.text() for b in
                  self.window.findChildren(QtWidgets.QPushButton)]
-        self.assertNotIn("Start Ollama", texts)
-        for text in texts:
-            self.assertNotIn("Ollama", text)
+        self.assertEqual(texts.count("Start Ollama"), 1)
+        self.assertFalse(btn.isVisible())
 
     def test_button_row_keeps_its_other_buttons(self):
         # The removal took only the one button: the rest of the
@@ -9128,6 +9239,8 @@ class ModuleSplitTests(unittest.TestCase):
             (dual_chat.Cancelled, duo_ollama.Cancelled),
             (dual_chat.CHAT_RETRY_DELAYS, duo_ollama.CHAT_RETRY_DELAYS),
             (dual_chat.check_for_update, duo_ollama.check_for_update),
+            (dual_chat.start_ollama, duo_ollama.start_ollama),
+            (dual_chat.MSG_TURN_FAILED, duo_ollama.MSG_TURN_FAILED),
             (dual_chat.parse_version, duo_ollama.parse_version),
             (dual_chat.SerialRunner, duo_runner.SerialRunner),
             (dual_chat.PairPresetController,
@@ -9172,6 +9285,10 @@ class ModuleSplitTests(unittest.TestCase):
             (dual_chat.SINGLE_INSTANCE_ENV,
              duo_single.SINGLE_INSTANCE_ENV),
             (dual_chat.SIDE_STATES, duo_constants.SIDE_STATES),
+            (dual_chat.SIDE_STATES_SHORT,
+             duo_constants.SIDE_STATES_SHORT),
+            (dual_chat.OLLAMA_START_WAIT_MS,
+             duo_constants.OLLAMA_START_WAIT_MS),
             (dual_chat.ERROR_STATE_HOLD_MS,
              duo_constants.ERROR_STATE_HOLD_MS),
             (dual_chat.first_run_guide_html,
@@ -10730,6 +10847,119 @@ class AccessibleNamesGuiTests(unittest.TestCase):
 
 @unittest.skipUnless(os.environ.get("DUAL_CHAT_GUI_TESTS") == "1",
                      "GUI tests run with DUAL_CHAT_GUI_TESTS=1")
+class DriveFixesGuiTests(unittest.TestCase):
+    """v0.58: the 2026-11-19 user drive's fixes -- Tab moves out of
+    the text edits instead of being swallowed (P1-32), and the
+    Ollama-down state offers a Start Ollama button that starts the
+    service and re-checks (P2-53)."""
+
+    @classmethod
+    def setUpClass(cls):
+        from PySide6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+        cls.client = FakeGuiClient()
+
+    def setUp(self):
+        self.window = None
+        self.client.reset()
+        self.tmp = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        if self.window is not None:
+            self.window.close()
+        self.app.processEvents()
+        self.tmp.cleanup()
+
+    def _wait_for(self, cond, timeout=10.0):
+        from PySide6.QtTest import QTest
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            QTest.qWait(50)
+            if cond():
+                return True
+        return cond()
+
+    def _build_window(self, client=None):
+        from dual_chat import build_window
+        self.window = build_window(client or self.client,
+                                   logger=TEST_LOGGER)
+        self.window.show()
+        self.state = self.window._dual_chat
+
+    def test_text_edits_let_tab_move_focus(self):
+        self._build_window()
+        self.assertTrue(self._wait_for(
+            lambda: self.state["widgets"]["A"]["picker"].count() == 2),
+            "pickers should load the fake models")
+        for edit in (self.state["composer"], self.state["task_edit"],
+                     self.state["review_edit"],
+                     self.state["widgets"]["A"]["instr_edit"],
+                     self.state["widgets"]["B"]["instr_edit"],
+                     self.state["widgets"]["A"]["transcript"]):
+            self.assertTrue(edit.tabChangesFocus(),
+                            "%r must let Tab move focus" % edit)
+        from PySide6.QtCore import Qt
+        from PySide6.QtTest import QTest
+        composer = self.state["composer"]
+        composer.setFocus()
+        self.app.processEvents()
+        self.assertIs(self.window.focusWidget(), composer)
+        QTest.keyClick(composer, Qt.Key_Tab)
+        self.app.processEvents()
+        self.assertIsNot(self.window.focusWidget(), composer)
+
+    def test_start_ollama_button_recovers_the_model_list(self):
+        class DownOnceClient(FakeGuiClient):
+            def __init__(self):
+                super().__init__()
+                self.list_calls = 0
+
+            def list_models_with_sizes(self, timeout=5):
+                self.list_calls += 1
+                if self.list_calls == 1:
+                    raise OllamaError(MSG_OLLAMA_DOWN)
+                return super().list_models_with_sizes(timeout)
+
+        import dual_chat
+        client = DownOnceClient()
+        self._build_window(client)
+        btn = self.state["start_ollama_btn"]
+        self.assertTrue(self._wait_for(lambda: btn.isVisible()),
+                        "the down state must offer Start Ollama")
+        self.assertEqual(self.state["status_label"].text(),
+                         MSG_OLLAMA_DOWN)
+        with mock.patch.object(dual_chat, "start_ollama",
+                               return_value=True) as spawn, \
+                mock.patch.object(dual_chat, "OLLAMA_START_WAIT_MS", 10):
+            btn.click()
+            self.assertTrue(self._wait_for(
+                lambda: self.state["widgets"]["A"]["picker"].count() == 2),
+                "the model list must reload after the start")
+        spawn.assert_called_once_with()
+        self.assertFalse(btn.isVisible())
+
+    def test_start_ollama_not_installed_says_so(self):
+        class DownClient(FakeGuiClient):
+            def list_models_with_sizes(self, timeout=5):
+                raise OllamaError(MSG_OLLAMA_DOWN)
+
+        import dual_chat
+        self._build_window(DownClient())
+        btn = self.state["start_ollama_btn"]
+        self.assertTrue(self._wait_for(lambda: btn.isVisible()))
+        with mock.patch.object(dual_chat, "start_ollama",
+                               return_value=False):
+            btn.click()
+            self.app.processEvents()
+        self.assertEqual(
+            self.state["status_label"].text(),
+            "Ollama doesn't seem to be installed on this PC.")
+        self.assertTrue(btn.isVisible())
+        self.assertTrue(btn.isEnabled())
+
+
+@unittest.skipUnless(os.environ.get("DUAL_CHAT_GUI_TESTS") == "1",
+                     "GUI tests run with DUAL_CHAT_GUI_TESTS=1")
 class LayoutGuiTests(unittest.TestCase):
     """v0.56: the layout fixes -- the relay button greys out on an
     empty composer (P1-3), the transcript keeps its floor at short
@@ -11283,6 +11513,13 @@ class ActivityStateTests(unittest.TestCase):
             self.assertTrue(color.startswith("#"), name)
             self.assertTrue(text, name)
         self.assertEqual(SIDE_STATES["idle"], ("#8a8a8a", "Idle"))
+        # v0.58 (P2-51): the short table covers the same states --
+        # the bottom-row label shows these so its words never clip.
+        self.assertEqual(sorted(SIDE_STATES_SHORT), sorted(SIDE_STATES))
+        for name, short in SIDE_STATES_SHORT.items():
+            self.assertTrue(short, name)
+        self.assertEqual(SIDE_STATES_SHORT["error"], "Failed")
+        self.assertEqual(SIDE_STATES_SHORT["queued"], "Queued…")
         self.assertEqual(SIDE_STATES["thinking"],
                          ("#2fbf5a", "Thinking…"))
         self.assertEqual(SIDE_STATES["waiting"],
@@ -11360,9 +11597,11 @@ class ActivityIndicatorGuiTests(unittest.TestCase):
                 lambda: self._dot_color(side) == color, timeout=1)
         self.assertEqual(self._dot_color(side), color)
         self.assertEqual(self._activity_text(side), text)
-        # The bottom-row status label shows the same words.
+        # The bottom-row status label shows the short form (v0.58,
+        # P2-51): the full words clipped in its crowded row.
         self.assertEqual(
-            self.state["widgets"][side]["status"].text(), text)
+            self.state["widgets"][side]["status"].text(),
+            SIDE_STATES_SHORT[state])
 
     def _send_to_a_and_wait(self, text, timeout=15.0):
         self.state["composer"].setPlainText(text)

@@ -221,7 +221,8 @@ from duo_constants import (
     MSG_PHONE_BUSY, MSG_PHONE_RELAY, MSG_PHONE_TASK,
     MSG_UPDATE_AVAILABLE, MSG_UPDATE_LATEST, MSG_UPDATE_FAILED,
     MSG_UPDATE_DOWNLOADING, MSG_UPDATE_PENDING,
-    MSG_PYSIDE6_MISSING, SIDE_STATES, ERROR_STATE_HOLD_MS,
+    MSG_PYSIDE6_MISSING, SIDE_STATES, SIDE_STATES_SHORT,
+    OLLAMA_START_WAIT_MS, ERROR_STATE_HOLD_MS,
     RELAY_CHIP_STATES, METER_REFRESH_MS, SETTINGS_ORG, SETTINGS_APP,
     SETTING_ENTER_TO_SEND, SETTING_DIRECTOR_COLLAPSED,
     SETTING_SECTION_COLLAPSED, SETTING_WINDOW_GEOMETRY,
@@ -256,9 +257,10 @@ from duo_model import (
 from duo_motion import DirectorSpring, install_motion, theme_colors
 from duo_ollama import (
     CHAT_MAX_ATTEMPTS, CHAT_RETRY_DELAYS, CHAT_TIMEOUT, DEFAULT_OLLAMA_URL,
-    MSG_MODEL_FAILED, MSG_OLLAMA_DOWN, MSG_OLLAMA_SLOW, OLLAMA_URL_ENV,
+    MSG_MODEL_FAILED, MSG_OLLAMA_DOWN, MSG_OLLAMA_SLOW, MSG_TURN_FAILED,
+    OLLAMA_URL_ENV,
     UPDATE_CHECK_TIMEOUT, UPDATE_CHECK_URL, UPDATE_CHECK_URL_ENV, Cancelled,
-    OllamaClient, OllamaError, check_for_update,
+    OllamaClient, OllamaError, check_for_update, start_ollama,
     parse_ollama_list_output, parse_ps_payload, parse_tags_payload,
     parse_tags_sizes, parse_version,)
 from duo_pairs import PairPresetController
@@ -298,7 +300,7 @@ from duo_workers import (_ModelLoader, _SignalObject,
 
 
 APP_NAME = "DUO"
-APP_VERSION = "0.57"
+APP_VERSION = "0.58"
 
 # P1-5 (v0.56): closing with an unsaved conversation asks first.
 # The GUI tests close windows with messages in every tearDown, so
@@ -551,6 +553,11 @@ def build_window(client=None, logger=None, deck_port=None):
         instr_edit.setPlaceholderText(
             "Instructions for this model (system prompt)...")
         instr_edit.setFixedHeight(44)
+        # Tab moves focus onward instead of inserting a tab
+        # character (v0.58, P1-32): every text edit in the window
+        # sets this, so a keyboard user can never be trapped in a
+        # text box. Pasted tabs are unaffected.
+        instr_edit.setTabChangesFocus(True)
         instr_edit.setVisible(False)
         layout.addWidget(instr_edit)
         # Field explanation (v0.42, U20): under the editor, inside
@@ -574,6 +581,7 @@ def build_window(client=None, logger=None, deck_port=None):
 
         transcript = QtWidgets.QTextEdit()
         transcript.setReadOnly(True)
+        transcript.setTabChangesFocus(True)  # P1-32: see instr_edit.
         # Links in a rendered reply open in the default browser
         # (via the viewport filter: QTextEdit has no anchorClicked
         # signal in this Qt build).
@@ -801,6 +809,7 @@ def build_window(client=None, logger=None, deck_port=None):
     # A placeholder is not a name (v0.57, P1-10): a screen reader
     # needs the real one.
     composer.setAccessibleName("Message to the models")
+    composer.setTabChangesFocus(True)  # P1-32: see instr_edit.
     # No block cap on purpose: a chat composer must never drop typed
     # or pasted text. (v0.12 and earlier capped it at 5 blocks, which
     # silently threw away the oldest paragraphs of a long paste.)
@@ -1051,6 +1060,7 @@ def build_window(client=None, logger=None, deck_port=None):
     task_edit = QtWidgets.QPlainTextEdit()
     task_edit.setPlaceholderText("Describe a task for one model...")
     task_edit.setFixedHeight(44)
+    task_edit.setTabChangesFocus(True)  # P1-32: see instr_edit.
     tasks_layout.addWidget(task_edit)
     # Field explanation (v0.42, U20): under the task box, inside
     # the collapsed Tasks section -- zero cost at default.
@@ -1105,6 +1115,7 @@ def build_window(client=None, logger=None, deck_port=None):
     review_layout.addWidget(review_label)
     review_edit = QtWidgets.QPlainTextEdit()
     review_edit.setFixedHeight(64)
+    review_edit.setTabChangesFocus(True)  # P1-32: see instr_edit.
     review_layout.addWidget(review_edit)
     review_btn_row = QtWidgets.QHBoxLayout()
     review_forward = QtWidgets.QPushButton("Forward")
@@ -1223,6 +1234,26 @@ def build_window(client=None, logger=None, deck_port=None):
     meter_label = QtWidgets.QLabel("")
     meter_label.setStyleSheet("font-size: 11px;")
     statusbar.addPermanentWidget(meter_label)
+    # Start Ollama (v0.58, P2-53): shown only while Ollama is down
+    # (on_models_failed shows it, populate_models hides it). The
+    # down message's remedy used to mean opening a terminal; under
+    # the no-terminal rule the app starts the service itself, on a
+    # click, then re-checks the model list after a short wait.
+    start_ollama_btn = QtWidgets.QPushButton("Start Ollama")
+    start_ollama_btn.setVisible(False)
+    statusbar.addPermanentWidget(start_ollama_btn)
+
+    def on_start_ollama():
+        start_ollama_btn.setEnabled(False)
+        if not start_ollama():
+            set_status_message(
+                "Ollama doesn't seem to be installed on this PC.")
+            start_ollama_btn.setEnabled(True)
+            return
+        set_status_message("Starting Ollama...")
+        QtCore.QTimer.singleShot(OLLAMA_START_WAIT_MS, load_models)
+
+    start_ollama_btn.clicked.connect(on_start_ollama)
     meter_prev = {"cpu": None}
 
     def refresh_meter():
@@ -1842,7 +1873,10 @@ def build_window(client=None, logger=None, deck_port=None):
         widgets[side]["activity_dot"].setStyleSheet(
             "background-color: %s; border-radius: 6px;" % color)
         widgets[side]["activity"].setText(text)
-        widgets[side]["status"].setText(text)
+        # The bottom label shares its row with six buttons and
+        # clipped the long words (v0.58, P2-51): it gets the short
+        # form, the activity row keeps the full words.
+        widgets[side]["status"].setText(SIDE_STATES_SHORT[new_state])
         if new_state == "error":
             error_timers[side].start(ERROR_STATE_HOLD_MS)
         else:
@@ -1913,16 +1947,19 @@ def build_window(client=None, logger=None, deck_port=None):
     job_stats = {}  # job id -> {"metrics": dict|None, "ram": str|None}
 
     def _ram_text(model):
-        """'<size> in RAM' for a running model, 'not loaded' when it
-        isn't running, or None when the lookup itself failed (shown
-        as 'RAM n/a')."""
+        """'<size> in RAM' for a running model, or None when the
+        lookup can't prove the model is resident (shown as
+        'RAM n/a'). This runs right after a turn, when the model
+        just answered: an empty /api/ps snapshot then cannot mean
+        'not loaded' -- it lags or races -- and the old 'not loaded'
+        wording read like an error on a good turn (v0.58, P3-50)."""
         try:
             running = client.running_models()
         except Exception:
             return None
         if model in running:
             return "%s in RAM" % format_ram(running[model])
-        return "not loaded"
+        return None
 
     def make_job_fn(job_id, model, messages, track_stats=True):
         holder = {"metrics": None, "ram": None}
@@ -3362,6 +3399,7 @@ def build_window(client=None, logger=None, deck_port=None):
         if not alive():
             return
         state["models_loading"] = False
+        start_ollama_btn.setVisible(False)
         for side in ("A", "B"):
             picker = widgets[side]["picker"]
             previous = convo.sides[side].model
@@ -3392,6 +3430,8 @@ def build_window(client=None, logger=None, deck_port=None):
         if not alive():
             return
         state["models_loading"] = False
+        start_ollama_btn.setVisible(True)
+        start_ollama_btn.setEnabled(True)
         for side in ("A", "B"):
             widgets[side]["picker"].setPlaceholderText("Pick a model")
         set_status_message(message)
@@ -3698,6 +3738,7 @@ def build_window(client=None, logger=None, deck_port=None):
         "meter_label": meter_label, "refresh_meter": refresh_meter,
         "meter_timer": meter_timer,
         "status_label": status_label,
+        "start_ollama_btn": start_ollama_btn,
         "set_status_message": set_status_message,
         "phone_btn": phone_btn, "deck_server": deck_server,
         "show_phone_deck": show_phone_deck,

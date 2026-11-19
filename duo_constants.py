@@ -56,6 +56,24 @@ SIDE_STATES = {
 # How long the red light holds after a failed turn (ms) before the
 # side goes back to idle. A new job starting first overrides it.
 ERROR_STATE_HOLD_MS = 5000
+# Short forms of the side states (v0.58, P2-51): the bottom-row
+# status label shares its row with six buttons and clipped the
+# long words ("Queued" showed as "Que", "Something went wrong"
+# as "Something w"). The activity row keeps the full SIDE_STATES
+# words; the bottom label gets these.
+SIDE_STATES_SHORT = {
+    "idle": "Idle",
+    "waiting": "Waiting…",
+    "thinking": "Thinking…",
+    "summarizing": "Summarizing…",
+    "queued": "Queued…",
+    "review": "Review…",
+    "error": "Failed",
+}
+# How long the Start Ollama button waits before re-checking the
+# model list (v0.58, P2-53): the service needs a moment to open
+# its port before the list call can succeed.
+OLLAMA_START_WAIT_MS = 2000
 # Relay chip (v0.34, redesign R3): the relay's status dot and words.
 # The same palette as the activity lights, so the colors mean the
 # same thing everywhere: grey idle, green working, amber waiting on
