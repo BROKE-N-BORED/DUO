@@ -46,6 +46,7 @@ import re
 import shutil
 import sys
 import tempfile
+import threading
 import traceback
 from collections import deque
 from datetime import datetime
@@ -277,6 +278,7 @@ class DebugLogger:
         self.dependencies = []
         self._crash_installed = False
         self._previous_excepthook = None
+        self._previous_threading_excepthook = None
 
         os.makedirs(log_dir, exist_ok=True)
         self.logger = logging.getLogger("debug_log." + app_name)
@@ -285,6 +287,30 @@ class DebugLogger:
         fmt = logging.Formatter(
             "%(asctime)s [%(levelname)s] %(message)s",
             datefmt="%Y-%m-%d %H:%M:%S")
+        if self.logger.handlers:
+            # A logger for this app already exists (v0.60, P1-21:
+            # a second window built without passing a logger, or
+            # tests). Adding a second set of handlers would double
+            # every log line and put two RotatingFileHandlers on
+            # the same file, racing on rotation -- so reuse the
+            # existing handlers and point this instance's report
+            # buffers at them.
+            self._ring = None
+            self._errors = None
+            for handler in self.logger.handlers:
+                if isinstance(handler, _RingBufferHandler):
+                    self._ring = handler
+                elif isinstance(handler, _ErrorCaptureHandler):
+                    self._errors = handler
+            if self._ring is None:
+                self._ring = _RingBufferHandler(history)
+                self._ring.setFormatter(fmt)
+                self.logger.addHandler(self._ring)
+            if self._errors is None:
+                self._errors = _ErrorCaptureHandler()
+                self._errors.setFormatter(fmt)
+                self.logger.addHandler(self._errors)
+            return
         file_handler = logging.handlers.RotatingFileHandler(
             self.log_path, maxBytes=max_bytes, backupCount=backup_count,
             encoding="utf-8")
@@ -441,11 +467,17 @@ class DebugLogger:
     def install_crash_handler(self):
         """On an unhandled exception, write a report, then re-raise.
 
+        Covers worker threads too (v0.60, P1-22): sys.excepthook
+        only sees the main thread, so threading.excepthook is
+        installed alongside it -- a runner or deck thread dying
+        used to leave no report and no log entry at all.
+
         Safe to call twice; restores cleanly via uninstall.
         """
         if self._crash_installed:
             return
         self._previous_excepthook = sys.excepthook
+        self._previous_threading_excepthook = threading.excepthook
         logger = self
 
         def _hook(exc_type, exc_value, exc_tb):
@@ -461,12 +493,30 @@ class DebugLogger:
                 logger._previous_excepthook(
                     exc_type, exc_value, exc_tb)
 
+        def _thread_hook(args):
+            try:
+                formatted = "".join(traceback.format_exception(
+                    args.exc_type, args.exc_value, args.exc_traceback))
+                thread_name = (args.thread.name if args.thread
+                               else "unknown")
+                logger.error(
+                    "UNHANDLED EXCEPTION in thread %s:\n%s",
+                    thread_name, scrub_text(formatted))
+                logger.generate_report()
+            except Exception:
+                pass  # the report must never hide the crash itself
+            if logger._previous_threading_excepthook is not None:
+                logger._previous_threading_excepthook(args)
+
         sys.excepthook = _hook
+        threading.excepthook = _thread_hook
         self._crash_installed = True
 
     def uninstall_crash_handler(self):
         if self._crash_installed:
             sys.excepthook = self._previous_excepthook
+            threading.excepthook = (
+                self._previous_threading_excepthook)
             self._crash_installed = False
 
 

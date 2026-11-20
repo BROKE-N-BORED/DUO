@@ -61,6 +61,14 @@ MSG_MODEL_TOO_BIG = (
 # answering gets these honest, general words instead.
 MSG_TURN_FAILED = "Something went wrong with that turn. Try again."
 
+# v0.60 (P1-13): a generation that ends with no reply at all is
+# a failed turn, never a silent success -- an empty assistant
+# message in the history (or forwarded by the relay) helps no
+# one and reads as if the model answered.
+MSG_EMPTY_REPLY = (
+    "That model sent back an empty reply. Try again, or pick "
+    "another model.")
+
 
 # The old client's chat timeout, kept as the signature default so
 # the call shape the window was built against is unchanged. The
@@ -511,7 +519,9 @@ class FyrnClient:
 
         Returns the full reply text. Raises Cancelled if
         cancel_event is set, EngineError with a plain message on
-        failure.
+        failure -- including a generation that ends with an
+        empty reply (v0.60, P1-13), which is a failed turn,
+        never a silent success.
 
         The model loads first when it is not the one already
         loaded (a load failure is a load failure: the model
@@ -575,6 +585,13 @@ class FyrnClient:
             raise EngineError(MSG_MODEL_FAILED)
         if cancel_event is not None and cancel_event.is_set():
             raise Cancelled()
+        if not "".join(chunks):
+            # v0.60 (P1-13): the generation ended without a single
+            # token of reply. That is a failed turn, not a reply --
+            # returning "" would put an empty message in the
+            # history and the relay would forward the emptiness
+            # onward.
+            raise EngineError(MSG_EMPTY_REPLY)
         if on_metrics is not None:
             stats = stats or {}
             elapsed_s = stats.get("elapsed_s")

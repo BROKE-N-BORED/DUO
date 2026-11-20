@@ -272,6 +272,13 @@ def load_side_transcript_file(path):
     """Read a saved single-pane transcript file and parse it. Raises
     TranscriptError for a bad format, OSError for a file that can't
     be read."""
-    with open(path, encoding="utf-8") as fh:
-        text = fh.read()
+    try:
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+    except UnicodeDecodeError:
+        # Not UTF-8 text at all (v0.60, P1-14): a decode error is
+        # a ValueError, not an OSError, so without this it escaped
+        # the caller's slot as a bare traceback instead of the
+        # plain TranscriptError every other bad file gets.
+        raise TranscriptError("this file is not readable text")
     return parse_side_transcript(text)

@@ -41,7 +41,8 @@ from dual_chat import (  # noqa: E402
     HIST_TRANSCRIPT_MIN_HEIGHT,
     MAX_ATTACHMENTS,
     MAX_ATTACHMENT_BYTES, MODEL_FIT_RESERVE_BYTES, MSG_EMPTY,
-    MSG_FYRN_MISSING, MSG_MODEL_FAILED, MSG_TURN_FAILED,
+    MSG_EMPTY_REPLY, MSG_FYRN_MISSING, MSG_MODEL_FAILED,
+    MSG_TURN_FAILED,
     MSG_PHONE_BUSY, MSG_PHONE_RELAY, MSG_PHONE_TARGET,
     MSG_UPDATE_AVAILABLE, MSG_UPDATE_DOWNLOADING, MSG_UPDATE_FAILED,
     MSG_UPDATE_LATEST, MSG_UPDATE_PENDING,
@@ -104,8 +105,9 @@ from dual_chat import (  # noqa: E402
 # directly now.
 from duo_storage import (  # noqa: E402
     delete_pair, delete_preset, is_valid_preset, load_pairs,
-    load_presets, pair_tooltip, pairs_path, preset_tooltip,
-    presets_file_corrupt, presets_path, save_pair, save_preset,
+    load_presets, pair_tooltip, pairs_file_corrupt, pairs_path,
+    preset_tooltip, presets_file_corrupt, presets_path, save_pair,
+    save_preset,
 )
 
 import duo_updater  # noqa: E402  (the v0.55 self-update module)
@@ -583,6 +585,58 @@ class SerialRunnerTests(unittest.TestCase):
         runner.submit("A", fn)
         self.assertTrue(done.wait(timeout=5))
         self.assertEqual(errors, [MSG_TURN_FAILED])
+
+    def test_raising_callbacks_do_not_kill_the_runner(self):
+        # v0.60 (P1-15): every callback raises. The runner thread
+        # must survive all of it -- an on_error raising inside the
+        # error path used to kill the thread, after which the
+        # queue never drained again and the window sat busy
+        # forever. Both jobs must still run, in order.
+        ran = []
+        done = threading.Event()
+
+        def bad(*args):
+            raise RuntimeError("gui bug")
+
+        def fn(emit, cancel_event):
+            ran.append("one")
+            return "reply one"
+
+        def fn2(emit, cancel_event):
+            ran.append("two")
+            done.set()
+            return "reply two"
+
+        runner = SerialRunner(
+            on_start=bad, on_chunk=bad, on_done=bad, on_error=bad,
+            on_cancelled=bad, on_idle=bad)
+        runner.submit("A", fn)
+        runner.submit("B", fn2)
+        self.assertTrue(done.wait(timeout=5))
+        self.assertEqual(ran, ["one", "two"])
+
+    def test_raising_error_callback_still_reports_later_jobs(self):
+        # v0.60 (P1-15): a job fails, on_error itself raises, and
+        # the NEXT job's error must still be delivered.
+        errors = []
+        done = threading.Event()
+        calls = []
+
+        def flaky_error(job, message):
+            calls.append(message)
+            if len(calls) == 1:
+                raise RuntimeError("gui bug")
+            errors.append(message)
+            done.set()
+
+        def fail(emit, cancel_event):
+            raise EngineError(MSG_FYRN_MISSING)
+
+        runner = SerialRunner(on_error=flaky_error)
+        runner.submit("A", fail)
+        runner.submit("B", fail)
+        self.assertTrue(done.wait(timeout=5))
+        self.assertEqual(errors, [MSG_FYRN_MISSING])
 
     def test_ollama_error_message_passes_through(self):
         errors = []
@@ -1571,6 +1625,37 @@ class PairsTests(unittest.TestCase):
             json.dump({"pairs": ["not", "a", "dict"]}, fh)
         self.assertEqual(load_pairs(self.path), {})
 
+    def test_corrupt_file_is_detected(self):
+        # v0.60 (P1-16): pairs get the corrupt check presets
+        # already had -- before this, nothing could tell a
+        # corrupt pairs file from an empty one.
+        self.assertFalse(pairs_file_corrupt(self.path))
+        with open(self.path, "w", encoding="utf-8") as fh:
+            fh.write("{not json")
+        self.assertTrue(pairs_file_corrupt(self.path))
+        with open(self.path, "w", encoding="utf-8") as fh:
+            json.dump({"pairs": ["not", "a", "dict"]}, fh)
+        self.assertTrue(pairs_file_corrupt(self.path))
+        # Valid JSON with an empty pairs object is not corrupt.
+        with open(self.path, "w", encoding="utf-8") as fh:
+            json.dump({"pairs": {}}, fh)
+        self.assertFalse(pairs_file_corrupt(self.path))
+
+    def test_save_backs_up_a_corrupt_file_first(self):
+        # v0.60 (P1-16): load_pairs reads a corrupt file as
+        # empty, so saving used to overwrite the old pairs'
+        # bytes for good. The save now copies the corrupt file
+        # to <path>.corrupt first.
+        with open(self.path, "w", encoding="utf-8") as fh:
+            fh.write("{not json, but precious")
+        setup = {"model_a": "a", "model_b": None,
+                 "instruction_a": "", "instruction_b": ""}
+        save_pair(self.path, "new pair", setup)
+        with open(self.path + ".corrupt", encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), "{not json, but precious")
+        self.assertEqual(load_pairs(self.path), {"new pair": setup})
+        self.assertFalse(pairs_file_corrupt(self.path))
+
     def test_save_load_round_trip_exact_contents(self):
         setup = {"model_a": "fake-a:latest", "model_b": "fake-b:latest",
                  "instruction_a": "Be brief.", "instruction_b": ""}
@@ -1747,6 +1832,20 @@ class RelayPresetTests(unittest.TestCase):
         # Valid JSON with an empty presets object is not corrupt.
         with open(self.path, "w", encoding="utf-8") as fh:
             json.dump({"presets": {}}, fh)
+        self.assertFalse(presets_file_corrupt(self.path))
+
+    def test_save_backs_up_a_corrupt_file_first(self):
+        # v0.60 (P1-16): presets had the corrupt warning but no
+        # save-time protection -- saving over a corrupt presets
+        # file destroyed its bytes just like pairs. Both now
+        # back the corrupt file up to <path>.corrupt first.
+        with open(self.path, "w", encoding="utf-8") as fh:
+            fh.write("{not json, but precious")
+        save_preset(self.path, "debate", self.config)
+        with open(self.path + ".corrupt", encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), "{not json, but precious")
+        self.assertEqual(load_presets(self.path),
+                         {"debate": self.config})
         self.assertFalse(presets_file_corrupt(self.path))
 
     def test_save_load_round_trip_exact_contents(self):
@@ -4048,6 +4147,20 @@ class TranscriptImportTests(unittest.TestCase):
                 os.path.join(tempfile.gettempdir(),
                              "duo-no-such-transcript.txt"))
 
+    def test_load_non_utf8_file_raises_transcript_error(self):
+        # v0.60 (P1-14): the transcript loader caught nothing, so
+        # a non-UTF-8 file's UnicodeDecodeError escaped the
+        # caller's slot as a bare traceback instead of the plain
+        # TranscriptError every other bad file gets.
+        fd, path = tempfile.mkstemp(suffix=".txt")
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(b"\xff\xfe\x00not text at all")
+            with self.assertRaises(TranscriptError):
+                load_side_transcript_file(path)
+        finally:
+            os.unlink(path)
+
 
 class MarkdownTests(unittest.TestCase):
     """Markdown rendering (v0.24, audit T13): the bounded converter.
@@ -4757,6 +4870,8 @@ class Item9GuiTests(unittest.TestCase):
         self.assertTrue(save_full.isEnabled())
 
 
+@unittest.skipUnless(os.environ.get("DUAL_CHAT_GUI_TESTS") == "1",
+                     "GUI tests run with DUAL_CHAT_GUI_TESTS=1")
 class FullLogCapGuiTests(unittest.TestCase):
     """The full-log cap in the window (v0.27, audit T16): trimming
     through the real append point, the export note, the flag rules
@@ -4970,6 +5085,69 @@ class DebugFilenameTests(unittest.TestCase):
                          "duo-debug-report-2026-11-12.txt")
         self.assertTrue(default_debug_filename().startswith(
             "duo-debug-report-"))
+
+
+class DebugLoggerReuseTests(unittest.TestCase):
+    """v0.60 (P1-21, P1-22): a second DebugLogger for the same
+    app must not stack a second set of handlers onto the shared
+    named logger, and the crash handler must cover worker
+    threads, not just the main thread."""
+
+    def setUp(self):
+        import debug_log
+        self.mod = debug_log
+        self.tmp = tempfile.TemporaryDirectory()
+        # A unique app name per test: the named logger is shared
+        # process-wide, and other tests' loggers must not leak in.
+        self.name = "duo-test-" + self.id().replace(".", "-")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _read_log(self, logger):
+        for handler in logger.logger.handlers:
+            handler.flush()
+        with open(logger.log_path, encoding="utf-8") as fh:
+            return fh.read()
+
+    def test_second_logger_reuses_handlers(self):
+        first = self.mod.DebugLogger(
+            self.name, "0.60", log_dir=self.tmp.name)
+        handler_count = len(first.logger.handlers)
+        second = self.mod.DebugLogger(
+            self.name, "0.60", log_dir=self.tmp.name)
+        self.assertEqual(len(second.logger.handlers), handler_count)
+        self.assertIs(second._ring, first._ring)
+        self.assertIs(second._errors, first._errors)
+        second.info("written exactly once")
+        self.assertEqual(
+            self._read_log(second).count("written exactly once"), 1)
+
+    def test_crash_handler_covers_threads_and_restores(self):
+        logger = self.mod.DebugLogger(
+            self.name, "0.60", log_dir=self.tmp.name)
+        old_sys_hook = sys.excepthook
+        old_thread_hook = threading.excepthook
+        try:
+            logger.install_crash_handler()
+            self.assertIsNot(threading.excepthook, old_thread_hook)
+            # Drive the installed thread hook the way the runtime
+            # would: an unhandled exception in a worker thread.
+            try:
+                raise ValueError("thread boom")
+            except ValueError:
+                exc_info = sys.exc_info()
+            args = threading.ExceptHookArgs(
+                (exc_info[0], exc_info[1], exc_info[2],
+                 threading.current_thread()))
+            threading.excepthook(args)
+            self.assertIn("UNHANDLED EXCEPTION in thread",
+                          self._read_log(logger))
+            self.assertIn("thread boom", self._read_log(logger))
+        finally:
+            logger.uninstall_crash_handler()
+        self.assertIs(sys.excepthook, old_sys_hook)
+        self.assertIs(threading.excepthook, old_thread_hook)
 
 
 @unittest.skipUnless(os.environ.get("DUAL_CHAT_GUI_TESTS") == "1",
@@ -6787,6 +6965,19 @@ class ConversationFileTests(unittest.TestCase):
             with self.assertRaises(ConversationError):
                 load_conversation_file(path)
 
+    def test_non_utf8_file_raises_conversation_error(self):
+        # v0.60 (P1-14): a file that isn't UTF-8 text raises
+        # UnicodeDecodeError on read -- a ValueError, not the
+        # JSONDecodeError the loader used to catch -- so it
+        # escaped as a bare traceback. It must get the same
+        # plain ConversationError as corrupt JSON.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "bad.json")
+            with open(path, "wb") as fh:
+                fh.write(b"\xff\xfe\x00not text at all")
+            with self.assertRaises(ConversationError):
+                load_conversation_file(path)
+
     def test_wrong_version_raises(self):
         convo, log = self._make_convo()
         data = conversation_to_data(convo, log)
@@ -8315,6 +8506,28 @@ class MarkdownGuiTests(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # Monolith split tests (v0.25, audit T14)
 # ---------------------------------------------------------------------------
+
+class BuildZipTests(unittest.TestCase):
+    """v0.60 (P1-26): the release zip derives its version from
+    dual_chat.py instead of a hardcoded string, and its file
+    list is proven complete -- a duo_*.py module missing from
+    FILES would ship a zip that crashes on import."""
+
+    def test_version_comes_from_dual_chat(self):
+        import build_zip
+        self.assertEqual(build_zip.app_version(), APP_VERSION)
+        self.assertTrue(build_zip.out_path().endswith(
+            "duo-v%s.zip" % APP_VERSION))
+
+    def test_file_list_is_complete(self):
+        import build_zip
+        # Raises SystemExit naming the gap when a module is
+        # missing from FILES or a FILES entry doesn't exist.
+        build_zip.check_complete()
+        for name in os.listdir(build_zip.ROOT):
+            if name.startswith("duo_") and name.endswith(".py"):
+                self.assertIn(name, build_zip.FILES)
+
 
 class ModuleSplitTests(unittest.TestCase):
     """dual_chat.py is split into focused sibling modules. These tests
@@ -10088,6 +10301,28 @@ class DriveFixesGuiTests(unittest.TestCase):
         # no model can be picked while the engine is missing.
         self.assertEqual(
             self.state["widgets"]["A"]["picker"].count(), 0)
+
+    def test_model_list_failure_state_details(self):
+        # v0.60 (P1-25): the failure path's full state -- the
+        # loading flag clears, and both pickers fall back to the
+        # "Pick a model" placeholder rather than sitting blank
+        # or stuck on the loading text.
+        class DownClient(FakeGuiClient):
+            def list_models_with_sizes(self, timeout=5):
+                raise EngineError(MSG_FYRN_MISSING)
+
+        self._build_window(DownClient())
+        self.assertTrue(self._wait_for(
+            lambda: self.state["status_label"].text()
+            == MSG_FYRN_MISSING),
+            "the failure must land before its state is checked")
+        self.assertFalse(self.state["state"]["models_loading"])
+        for side in ("A", "B"):
+            picker = self.state["widgets"][side]["picker"]
+            self.assertEqual(picker.count(), 0)
+            self.assertEqual(picker.placeholderText(), "Pick a model")
+        self.assertEqual(self.state["status_label"].text(),
+                         MSG_FYRN_MISSING)
 
 
 @unittest.skipUnless(os.environ.get("DUAL_CHAT_GUI_TESTS") == "1",
@@ -12608,6 +12843,8 @@ class DirectorSectionsGuiTests(unittest.TestCase):
         self.assertTrue(self.state["relay_section"].isHidden())
 
 
+@unittest.skipUnless(os.environ.get("DUAL_CHAT_GUI_TESTS") == "1",
+                     "GUI tests run with DUAL_CHAT_GUI_TESTS=1")
 class HistorySplitterGuiTests(unittest.TestCase):
     """v0.38 (audit T20): the history editor is resizable -- each
     pane's transcript block and history editor live in a vertical
@@ -13543,6 +13780,18 @@ class PairSettingsGuiTests(unittest.TestCase):
         self.assertEqual(self.state["convo"].sides["B"].model,
                          "fake-b:latest")
 
+    def test_corrupt_pairs_file_shows_a_plain_note(self):
+        # v0.60 (P1-16): the pairs row gets the corrupt-file note
+        # the presets row already had -- before this, a corrupt
+        # pairs file just looked like no pairs were saved.
+        with open(self.pairs_file, "w", encoding="utf-8") as fh:
+            fh.write("{not json")
+        self.state["refresh_pair_combo"]()
+        self.app.processEvents()
+        self.assertIn("Couldn't read the saved pairs.",
+                      self.state["status_label"].text())
+        self.assertEqual(self.state["pair_combo"].count(), 0)
+
     def test_pair_tooltip_shows_what_loading_would_set(self):
         save_pair(self.pairs_file, "work pair",
                   {"model_a": "fake-a:latest", "model_b": "fake-b:latest",
@@ -13731,6 +13980,8 @@ class FieldExplanationsGuiTests(unittest.TestCase):
         self.assertGreaterEqual(self.state["stop_edit"].width(), 200)
 
 
+@unittest.skipUnless(os.environ.get("DUAL_CHAT_GUI_TESTS") == "1",
+                     "GUI tests run with DUAL_CHAT_GUI_TESTS=1")
 class SendGateGuiTests(unittest.TestCase):
     """v0.43 (audit T21): the send buttons stay disabled while the
     composer is empty -- whitespace-only counts as empty -- and
@@ -14968,6 +15219,8 @@ class SparklineGuiTests(unittest.TestCase):
             motion.reduced_motion.set(False)
 
 
+@unittest.skipUnless(os.environ.get("DUAL_CHAT_GUI_TESTS") == "1",
+                     "GUI tests run with DUAL_CHAT_GUI_TESTS=1")
 class AccessibilityGuiTests(unittest.TestCase):
     """v0.48 (redesign R10): the Big text preset in the window --
     the font grows by 2 pt, every self-sized label is re-styled,
@@ -15767,6 +16020,22 @@ class FyrnClientTests(unittest.TestCase):
         self.assertIsNone(metrics[0]["prompt_eval_count"])
         self.assertEqual(metrics[0]["ttft_s"], 0.1)
         self.assertGreaterEqual(metrics[0]["total_s"], 0.0)
+
+    def test_empty_reply_is_a_failed_turn(self):
+        # v0.60 (P1-13): a generation that ends with no tokens at
+        # all raises the empty-reply error -- it must never come
+        # back as a silent "" success that lands in the history
+        # and gets forwarded by the relay.
+        self.runner.tokens = []
+        client = self._client()
+        metrics = []
+        with self.assertRaises(EngineError) as ctx:
+            client.chat_stream(
+                "folder-a", [{"role": "user", "content": "hi"}],
+                lambda token: None, threading.Event(),
+                on_metrics=metrics.append)
+        self.assertEqual(str(ctx.exception), MSG_EMPTY_REPLY)
+        self.assertEqual(metrics, [])
 
     def test_instructions_history_and_prompt_split(self):
         client = self._client()

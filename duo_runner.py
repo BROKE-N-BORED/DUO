@@ -6,6 +6,7 @@ Split out of dual_chat.py in v0.25 (audit T14).
 
 import queue
 import threading
+import traceback
 
 from duo_fyrn import MSG_TURN_FAILED, Cancelled, EngineError
 
@@ -45,6 +46,22 @@ class SerialRunner:
             if self._current_id == job_id and self._current_event is not None:
                 self._current_event.set()
 
+    def _safe(self, callback, *args):
+        """Invoke one GUI callback, logging and swallowing any
+        exception it raises (v0.60, P1-15).
+
+        This loop is the only runner thread: if a callback raised
+        out of it -- on_error inside an except block, on_cancelled,
+        on_idle -- the thread died, the queue never drained again,
+        and the window sat "busy" forever with no log and no
+        recovery. A broken callback is a GUI bug; it is logged
+        here and the queue keeps moving.
+        """
+        try:
+            callback(*args)
+        except Exception:
+            traceback.print_exc()
+
     def _loop(self):
         while True:
             job = self._queue.get()
@@ -54,7 +71,7 @@ class SerialRunner:
                 if was_cancelled:
                     self._cancelled.discard(job_id)
             if was_cancelled:
-                self.on_cancelled(job)
+                self._safe(self.on_cancelled, job)
             else:
                 event = threading.Event()
                 with self._cancel_lock:
@@ -65,19 +82,20 @@ class SerialRunner:
                         self._cancelled.discard(job_id)
                         event.set()
                 try:
-                    self.on_start(job)
+                    self._safe(self.on_start, job)
                     full = job["fn"](
-                        lambda text: self.on_chunk(job, text), event)
-                    self.on_done(job, full)
+                        lambda text: self._safe(
+                            self.on_chunk, job, text), event)
+                    self._safe(self.on_done, job, full)
                 except Cancelled:
-                    self.on_cancelled(job)
+                    self._safe(self.on_cancelled, job)
                 except EngineError as exc:
-                    self.on_error(job, str(exc))
+                    self._safe(self.on_error, job, str(exc))
                 except Exception:
                     # v0.58 (P2-52): an unexpected failure is not a
                     # model load failure; the old catch-all blamed
                     # the model for every hiccup.
-                    self.on_error(job, MSG_TURN_FAILED)
+                    self._safe(self.on_error, job, MSG_TURN_FAILED)
                 finally:
                     with self._cancel_lock:
                         self._current_id = None
@@ -91,4 +109,4 @@ class SerialRunner:
                         self._cancelled.discard(job_id)
             self._queue.task_done()
             if self._queue.empty():
-                self.on_idle()
+                self._safe(self.on_idle)

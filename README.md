@@ -415,14 +415,18 @@ so in plain words.
 
 ## Tests
 
+Run the suite with the app's own interpreter (the one install.sh
+set up in `.venv`): the tests need PySide6, which the system
+`python3` does not have.
+
 ```sh
-python3 -m unittest discover -s tests -v
+.venv/bin/python -m unittest discover -s tests -v
 ```
 
 GUI tests need a display or offscreen Qt plus the flag:
 
 ```sh
-DUAL_CHAT_GUI_TESTS=1 QT_QPA_PLATFORM=offscreen python3 -m unittest discover -s tests -v
+DUAL_CHAT_GUI_TESTS=1 QT_QPA_PLATFORM=offscreen .venv/bin/python -m unittest discover -s tests -v
 ```
 
 ## When a turn fails

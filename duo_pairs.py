@@ -23,8 +23,8 @@ delete with a confirmation first.
 from duo_constants import MSG_PAIR_NEEDS_NAME, MSG_PRESET_NEEDS_NAME
 from duo_storage import (
     delete_pair, delete_preset, load_pairs, load_presets,
-    pair_tooltip, pairs_path, preset_tooltip, presets_file_corrupt,
-    presets_path, save_pair, save_preset,
+    pair_tooltip, pairs_file_corrupt, pairs_path, preset_tooltip,
+    presets_file_corrupt, presets_path, save_pair, save_preset,
 )
 from duo_text import parse_stop_phrases
 
@@ -88,7 +88,9 @@ class PairPresetController:
 
     def refresh_pair_combo(self, select=None):
         """Reload the pair dropdown from the JSON file. Nothing is
-        loaded by default -- the dropdown just lists what is saved."""
+        loaded by default -- the dropdown just lists what is saved.
+        A file that exists but won't parse earns a plain note, the
+        same as the presets row (v0.60, P1-16)."""
         from PySide6 import QtCore
         pairs = load_pairs(pairs_path())
         self.pair_combo.blockSignals(True)
@@ -106,6 +108,9 @@ class PairPresetController:
         else:
             self.pair_combo.setCurrentIndex(-1)
         self.pair_combo.blockSignals(False)
+        if pairs_file_corrupt(pairs_path()):
+            self.set_status_message(
+                "Couldn't read the saved pairs.")
         # The Delete button follows the selection, and this rebuild
         # runs with signals blocked, so refresh the buttons here.
         self.refresh_buttons()

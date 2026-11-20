@@ -9,6 +9,7 @@ does, so the paths are unchanged.
 
 import json
 import os
+import shutil
 import tempfile
 
 from duo_model import ChatMessage, Conversation
@@ -61,6 +62,39 @@ def load_pairs(path):
             if isinstance(setup, dict)}
 
 
+def pairs_file_corrupt(path):
+    """Whether the pairs file exists but can't be read as pairs
+    at all -- bad JSON, or JSON without a "pairs" object. A
+    missing file is fine (no pairs saved yet); a file whose
+    entries are merely invalid is not corrupt, just empty.
+    Mirrors presets_file_corrupt (v0.60, P1-16: pairs had no
+    such check, so a corrupt file was silently destroyed by
+    the next save)."""
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        return False
+    except (OSError, ValueError):
+        return True
+    pairs = data.get("pairs") if isinstance(data, dict) else None
+    return not isinstance(pairs, dict)
+
+
+def _back_up_corrupt_file(path, is_corrupt):
+    """Copy a corrupt pairs/presets file to ``path + ".corrupt"``
+    before a save or delete overwrites it (v0.60, P1-16).
+
+    load_pairs/load_presets read a corrupt file as empty, so
+    writing without this step would destroy the old bytes for
+    good; the copy keeps them recoverable by hand. A failed
+    copy raises the OSError, so the overwrite never happens
+    silently -- the caller reports the save as failed instead.
+    """
+    if is_corrupt(path):
+        shutil.copyfile(path, path + ".corrupt")
+
+
 def save_pair(path, name, setup):
     """Save one pair (creating or overwriting it) in the JSON file.
 
@@ -73,6 +107,7 @@ def save_pair(path, name, setup):
     write is atomic: a failed save leaves the previous file
     intact and raises the OSError.
     """
+    _back_up_corrupt_file(path, pairs_file_corrupt)
     pairs = load_pairs(path)
     pairs[name] = setup
     text = json.dumps({"pairs": pairs}, indent=2, sort_keys=True) + "\n"
@@ -88,6 +123,7 @@ def delete_pair(path, name):
     pairs = load_pairs(path)
     if name not in pairs:
         return False
+    _back_up_corrupt_file(path, pairs_file_corrupt)
     del pairs[name]
     text = json.dumps({"pairs": pairs}, indent=2, sort_keys=True) + "\n"
     write_text_atomic(path, text, prefix=".duo-pairs-")
@@ -231,6 +267,7 @@ def save_preset(path, name, config):
     The write is atomic: a failed save leaves the previous file
     intact and raises the OSError.
     """
+    _back_up_corrupt_file(path, presets_file_corrupt)
     presets = load_presets(path)
     presets[name] = config
     text = json.dumps({"presets": presets}, indent=2, sort_keys=True) + "\n"
@@ -246,6 +283,7 @@ def delete_preset(path, name):
     presets = load_presets(path)
     if name not in presets:
         return False
+    _back_up_corrupt_file(path, presets_file_corrupt)
     del presets[name]
     text = json.dumps({"presets": presets}, indent=2, sort_keys=True) + "\n"
     write_text_atomic(path, text, prefix=".duo-presets-")
@@ -395,6 +433,11 @@ def load_conversation_file(path):
     try:
         with open(path, encoding="utf-8") as fh:
             data = json.load(fh)
-    except json.JSONDecodeError:
+    except ValueError:
+        # JSONDecodeError for bad JSON, UnicodeDecodeError for a
+        # file that isn't UTF-8 text at all -- both are ValueError,
+        # and both mean the same thing to the user (v0.60, P1-14:
+        # catching only JSONDecodeError let the decode error
+        # escape the caller's slot as a bare traceback).
         raise ConversationError("this is not a DUO conversation file")
     return data_to_conversation(data)

@@ -67,8 +67,8 @@ HOW_TO_USE_SECTIONS = (
      "Type in the message box at the bottom, then Send to A, Send "
      "to B, or Send to Both. Send to Both sends the same message "
      "to each side, one after the other, so the PC never runs two "
-     "models at the same time. Ctrl+Enter sends to both from "
-     "anywhere in the window. Tick Enter to send and plain Enter "
+     "models at the same time. Ctrl+Enter sends to both from the "
+     "message box. Tick Enter to send and plain Enter "
      "sends to both too, with Shift+Enter still adding a new "
      "line."),
     ("The relay",

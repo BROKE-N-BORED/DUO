@@ -1,199 +1,22 @@
 #!/usr/bin/env python3
 """DUO - two local models side by side in one desktop window.
 
-Item 1: the shell, the model pickers, and send-to-A/B/both.
-Item 2: the auto-relay AI-to-AI loop. The user types a seed message, picks
-  the starting side, and presses Start Relay. Each reply is handed to the
-  other model, one generation at a time, until the turn cap, the Stop
-  button, or a stop condition. Blind mode (default) delivers the bare
-  reply text as a plain user message, so each model sees only a person
-  talking to it. Aware mode frames the relay so the models know they are
-  talking to another AI. Relayed hops are tagged in the window's
-  transcripts only -- the models never see the tag.
-Item 3: director controls. Reorder or delete any message in a side's
-  history (the model sees the edited order on the next turn); review
-  each relay hop before it is forwarded, editing it if you like;
-  per-side instructions (system prompts) plus saved model pairs; and
-  compare mode -- after Send to Both, pick the better reply and the
-  conversation continues from it.
-Item 4: long-loop support. Each pane gets a Summarize button: that
-  side's own model summarizes the conversation so far, and the older
-  turns are replaced by that summary (kept as a visible "Summary of
-  earlier messages" entry) while the last 4 entries stay verbatim.
-  A budget nudge appears when a side's history passes ~12,000
-  characters -- it never calls the model on its own. And each pane
-  shows a stats line for the last completed turn: tokens/sec, time
-  to first token, total turn time, and the model's RAM from
-  Ollama /api/ps.
-Item 5: file upload. Attach up to 5 text files (100 KB each) to a
-  message: their contents ride along with the typed message as plain
-  text blocks the model can read. The window shows a short
-  "Attached: ..." tag instead of the full contents. Binary files are
-  skipped with a plain note. Attachments are one-shot -- they clear
-  after a send, and a relay only carries them on the seed message.
-Item 6: tasks. Hand a job to one model: it answers, and then the
-  work passes back and forth for as many rounds as you pick -- the
-  other model reviews the result or continues it, and a review
-  round hands a review back to the worker to revise from. Or
-  nothing happens after the first round. The task shows as
-  "You [task]" in the worker's pane and each handoff as
-  "You [task handoff]" in the receiving pane; the tags never
-  reach the models.
-Item 7: transcripts. Save one side's conversation, or both sides in
-  one file, as plain text that reads like the window: a header line
-  naming DUO, the model, and when the file was saved, then each
-  message in order with its labels, one blank line between messages.
-  Attached file contents are never pasted in -- the short tag is all
-  the file carries. Saving is idle-only: never mid-generation or
-  mid-relay, when the transcript is moving.
-Item 8: final pass. The status-line nit (a stale "Attached: ..." note
-  after a send) fixed, and the README rewritten for the complete app.
-Item 9: chat layout (blank line between messages, bold sender
-  labels, explicit word wrap) and the full transcript export: both
-  sides interleaved in the order the conversation actually happened.
-v0.10: Ollama reliability. Chat turns retry transient failures with
-  a pause between attempts and wait as long as Code Forge does; a
-  Start Ollama button starts the server from inside DUO when it is
-  down; and a debug log layer (the BNB T21 standard, vendored as
-  debug_log.py) records events and writes a report to email when
-  something breaks. The log never holds message or file contents.
-v0.11: the phone deck. DUO serves a small local web page on the PC
-  (the one place a web page is wanted -- Joshua ordered it): a QR
-  code in the window opens it on his phone, the page follows
-  whichever model is thinking, and he can send messages from the
-  phone and export the full transcript with one button. LAN-only,
-  no accounts, no internet.
-v0.12: the agreement matcher fixed. Stop phrases and agreement
-  phrases now match whole words only -- "I disagreed" no longer
-  stops a relay that was waiting for "agreed".
-v0.13: keyboard send and the composer cap gone. Ctrl+Enter sends to
-  both models, and an "Enter to send" tickbox (remembered between
-  runs) makes plain Enter send too, with Shift+Enter still adding a
-  new line. The composer no longer drops pasted paragraphs -- the
-  5-block cap is removed entirely.
-v0.14: the first-run path guarded. If PySide6 is missing, main()
-  says so in plain language (stderr, plus a small dialog when
-  tkinter is available) and exits cleanly -- never a raw traceback.
-  install.sh pins PySide6-Essentials and checks the install before
-  calling it done; run.sh no longer falls back to system Python.
-v0.15: the window finished. Its size, position, and the pane split
-  are remembered between runs (clamped to the screen, so a stale
-  restore can never strand it off-screen); it has a window icon,
-  drawn in code; the title shows the version; and saved pairs can
-  be deleted, with a confirmation first.
-v0.16: the front door. A CHANGELOG and .gitignore, a CI workflow
-  that runs the suite on every push, a .desktop launcher the
-  installer puts in the app menu (with an icon drawn from the
-  window icon), and an uninstaller that asks first. The license is
-  still to be decided.
-v0.17: conversation persistence. Save conversation writes the whole
-  conversation -- both sides' histories with their labels, both
-  models, both instruction fields, and the interleaved full-transcript
-  log -- to a JSON file, atomically, and Open conversation loads it
-  back exactly. A saved model that isn't installed anymore stays
-  unpicked, with a plain note naming it. Opening replaces the
-  conversation on screen, so it asks first.
-v0.18: atomic writes everywhere. The pairs file and all three
-  transcript saves now go through the same write-to-temp-then-rename
-  step the conversation save already used, so a crash or a failed
-  write can never leave a half-written file behind -- the old file
-  stays intact, and a failed save says so plainly instead of
-  crashing.
-v0.19: temperature controls. Each pane has a Temperature control
-  (0.0-2.0, default 0.7, which is Ollama's own default -- made
-  visible instead of silent). The value travels with every turn
-  that side generates, as Ollama's options, and is remembered per
-  side between runs.
-v0.20: token counts. The stats line shows how many tokens the last
-  turn used -- generated and prompt, straight from Ollama's done
-  chunk, never estimated -- and each pane keeps a running session
-  total underneath. A failed turn shows n/a and adds nothing;
-  Clear never resets the session total.
-v0.21: relay presets. The whole relay row -- start side, mode, turn
-  cap, stop phrases, stop-on-agreement, review-each-hop -- can be
-  saved under a name and loaded back from a dropdown, the same way
-  saved model pairs work. Presets live in duo-relay-presets.json
-  next to the app, written atomically; nothing loads by itself.
-v0.22: multi-round tasks. A task runs for as many rounds as the
-  Rounds box says (1-10, default 1): each round passes the work to
-  the other side, alternating. "Continue it" keeps continuing; a
-  review round hands the review back to the worker to revise from.
-  "Nothing" is always one round. The status bar shows which round
-  a chain is on, and Stop still ends it.
-v0.25: the monolith split (audit T14). The code that used to live
-  in this one file (5,165 lines) is split into focused sibling
-  modules -- duo_ollama, duo_stats, duo_text, duo_tasks,
-  duo_markdown, duo_model, duo_transcript, duo_storage,
-  duo_runner, duo_icon -- and this file keeps the window, the
-  phone deck, and the entry point, re-exporting the moved names
-  so imports through here keep working. Nothing you can see
-  changed: same window, same features, same files.
-v0.26: one message structure (audit T15). Each side used to keep
-  three separate lists -- message contents, sender labels, short
-  display texts -- that had to stay in step by hand. Each message
-  is now one object holding its role, content, label, and display
-  text together, so a label can never land on the wrong message.
-  Same window, same features, same files -- and DUO is now
-  MIT-licensed (see LICENSE).
-v0.27: the full transcript log is bounded (audit T16). It used to
-  grow without limit across a long session; it now keeps the most
-  recent 2,000 entries, oldest first out, and the saved full
-  transcript says so at the top when a session passes it.
-v0.28: the update story (audit T17). DUO checks GitHub once at
-  startup, on a background thread, and says in the status bar when
-  a newer Release is out -- silently saying nothing when offline.
-  A "Check for updates" button runs the same check on demand and
-  reports either way. DUO never downloads or installs anything;
-  the user downloads from GitHub themselves.
-v0.29: activity lights and a system meter. Each pane has a small
-  colored light and small words saying what that side is doing
-  right now -- grey Idle, amber while it waits (queued, waiting
-  for Ollama to answer, or a relay hop waiting for review), green
-  while it thinks or summarizes, red for a few seconds when a
-  turn fails. And the status bar shows the whole machine's CPU %
-  and RAM, read from /proc once a second (stdlib only, no new
-  dependency); on a machine without /proc the meter stays empty
-  and silent.
-v0.30: a menu bar and keyboard shortcuts (audit T18). File, Relay,
-  and Help menus across the top, every item calling the same
-  handler as its button -- Ctrl+S saves the conversation, Ctrl+O
-  opens one, Ctrl+Shift+S saves the full transcript, Ctrl+Q quits.
-  Help holds Check for updates, an About box, and a built-in How
-  to Use index. The menu lives in its own module (duo_menu.py) so
-  the window file stays under its 4,000-line bound.
-v0.31: the director bar collapses (audit T19). One "Director"
-  toggle on the boundary between the panes and the director rows
-  hides the controls so the panes take the whole window; the
-  toggle stays visible either way, and the choice is remembered
-  between runs. Collapsing never touches running work. The phone
-  deck moved to its own module (duo_deck.py) to make room: the
-  window file was 16 lines under its 4,000-line bound.
-v0.55: the update story grows up (standing order 2026-11-17).
-  When a newer Release is out, a popup asks whether to update;
-  on the user's tap DUO pulls it, checks the zip against the
-  release's checksum before installing anything, and asks
-  whether to restart now to finish -- Yes restarts DUO on its
-  own, No leaves the update staged for the next launch.
-v0.56: the window gets room to breathe, and room to grow.
-  The saved-pair and relay-preset handlers move to duo_pairs.py
-  (P1-12), which buys back 200 lines under the bound. The relay
-  button greys out on an empty composer (P1-3), history delete
-  and closing with an unsaved conversation ask first (P1-4,
-  P1-5), the panes keep a guaranteed minimum so transcripts stop
-  squeezing (P1-6), the send row loses the four buttons the File
-  menu already has (P1-7), and the director scrolls instead of
-  running off the bottom of a short window (P1-8).
-v0.59: the engine swap (item 139, Joshua's direction). DUO runs
-  on FYRN now, his own in-process engine: duo_fyrn finds the
-  installed Fyrn, imports its package, and loads the model into
-  this process -- no server to start, watch, or lose. duo_ollama
-  is deleted; the update check moves to duo_updater, its real
-  home. The Start Ollama button and the Ollama-down state go
-  with the server; when Fyrn is not installed the status bar
-  says so in plain words. The per-pane Temperature controls go
-  too: FYRN exposes no temperature, and a control that does
-  nothing is not a control. Saved pairs keep loading (their old
-  temperature keys are ignored).
+Two panes, one model each, plus a director layer: send to A, B,
+or both; an auto-relay that hands each reply to the other model
+(blind, so each side thinks it is talking to a person, or aware);
+review each hop before it is forwarded; per-side instructions
+and saved model pairs; compare mode; multi-round tasks handed
+between the models; file attachments; a summarize button and a
+per-turn stats line; transcripts and whole-conversation
+save/load; a phone deck on the home network; and ask-first
+self-updates from GitHub Releases.
+
+The engine is FYRN (duo_fyrn.py): the model loads into this
+process and generates here -- no server to start, watch, or
+lose. This file holds the window and the entry point; the rest
+lives in the duo_*.py modules next to it. Version history lives
+in CHANGELOG.md (this docstring used to carry it, and went
+stale: it described controls removed versions earlier).
 """
 
 import html
@@ -268,11 +91,12 @@ from duo_model import (
     SUMMARY_LABEL,)
 from duo_motion import DirectorSpring, install_motion, theme_colors
 from duo_fyrn import (
-    CHAT_TIMEOUT, MSG_FYRN_AMBIGUOUS, MSG_FYRN_MISSING,
-    MSG_MODEL_FAILED, MSG_MODEL_GONE, MSG_MODEL_TOO_BIG,
-    MSG_TURN_FAILED, Cancelled, EngineError, FyrnAmbiguousError,
-    FyrnClient, FyrnInstall, FyrnNotFoundError, check_fyrn,
-    find_fyrn_install, fyrn_models_folder, is_embedding_model,)
+    CHAT_TIMEOUT, MSG_EMPTY_REPLY, MSG_FYRN_AMBIGUOUS,
+    MSG_FYRN_MISSING, MSG_MODEL_FAILED, MSG_MODEL_GONE,
+    MSG_MODEL_TOO_BIG, MSG_TURN_FAILED, Cancelled, EngineError,
+    FyrnAmbiguousError, FyrnClient, FyrnInstall,
+    FyrnNotFoundError, check_fyrn, find_fyrn_install,
+    fyrn_models_folder, is_embedding_model,)
 from duo_pairs import PairPresetController
 from duo_runner import SerialRunner
 from duo_single import (SINGLE_INSTANCE_ENV, SINGLE_INSTANCE_NAME,
@@ -313,7 +137,7 @@ from duo_workers import (_ModelLoader, _SignalObject,
 
 
 APP_NAME = "DUO"
-APP_VERSION = "0.59"
+APP_VERSION = "0.60"
 
 # P1-5 (v0.56): closing with an unsaved conversation asks first.
 # The GUI tests close windows with messages in every tearDown, so

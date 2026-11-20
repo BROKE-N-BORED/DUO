@@ -3,7 +3,29 @@
 Every version, newest first. v0.1–v0.17 were built on 2026-11-12;
 v0.18–v0.35 on 2026-11-13; v0.36–v0.49 on 2026-11-14; v0.50 on
 2026-11-15; v0.51–v0.52 on 2026-11-16; v0.53–v0.56 on
-2026-11-17; v0.58 on 2026-11-19; v0.59 on 2026-11-19.
+2026-11-17; v0.58 on 2026-11-19; v0.59 on 2026-11-19; v0.60 on
+2026-11-19.
+
+## v0.60 — 2026-11-19
+
+A hardening pass under the hood; nothing about the window
+changes. A turn that comes back empty is now reported as a
+failed turn with plain words, instead of landing in the
+conversation as a blank reply (and being forwarded by the
+relay as one). Opening a conversation or transcript file that
+is not readable text now gets the same plain "not a DUO file"
+answer as a corrupt one, instead of failing silently. A saved
+pairs file that has gone bad is now backed up before anything
+overwrites it, and the pairs row says so when it can't be read,
+the same protection saved relay presets already had. If part
+of the window's plumbing ever throws an error mid-turn, the
+generation queue now logs it and keeps going instead of
+stalling every later turn. Crashes in DUO's background threads
+are now written into the debug report too, not just crashes in
+the window itself. Small print: the How to Use page now says
+Ctrl+Enter sends from the message box (it never worked from
+anywhere else), and the README's test commands point at the
+interpreter that actually has what the tests need.
 
 ## v0.59 — 2026-11-19
 
