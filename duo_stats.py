@@ -1,4 +1,4 @@
-"""Turn statistics: compute them from Ollama's done chunk and
+"""Turn statistics: compute them from the engine's turn stats and
 format the stats line and the session-total line.
 
 Split out of dual_chat.py in v0.25 (audit T14). Pure functions,
@@ -14,8 +14,10 @@ def compute_turn_stats(metrics):
     ttft_s, total_s. Anything missing (or not a number) stays None
     and shows as "n/a" -- never invented. tokens/sec is eval_count
     over eval_duration in seconds. The counts are the turn's own
-    numbers, straight from Ollama -- generated (out) and prompt
-    (in) -- never estimated from characters.
+    numbers, straight from the engine -- generated (out) and prompt
+    (in) -- never estimated from characters. The FYRN engine
+    reports the generated count but no prompt count, so the "in"
+    side is None (n/a) on every Fyrn turn.
     """
     count = metrics.get("eval_count")
     duration = metrics.get("eval_duration_ns")
@@ -48,10 +50,11 @@ def format_ram(size_bytes):
 # U39: model selection shows what the model does and whether it fits
 # this PC -- never make the user guess at sizes or specs. A model
 # fits when its size leaves the reserve (2 GB for the OS, DUO, and
-# Ollama itself) untouched. A model that doesn't fit is still
-# selectable -- inform, never block. Sizes come from /api/tags;
-# total RAM comes from /proc/meminfo, read once and cached by the
-# window. Everything here returns None on unknown input instead of
+# the engine itself) untouched. A model that doesn't fit is still
+# selectable -- inform, never block. Sizes come from the engine's
+# model list; total RAM comes from /proc/meminfo, read once and
+# cached by the window. Everything here returns None on unknown
+# input instead of
 # raising: an unreadable /proc means "size only, no fit label",
 # never a crash.
 
@@ -248,9 +251,11 @@ def format_stats_line(stats):
     "total_s": float|None, "ram": str|None} -- "ram" is preformatted,
     e.g. "1.9 GB in RAM"; None shows "RAM n/a". None (before any turn) shows
     dashes; a missing number shows "n/a". The token segment sits
-    right after the speed: "42 out / 128 in" when Ollama reported
+    right after the speed: "42 out / 128 in" when the engine reported
     both counts, "tokens n/a" when it reported neither, and the
-    half it did report when it reported only one.
+    half it did report when it reported only one. (On the FYRN
+    engine the prompt count is never reported, so the "in" half
+    always shows n/a.)
     """
     if stats is None:
         return STATS_EMPTY_LINE

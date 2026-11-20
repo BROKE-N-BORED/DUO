@@ -3,7 +3,30 @@
 Every version, newest first. v0.1–v0.17 were built on 2026-11-12;
 v0.18–v0.35 on 2026-11-13; v0.36–v0.49 on 2026-11-14; v0.50 on
 2026-11-15; v0.51–v0.52 on 2026-11-16; v0.53–v0.56 on
-2026-11-17; v0.58 on 2026-11-19.
+2026-11-17; v0.58 on 2026-11-19; v0.59 on 2026-11-19.
+
+## v0.59 — 2026-11-19
+
+DUO runs on a new engine: Fyrn, the local model engine
+installed on this PC. The model now loads into DUO itself and
+generates there, so there is no Ollama server to start, watch,
+or lose, and turns start faster. DUO finds the Fyrn install on
+its own when it starts. The model list still shows every model
+Fyrn sees: the models in Fyrn's models folder, plus any models
+already sitting in Ollama's store on this PC, which Fyrn reads
+itself. Embedding models no longer appear in the pickers,
+because they cannot write replies. If Fyrn is not installed,
+the window opens anyway and the status bar says so in plain
+words, and the Start Ollama button from v0.58 is gone, because
+there is no server left to start. The Temperature control
+under each picker is gone too: Fyrn does not offer a
+temperature setting, and DUO does not keep controls that do
+nothing. Saved pairs still load; a pair saved by an older
+version keeps its models and instructions, and its old
+temperature values are simply ignored. The stats line keeps
+its speed and timing numbers; the prompt token count now
+shows n/a, because Fyrn does not report one, and DUO would
+rather show n/a than invent a number.
 
 ## v0.58 — 2026-11-19
 

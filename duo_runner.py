@@ -7,7 +7,7 @@ Split out of dual_chat.py in v0.25 (audit T14).
 import queue
 import threading
 
-from duo_ollama import MSG_TURN_FAILED, Cancelled, OllamaError
+from duo_fyrn import MSG_TURN_FAILED, Cancelled, EngineError
 
 
 class SerialRunner:
@@ -71,7 +71,7 @@ class SerialRunner:
                     self.on_done(job, full)
                 except Cancelled:
                     self.on_cancelled(job)
-                except OllamaError as exc:
+                except EngineError as exc:
                     self.on_error(job, str(exc))
                 except Exception:
                     # v0.58 (P2-52): an unexpected failure is not a

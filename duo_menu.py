@@ -22,7 +22,7 @@ def about_text(version):
     """The About dialog's text: name + version, what DUO is, and the
     license line. No links, no web."""
     return ("DUO %s: a dual-window chat interface for two local "
-            "Ollama models.\n\nMIT License (see LICENSE)."
+            "models, running on Fyrn.\n\nMIT License (see LICENSE)."
             % version)
 
 
@@ -60,8 +60,9 @@ HOW_TO_USE_SECTIONS = (
     ("The two panes",
      "Each pane is one model. Pick a model in a pane's dropdown "
      "before you can send to it. Nothing is picked for you. The "
-     "Temperature control under each picker sets how focused or "
-     "random that side's replies are. 0.7 is Ollama's default."),
+     "models run on Fyrn, the engine installed on this PC: DUO "
+     "loads the model and talks to it directly, with no server "
+     "in between."),
     ("Sending a message",
      "Type in the message box at the bottom, then Send to A, Send "
      "to B, or Send to Both. Send to Both sends the same message "
@@ -100,7 +101,7 @@ HOW_TO_USE_SECTIONS = (
      "pane."),
     ("Saved pairs and relay presets",
      "A saved pair remembers the whole setup for both panes: which "
-     "model goes in each pane, each side's temperature, and each "
+     "model goes in each pane and each "
      "side's instructions, so you can pick both at once. A relay "
      "preset remembers the whole relay row: start side, mode, turn "
      "cap, stop words, and the two checkboxes. Name a pair or "

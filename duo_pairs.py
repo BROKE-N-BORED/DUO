@@ -24,7 +24,7 @@ from duo_constants import MSG_PAIR_NEEDS_NAME, MSG_PRESET_NEEDS_NAME
 from duo_storage import (
     delete_pair, delete_preset, load_pairs, load_presets,
     pair_tooltip, pairs_path, preset_tooltip, presets_file_corrupt,
-    presets_path, save_pair, save_preset, valid_temperature,
+    presets_path, save_pair, save_preset,
 )
 from duo_text import parse_stop_phrases
 
@@ -97,7 +97,7 @@ class PairPresetController:
         for index, name in enumerate(names):
             self.pair_combo.addItem(name)
             # Hovering shows what loading this pair would set (v0.41,
-            # R6): models, temperatures, instructions preview.
+            # R6): models and the instructions preview.
             self.pair_combo.setItemData(
                 index, pair_tooltip(pairs[name]),
                 QtCore.Qt.ToolTipRole)
@@ -119,8 +119,6 @@ class PairPresetController:
         setup = {
             "model_a": self.convo.sides["A"].model,
             "model_b": self.convo.sides["B"].model,
-            "temperature_a": self.widgets["A"]["temperature"].value(),
-            "temperature_b": self.widgets["B"]["temperature"].value(),
             "instruction_a":
                 self.widgets["A"]["instr_edit"].toPlainText(),
             "instruction_b":
@@ -156,16 +154,14 @@ class PairPresetController:
                 picker.setCurrentIndex(found)
             else:
                 missing.append(model)
-        # Temperatures and instructions follow the pair too (v0.41,
-        # R6). A key missing from an old pair leaves the current value
-        # alone -- only keys the pair actually has are applied, so a
-        # pair saved before temperatures were stored can't reset them.
-        for side, tkey, ikey in (
-                ("A", "temperature_a", "instruction_a"),
-                ("B", "temperature_b", "instruction_b")):
-            temp = valid_temperature(setup.get(tkey))
-            if temp is not None:
-                self.widgets[side]["temperature"].setValue(temp)
+        # Instructions follow the pair too (v0.41, R6). A key
+        # missing from an old pair leaves the current value alone --
+        # only keys the pair actually has are applied. (Pairs saved
+        # before v0.59 also hold temperatures; the FYRN engine has
+        # no temperature knob, so those keys are simply ignored.)
+        for side, ikey in (
+                ("A", "instruction_a"),
+                ("B", "instruction_b")):
             if isinstance(setup.get(ikey), str):
                 self.widgets[side]["instr_edit"].setPlainText(
                     setup[ikey])

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""DUO 0.29 - two Ollama models side by side in one desktop window.
+"""DUO - two local models side by side in one desktop window.
 
 Item 1: the shell, the model pickers, and send-to-A/B/both.
 Item 2: the auto-relay AI-to-AI loop. The user types a seed message, picks
@@ -183,14 +183,26 @@ v0.56: the window gets room to breathe, and room to grow.
   squeezing (P1-6), the send row loses the four buttons the File
   menu already has (P1-7), and the director scrolls instead of
   running off the bottom of a short window (P1-8).
+v0.59: the engine swap (item 139, Joshua's direction). DUO runs
+  on FYRN now, his own in-process engine: duo_fyrn finds the
+  installed Fyrn, imports its package, and loads the model into
+  this process -- no server to start, watch, or lose. duo_ollama
+  is deleted; the update check moves to duo_updater, its real
+  home. The Start Ollama button and the Ollama-down state go
+  with the server; when Fyrn is not installed the status bar
+  says so in plain words. The per-pane Temperature controls go
+  too: FYRN exposes no temperature, and a control that does
+  nothing is not a control. Saved pairs keep loading (their old
+  temperature keys are ignored).
 """
 
 import html
 import os
 import re
-import shutil  # noqa: F401 -- unused here, but the tests patch
-# dual_chat.shutil.which (the Ollama fallback lookup lives in
-# duo_ollama; shutil is one shared module, so the patch lands).
+import shutil  # noqa: F401 -- unused here since v0.59 (the old
+# Ollama fallback lookup that the tests patched through this
+# name lived in duo_ollama); kept so the module's import surface
+# is unchanged for anything that still patches it.
 import sys
 import threading
 import time
@@ -202,8 +214,9 @@ import time
 # in v0.39, the relay session to duo_model.py in v0.40, the debug
 # log fallback to duo_debug.py and the attachments to
 # duo_attachments.py in v0.42, the single-instance socket to
-# duo_single.py in v0.44, and the window constants to
-# duo_constants.py in v0.47), and
+# duo_single.py in v0.44, the window constants to
+# duo_constants.py in v0.47, and the engine client to duo_fyrn.py
+# in v0.59, replacing duo_ollama), and
 # re-exports the moved names so
 # `from dual_chat import ...` keeps working unchanged -- the
 # tests, the installer, and the deck all import through here.
@@ -222,17 +235,16 @@ from duo_constants import (
     MSG_UPDATE_AVAILABLE, MSG_UPDATE_LATEST, MSG_UPDATE_FAILED,
     MSG_UPDATE_DOWNLOADING, MSG_UPDATE_PENDING,
     MSG_PYSIDE6_MISSING, SIDE_STATES, SIDE_STATES_SHORT,
-    OLLAMA_START_WAIT_MS, ERROR_STATE_HOLD_MS,
+    ERROR_STATE_HOLD_MS,
     RELAY_CHIP_STATES, METER_REFRESH_MS, SETTINGS_ORG, SETTINGS_APP,
     SETTING_ENTER_TO_SEND, SETTING_DIRECTOR_COLLAPSED,
     SETTING_SECTION_COLLAPSED, SETTING_WINDOW_GEOMETRY,
     SETTING_SPLITTER_STATE, SETTING_HIST_SPLITTER_STATE,
     HIST_TRANSCRIPT_MIN_HEIGHT, HIST_EDITOR_MIN_HEIGHT,
     PANES_MIN_HEIGHT, DIRECTOR_SCROLL_MAX_HEIGHT, CLOSE_WAIT_MS,
-    HIST_EDITOR_DEFAULT_HEIGHT, SETTING_TEMPERATURE,
-    TEMPERATURE_DEFAULT, TEMPERATURE_MIN, TEMPERATURE_MAX,
+    HIST_EDITOR_DEFAULT_HEIGHT,
     SETTING_FIRST_RUN_DONE, FIRST_RUN_HEADER, FIRST_RUN_STEP1,
-    FIRST_RUN_STEP2, FIRST_RUN_STEP3, FIRST_RUN_TICK, EXPLAIN_TEMP,
+    FIRST_RUN_STEP2, FIRST_RUN_STEP3, FIRST_RUN_TICK,
     EXPLAIN_RELAY_ROW1, EXPLAIN_STOP, EXPLAIN_AGREE, EXPLAIN_INSTR,
     EXPLAIN_TASK,
     EXPLAIN_TASK_ROW, EXPLAIN_STYLE, first_run_guide_html,
@@ -255,14 +267,12 @@ from duo_model import (
     MSG_NO_MODEL, NoModelSelected, RelaySession, SUMMARY_KEEP_LAST,
     SUMMARY_LABEL,)
 from duo_motion import DirectorSpring, install_motion, theme_colors
-from duo_ollama import (
-    CHAT_MAX_ATTEMPTS, CHAT_RETRY_DELAYS, CHAT_TIMEOUT, DEFAULT_OLLAMA_URL,
-    MSG_MODEL_FAILED, MSG_OLLAMA_DOWN, MSG_OLLAMA_SLOW, MSG_TURN_FAILED,
-    OLLAMA_URL_ENV,
-    UPDATE_CHECK_TIMEOUT, UPDATE_CHECK_URL, UPDATE_CHECK_URL_ENV, Cancelled,
-    OllamaClient, OllamaError, check_for_update, start_ollama,
-    parse_ollama_list_output, parse_ps_payload, parse_tags_payload,
-    parse_tags_sizes, parse_version,)
+from duo_fyrn import (
+    CHAT_TIMEOUT, MSG_FYRN_AMBIGUOUS, MSG_FYRN_MISSING,
+    MSG_MODEL_FAILED, MSG_MODEL_GONE, MSG_MODEL_TOO_BIG,
+    MSG_TURN_FAILED, Cancelled, EngineError, FyrnAmbiguousError,
+    FyrnClient, FyrnInstall, FyrnNotFoundError, check_fyrn,
+    find_fyrn_install, fyrn_models_folder, is_embedding_model,)
 from duo_pairs import PairPresetController
 from duo_runner import SerialRunner
 from duo_single import (SINGLE_INSTANCE_ENV, SINGLE_INSTANCE_NAME,
@@ -292,15 +302,18 @@ from duo_transcript import (
     default_full_filename, default_side_filename,
     format_both_transcript, format_full_transcript, format_side_transcript,
     load_side_transcript_file, parse_side_transcript, sanitize_filename_part,)
-from duo_updater import (apply_pending_update, download_and_stage,
+from duo_updater import (UPDATE_CHECK_TIMEOUT, UPDATE_CHECK_URL,
+                         UPDATE_CHECK_URL_ENV, apply_pending_update,
+                         check_for_update, download_and_stage,
                          install_update_wiring, offer_update,
-                         restart_quietly,)
+                         parse_version, restart_quietly,
+                         update_check_url,)
 from duo_workers import (_ModelLoader, _SignalObject,
                          _Signals, _UpdateChecker, _qt,)
 
 
 APP_NAME = "DUO"
-APP_VERSION = "0.58"
+APP_VERSION = "0.59"
 
 # P1-5 (v0.56): closing with an unsaved conversation asks first.
 # The GUI tests close windows with messages in every tearDown, so
@@ -373,18 +386,17 @@ def build_window(client=None, logger=None, deck_port=None):
     from PySide6 import QtCore, QtGui, QtWidgets
     import shiboken6
 
-    client = client or OllamaClient()
+    client = client or FyrnClient()
     if logger is None:
         logger = make_debug_logger()
     # The debug log records events and timings only -- never message
     # or attached-file contents. That rule is load-bearing: the report
     # is meant to be emailed, so nothing private may reach the log.
-    ollama_url = getattr(client, "base_url", DEFAULT_OLLAMA_URL)
-    logger.set_setting("ollama_url", ollama_url)
+    # The engine is Fyrn, in-process (v0.59): the report's service
+    # check says which Fyrn DUO found, never anything about the
+    # models' use.
     if _debug_log is not None:
-        logger.register_service(
-            "ollama",
-            lambda: _debug_log.check_ollama(ollama_url))
+        logger.register_service("fyrn", check_fyrn)
     logger.register_dependency("PySide6-Essentials")
     logger.action("DUO %s started" % APP_VERSION)
     # Theme colors (v0.51): the code-block background and the search
@@ -442,9 +454,9 @@ def build_window(client=None, logger=None, deck_port=None):
     root.addWidget(panes, stretch=1)
 
     # Persisted preferences (QSettings): created here, before the
-    # panes, because the panes read their saved temperatures as they
-    # are built. Explicit org/app names so the settings land in the
-    # same place no matter how the app was launched.
+    # panes, because the panes and sections read their saved state
+    # as they are built. Explicit org/app names so the settings land
+    # in the same place no matter how the app was launched.
     prefs = QtCore.QSettings(SETTINGS_ORG, SETTINGS_APP)
 
     # --- one pane per side -----------------------------------------------
@@ -512,40 +524,11 @@ def build_window(client=None, logger=None, deck_port=None):
         picker_row.addWidget(refresh)
         layout.addLayout(picker_row)
 
-        # Temperature (v0.19): per side, 0.0-2.0, default 0.7 -- that
-        # is Ollama's own default, made visible instead of silent.
-        # Remembered per side between runs (QSettings).
-        temp_row = QtWidgets.QHBoxLayout()
-        temp_label = QtWidgets.QLabel("Temperature")
-        temp_row.addWidget(temp_label)
-        temp_spin = QtWidgets.QDoubleSpinBox()
-        temp_spin.setRange(TEMPERATURE_MIN, TEMPERATURE_MAX)
-        temp_spin.setSingleStep(0.1)
-        temp_spin.setDecimals(1)
-        temp_spin.setToolTip(
-            "0.7 is Ollama's default. Lower is more focused, "
-            "higher is more random.")
-        temp_spin.setValue(prefs.value(
-            SETTING_TEMPERATURE % side, TEMPERATURE_DEFAULT,
-            type=float))
-
-        def _save_temperature(value):
-            prefs.setValue(SETTING_TEMPERATURE % side, float(value))
-            prefs.sync()
-
-        temp_spin.valueChanged.connect(_save_temperature)
-        temp_row.addWidget(temp_spin)
-        # Field explanation (v0.42, U20): beside the spinbox, in
-        # the row's empty space -- the row is wide and the control
-        # is narrow, so it costs no height. One line, not wrapped:
-        # a word-wrapped label's size hint wraps the sentence at
-        # ~198 px and the row grows to two lines tall, while the
-        # unwrapped sentence is 244 px and fits the row even at
-        # the 900 px minimum width (probed, not assumed).
-        temp_explain = _make_explanation(EXPLAIN_TEMP, wrap=False)
-        temp_row.addWidget(temp_explain)
-        temp_row.addStretch(1)
-        layout.addLayout(temp_row)
+        # (The Temperature row that lived here from v0.19 to
+        # v0.58 is gone in v0.59: the FYRN engine exposes no
+        # temperature, and a control that does nothing is not a
+        # control. Temperatures saved in QSettings or in old pairs
+        # are simply never read again.)
 
         # Per-side instructions (system prompt). Collapsed by default;
         # empty means no system message is sent for this side.
@@ -730,8 +713,6 @@ def build_window(client=None, logger=None, deck_port=None):
         widgets[side] = {
             "title": title,
             "picker": picker, "refresh": refresh, "transcript": transcript,
-            "temperature": temp_spin,
-            "temp_label": temp_label, "temp_explain": temp_explain,
             "status": status, "stop": stop, "clear": clear,
             "save": save, "import": import_btn,
             "search_edit": search_edit, "search_count": search_count,
@@ -764,14 +745,11 @@ def build_window(client=None, logger=None, deck_port=None):
         # reader hears bare widget text -- "Stop" three times, two
         # "Refresh" buttons, two "Save" buttons -- with no hint
         # which pane a control belongs to. Every duplicated
-        # per-pane control names its side; the Temperature label
-        # is the spinbox's buddy, so the reader pairs them.
+        # per-pane control names its side.
         model = "Model " + side
-        temp_label.setBuddy(temp_spin)
         for widget, name in (
                 (picker, model + " picker"),
                 (refresh, "Refresh " + model + " list"),
-                (temp_spin, "Temperature for " + model),
                 (instr_toggle, "Instructions for " + model),
                 (instr_edit, "Instructions text for " + model),
                 (transcript, "Conversation with " + model),
@@ -1234,26 +1212,10 @@ def build_window(client=None, logger=None, deck_port=None):
     meter_label = QtWidgets.QLabel("")
     meter_label.setStyleSheet("font-size: 11px;")
     statusbar.addPermanentWidget(meter_label)
-    # Start Ollama (v0.58, P2-53): shown only while Ollama is down
-    # (on_models_failed shows it, populate_models hides it). The
-    # down message's remedy used to mean opening a terminal; under
-    # the no-terminal rule the app starts the service itself, on a
-    # click, then re-checks the model list after a short wait.
-    start_ollama_btn = QtWidgets.QPushButton("Start Ollama")
-    start_ollama_btn.setVisible(False)
-    statusbar.addPermanentWidget(start_ollama_btn)
-
-    def on_start_ollama():
-        start_ollama_btn.setEnabled(False)
-        if not start_ollama():
-            set_status_message(
-                "Ollama doesn't seem to be installed on this PC.")
-            start_ollama_btn.setEnabled(True)
-            return
-        set_status_message("Starting Ollama...")
-        QtCore.QTimer.singleShot(OLLAMA_START_WAIT_MS, load_models)
-
-    start_ollama_btn.clicked.connect(on_start_ollama)
+    # (The Start Ollama button that lived here in v0.58 is gone in
+    # v0.59: there is no server to start. When Fyrn is missing,
+    # on_models_failed puts the plain words in the status message
+    # above -- that is the whole down state now.)
     meter_prev = {"cpu": None}
 
     def refresh_meter():
@@ -1947,11 +1909,11 @@ def build_window(client=None, logger=None, deck_port=None):
     job_stats = {}  # job id -> {"metrics": dict|None, "ram": str|None}
 
     def _ram_text(model):
-        """'<size> in RAM' for a running model, or None when the
+        """'<size> in RAM' for the loaded model, or None when the
         lookup can't prove the model is resident (shown as
         'RAM n/a'). This runs right after a turn, when the model
-        just answered: an empty /api/ps snapshot then cannot mean
-        'not loaded' -- it lags or races -- and the old 'not loaded'
+        just answered: an empty snapshot then cannot mean 'not
+        loaded' -- it lags or races -- and the old 'not loaded'
         wording read like an error on a good turn (v0.58, P3-50)."""
         try:
             running = client.running_models()
@@ -1964,21 +1926,12 @@ def build_window(client=None, logger=None, deck_port=None):
     def make_job_fn(job_id, model, messages, track_stats=True):
         holder = {"metrics": None, "ram": None}
         job_stats[job_id] = holder
-        # Temperature (v0.19): read when the job is made -- the value
-        # in effect when the turn was started -- and sent as Ollama's
-        # options. Every generation goes through here: direct sends,
-        # relay hops, task runs, and summaries.
-        job_side, _is_summary = _job_side(job_id)
-        options = {"temperature":
-                   widgets[job_side]["temperature"].value()}
-
-        def _on_retry(attempt, delay, kind):
-            logger.warning(
-                "chat retry: model %s, attempt %d failed (%s), "
-                "retrying in %.1fs", model, attempt, kind, delay)
+        # Every generation goes through here: direct sends, relay
+        # hops, task runs, and summaries. No options ride along
+        # (v0.59): the FYRN engine exposes no per-turn knobs.
 
         def fn(emit, cancel_event):
-            kwargs = {"on_retry": _on_retry, "options": options}
+            kwargs = {}
             if track_stats:
                 kwargs["on_metrics"] = (
                     lambda m: holder.update(metrics=m))
@@ -2021,7 +1974,7 @@ def build_window(client=None, logger=None, deck_port=None):
     def _take_job_stats(job_id, side):
         """Pop a finished job's holder and return its stats dict.
 
-        The turn's token counts -- when Ollama reported them -- are
+        The turn's token counts -- when the engine reported them -- are
         folded into the side's session total first. A job with no
         holder (never tracked) returns None. A failed turn has no
         metrics, so its stats come back all None and nothing is
@@ -2058,9 +2011,9 @@ def build_window(client=None, logger=None, deck_port=None):
         state["queued"].discard(side)
         state["active"].add(side)
         # The job started but no reply has arrived yet: amber
-        # "Waiting for Ollama…" until the first chunk lands, when
-        # on_chunk flips it to green "Thinking…". A slow or
-        # retrying Ollama honestly stays amber.
+        # "Waiting for the model…" until the first chunk lands, when
+        # on_chunk flips it to green "Thinking…". A slow model
+        # load honestly stays amber.
         set_side_state(side, "waiting")
         widgets[side]["reply_open"] = True
         begin_reply(side, convo.sides[side].model)
@@ -2072,8 +2025,8 @@ def build_window(client=None, logger=None, deck_port=None):
         side, is_summary = _job_side(job_id)
         if is_summary:
             return
-        # The first chunk is the moment Ollama starts answering:
-        # amber "Waiting for Ollama…" becomes green "Thinking…".
+        # The first chunk is the moment the model starts answering:
+        # amber "Waiting for the model…" becomes green "Thinking…".
         if side_state[side] == "waiting":
             set_side_state(side, "thinking")
             # ...and the sparkline starts sampling: the first
@@ -2104,7 +2057,7 @@ def build_window(client=None, logger=None, deck_port=None):
         if session is None:
             return
         session.active = False
-        # Reasons that are full sentences (the Ollama messages) already
+        # Reasons that are full sentences (the engine messages) already
         # end with a period; the status line adds its own, so strip
         # one to avoid "Try again in a moment..".
         reason = reason.rstrip(".")
@@ -2801,7 +2754,7 @@ def build_window(client=None, logger=None, deck_port=None):
     # --- debug report ------------------------------------------------------
     def do_debug_report():
         """Write the debug report to a file the user picks: app
-        version, Ollama status, the session log, and recent errors.
+        version, Fyrn status, the session log, and recent errors.
         The report never holds message or attached-file contents, so
         it is safe to email. Cancelling writes nothing."""
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
@@ -3399,7 +3352,6 @@ def build_window(client=None, logger=None, deck_port=None):
         if not alive():
             return
         state["models_loading"] = False
-        start_ollama_btn.setVisible(False)
         for side in ("A", "B"):
             picker = widgets[side]["picker"]
             previous = convo.sides[side].model
@@ -3420,18 +3372,20 @@ def build_window(client=None, logger=None, deck_port=None):
             picker.blockSignals(False)
         if models:
             set_status_message(
-                "Ollama connected: %d model(s) found." % len(models))
+                "Fyrn connected: %d model(s) found." % len(models))
         else:
             set_status_message(
-                "Ollama connected but no models found. Pull a model first.")
+                "Fyrn connected but no models found. Add a model in Fyrn first.")
         refresh_buttons()
 
     def on_models_failed(message):
+        # The engine state (v0.59): Fyrn missing or unreadable.
+        # There is no button to offer -- no server to start, and
+        # installing Fyrn is Fyrn's own installer's job -- so the
+        # plain words in the status bar are the whole state.
         if not alive():
             return
         state["models_loading"] = False
-        start_ollama_btn.setVisible(True)
-        start_ollama_btn.setEnabled(True)
         for side in ("A", "B"):
             widgets[side]["picker"].setPlaceholderText("Pick a model")
         set_status_message(message)
@@ -3443,17 +3397,17 @@ def build_window(client=None, logger=None, deck_port=None):
     loaders = []
 
     def _on_probe_result(ok, models_or_message, seconds):
-        """Log the model-list probe: up/down plus its latency."""
+        """Log the model-list probe: found/failed plus its latency."""
         if ok:
-            logger.info("Ollama probe: up, %d model(s), %.2fs"
+            logger.info("Fyrn probe: %d model(s) found, %.2fs"
                         % (len(models_or_message), seconds))
         else:
-            logger.warning("Ollama probe: down (%.2fs): %s"
+            logger.warning("Fyrn probe: failed (%.2fs): %s"
                            % (seconds, models_or_message))
 
     def load_models():
-        # Loading state (v0.33, entry 011): while the /api/tags
-        # fetch runs, the pickers are disabled with a "Loading
+        # Loading state (v0.33, entry 011): while the model scan
+        # runs, the pickers are disabled with a "Loading
         # models..." placeholder -- the shape of what's coming,
         # honestly, never a fake progress bar. The picked model
         # survives the reload: populate_models restores it by name.
@@ -3642,7 +3596,7 @@ def build_window(client=None, logger=None, deck_port=None):
          for key in ("stats", "activity", "session_tokens")]
         + [(widgets[side][key], explanation_style)
            for side in ("A", "B")
-           for key in ("temp_explain", "instr_explain")]
+           for key in ("instr_explain",)]
         + [(attach_note, small_label_style),
            (relay_status, small_label_style),
            (meter_label, small_label_style),
@@ -3738,7 +3692,6 @@ def build_window(client=None, logger=None, deck_port=None):
         "meter_label": meter_label, "refresh_meter": refresh_meter,
         "meter_timer": meter_timer,
         "status_label": status_label,
-        "start_ollama_btn": start_ollama_btn,
         "set_status_message": set_status_message,
         "phone_btn": phone_btn, "deck_server": deck_server,
         "show_phone_deck": show_phone_deck,
@@ -3769,8 +3722,8 @@ def build_window(client=None, logger=None, deck_port=None):
     update_downloaders = install_update_wiring(
         window, alive, download_fn=download_and_stage)
 
-    # Closing the window stops only DUO: Ollama keeps running, the
-    # way DUO found it -- DUO never starts or stops a server.
+    # Closing the window stops only DUO: Fyrn the app keeps its
+    # own state -- DUO only ever borrowed its engine in-process.
     _orig_close_event = window.closeEvent
 
     def _on_close(event):
@@ -3793,9 +3746,8 @@ def build_window(client=None, logger=None, deck_port=None):
         # destroying a running QThread aborts the whole process
         # ("QThread: Destroyed while thread '' is still running",
         # exit 134 in the full suite). But waiting without a bound
-        # freezes the window for up to ~42 s when Ollama is down
-        # (P1-11, v0.57): the model load is bounded only by its
-        # retries plus the CLI fallback. So the wait shares one
+        # freezes the window when a model scan runs long
+        # (P1-11, v0.57). So the wait shares one
         # CLOSE_WAIT_MS deadline across all three lists, then the
         # window closes anyway. A thread still running after that
         # is orphaned, never destroyed mid-flight: its holder
@@ -3840,7 +3792,7 @@ def build_window(client=None, logger=None, deck_port=None):
         prefs.sync()
         # Closing mid-generation must stop the work: without this,
         # the runner thread keeps a relay going in the closed window,
-        # still calling Ollama after DUO is gone (and, in the tests,
+        # still generating after DUO is gone (and, in the tests,
         # still appending to the shared fake client's call list long
         # after the window closed). Cancel every job and deactivate
         # the relay/task so a done signal already queued can't submit
@@ -3944,11 +3896,6 @@ def main(argv=None):
     if apply_pending_update()[0] == "applied":
         restart_quietly()
     argv = list(sys.argv[1:] if argv is None else argv)
-    base_url = None
-    if "--ollama-url" in argv:
-        i = argv.index("--ollama-url")
-        if i + 1 < len(argv):
-            base_url = argv[i + 1]
     try:
         from PySide6 import QtWidgets
     except ImportError:
@@ -3967,7 +3914,7 @@ def main(argv=None):
         return 0
     logger = make_debug_logger()
     logger.install_crash_handler()
-    window = build_window(OllamaClient(base_url), logger=logger)
+    window = build_window(FyrnClient(), logger=logger)
     guard.set_show_callback(
         lambda: (window.show(), window.raise_(),
                  window.activateWindow()))

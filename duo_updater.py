@@ -1,7 +1,9 @@
 """Self-update for DUO (v0.55, standing order 2026-11-17).
 
 On launch DUO silently checks GitHub for a newer Release (the
-v0.28 check in duo_ollama). When one is out, a popup asks
+v0.28 check below; it lived in duo_ollama until v0.59 moved it
+here, its real home, when the FYRN swap retired that module).
+When one is out, a popup asks
 whether to update; only on the user's tap does DUO pull it --
 and the pull goes through the verified path: the release's
 checksum sidecar is downloaded first, the zip's SHA-256 must
@@ -40,8 +42,88 @@ import urllib.request
 import zipfile
 
 from duo_constants import MSG_UPDATE_DOWNLOADING, MSG_UPDATE_PENDING
-from duo_ollama import parse_version, update_check_url
 from duo_workers import _UpdateDownloader
+
+
+# --- Update check (v0.28, audit T17) ---------------------------------------
+# DUO tells the user when a newer Release exists. Since v0.55 the
+# popup offers to pull it (the rest of this module) -- this check
+# only ever looks, and never downloads anything itself.
+# The source of truth is the GitHub API's latest-release endpoint
+# for this repo, unauthenticated, with a short timeout so a slow
+# network never holds the app up. DUO_UPDATE_CHECK_URL points the
+# check at a different endpoint (for testing only).
+
+UPDATE_CHECK_URL = (
+    "https://api.github.com/repos/BROKE-N-BORED/DUO/releases/latest")
+
+
+UPDATE_CHECK_URL_ENV = "DUO_UPDATE_CHECK_URL"
+
+
+UPDATE_CHECK_TIMEOUT = 5
+
+
+def update_check_url():
+    """The endpoint check_for_update asks: the GitHub latest-release
+    URL, or the DUO_UPDATE_CHECK_URL override when one is set."""
+    return os.environ.get(UPDATE_CHECK_URL_ENV) or UPDATE_CHECK_URL
+
+
+def parse_version(text):
+    """Parse a version like "0.28" or "v0.28" into a tuple of ints
+    for numeric comparison ("0.9" < "0.10" holds). Returns None
+    when the text is not a dotted-number version -- empty, a
+    non-number part, trailing junk -- so a bad tag can never crash
+    the check or report a nonsense update."""
+    if not isinstance(text, str):
+        return None
+    text = text.strip()
+    if text.startswith(("v", "V")):
+        text = text[1:]
+    if not text:
+        return None
+    numbers = []
+    for part in text.split("."):
+        if not part.isdigit():
+            return None
+        numbers.append(int(part))
+    return tuple(numbers)
+
+
+def check_for_update(current_version, url=None, timeout=UPDATE_CHECK_TIMEOUT,
+                     urlopen=None):
+    """Ask for the latest DUO release and compare with
+    ``current_version``. Returns ("newer", version) when a newer
+    release exists (version is the normalized dotted number, e.g.
+    "0.29"), ("latest", None) when this copy is current, and
+    ("failed", None) when the check could not be completed -- no
+    network, a timeout, a bad response, or a tag that doesn't parse.
+    Never raises: any failure is ("failed", None), so the caller
+    only ever has to decide what to show. ``urlopen`` is the
+    url-opener to use (urllib's by default; tests pass a stub)."""
+    current = parse_version(current_version)
+    if current is None:
+        return ("failed", None)
+    if url is None:
+        url = update_check_url()
+    if urlopen is None:
+        urlopen = urllib.request.urlopen
+    try:
+        request = urllib.request.Request(
+            url, headers={"Accept": "application/vnd.github+json",
+                          "User-Agent": "DUO-update-check"})
+        with urlopen(request, timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except Exception:
+        return ("failed", None)
+    tag = payload.get("tag_name") if isinstance(payload, dict) else None
+    latest = parse_version(tag)
+    if latest is None:
+        return ("failed", None)
+    if latest > current:
+        return ("newer", ".".join(str(n) for n in latest))
+    return ("latest", None)
 
 
 UPDATE_DIR_NAME = ".duo-update"

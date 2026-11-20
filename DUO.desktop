@@ -1,7 +1,7 @@
 [Desktop Entry]
 Type=Application
 Name=DUO
-Comment=Two Ollama models side by side, with a director layer
+Comment=Two local models side by side, with a director layer
 Exec="@APP_DIR@/run.sh"
 Icon=@APP_DIR@/duo.png
 Terminal=false

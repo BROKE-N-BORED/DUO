@@ -1,6 +1,7 @@
 # DUO
 
-Two Ollama models side by side in one desktop window. Pick a model for
+Two local models side by side in one desktop window, running on Fyrn.
+Pick a model for
 the left pane and one for the right, type a message, and send it to A,
 to B, or to both at once. Each side keeps its own conversation.
 
@@ -14,10 +15,7 @@ Everything in one app:
 
 - **Chat** — two panes, each with its own model picker and
   conversation; send to A, to B, or to both. One model generates at
-  a time, so the PC never runs two models at once. Each pane also
-  has a Temperature control (0.0–2.0, default 0.7, which is
-  Ollama's own default): lower is more focused, higher is more
-  random.
+  a time, so the PC never runs two models at once.
 - **Relay** — the two models talk to each other, blind (each thinks
   it's talking to a person) or aware (they know it's another AI),
   with a turn cap, stop phrases, stop on agreement, and an option to
@@ -56,15 +54,15 @@ Everything in one app:
   send a message to both, start a relay. Step 1 gets a checkmark
   once both models are picked, and the guide goes away for good
   once you send your first message.
-- **Stays connected** — if Ollama stalls briefly while the computer
-  is busy, a turn retries a few times instead of giving up, and a
-  slow Ollama is never reported as "not running". Models stay loaded
-  for the session, and the model list gets a few tries too. If
-  Ollama really is down, the panes say so in plain words — start
-  Ollama yourself (`ollama serve` in a terminal) and try again.
+- **Runs on Fyrn** — the models run on Fyrn, the engine installed
+  on this PC: the model loads into DUO itself and generates there,
+  so there is no server to start, watch, or lose. If Fyrn isn't
+  installed, the window still opens and the status bar says so in
+  plain words. A turn that fails says why, in the pane, in plain
+  words.
 - **Debug report** — DUO keeps a log of what it does (events and
   timings only, never your messages). The Debug report button
-  writes one file with the app version, Ollama's status, the
+  writes one file with the app version, Fyrn's status, the
   session log, and recent errors — ready to email when something
   breaks.
 - **Phone deck** — DUO serves a small page for your phone: press
@@ -98,8 +96,10 @@ Everything in one app:
 ## What you need
 
 - Linux with Python 3.10 or newer
-- Ollama running on this computer, with at least one model pulled
-  (for example: `ollama pull qwen3.5:2b`)
+- Fyrn installed on this computer, with at least one model in its
+  models folder. Models already sitting in Ollama's store on this
+  PC are found too: Fyrn reads that store itself, so models you
+  pulled with Ollama keep working.
 - Nothing else. No accounts, no keys, no cost.
 
 ## Install (one time)
@@ -146,11 +146,8 @@ menu. (Or run `bash run.sh` from the app folder.)
   size and whether it fits this PC, in plain words, so you never have
   to guess at sizes or specs. A model that is too big is still
   selectable; the label only tells you what to expect. The Refresh
-  button reloads the list from Ollama. Under the picker is a
-  Temperature control (0.0–2.0, default 0.7, which is Ollama's own
-  default): lower is more focused, higher is more random. Each side's
-  temperature is remembered between runs. The fields explain
-  themselves in plain words next to the control — temperature, the
+  button reloads the list from Fyrn. The fields explain
+  themselves in plain words next to the control — the
   relay rows, the instructions editor, and the task controls all
   say what they do, right where you look at them.
 - Send to A talks only to the left model. Send to B talks only to the
@@ -193,7 +190,7 @@ menu. (Or run `bash run.sh` from the app folder.)
   next to Phone deck runs the same check on demand. When an
   update is out, a popup asks whether to install it, and DUO
   checks the download against the release's checksum first.
-- If Ollama isn't running, the pane says so in plain words.
+- If Fyrn isn't installed, the status bar says so in plain words.
 
 ## Relay
 
@@ -236,8 +233,8 @@ menu. (Or run `bash run.sh` from the app folder.)
   system-prompt field for that side. Whatever you type there is sent
   as the system message for that model on every turn. Leave it empty
   for no system message.
-- Pairs: the Pair row saves the current setup — both models, both
-  temperatures, and both instruction fields — under a name, and
+- Pairs: the Pair row saves the current setup — both models and
+  both instruction fields — under a name, and
   loads it back from the dropdown. Hovering over a saved pair (or
   a relay preset) shows what loading it would set. Pairs live in
   duo-pairs.json next to the app. Nothing is saved or loaded unless
@@ -260,12 +257,13 @@ menu. (Or run `bash run.sh` from the app folder.)
   The nudge never calls the model on its own — you decide.
 - Stats: under each pane, the last completed turn's speed — tokens
   per second, time to first token, total turn time — plus how many
-  tokens the turn used ("42 out / 128 in": generated and prompt,
-  straight from Ollama) and the model's RAM from Ollama ("1.9 GB in
-  RAM", or "not loaded" when it isn't running). Dashes until a turn
-  has run; "n/a" when Ollama doesn't report a number. Underneath,
-  each pane keeps a running session total ("Session: 42 out /
-  128 in") across every generation since the app started; Clear
+  tokens the turn generated ("42 out / n/a in": Fyrn reports the
+  generated count but not a prompt count, so that half shows n/a
+  rather than a guess) and the model's RAM ("1.9 GB in
+  RAM"). Dashes until a turn
+  has run; "n/a" when the engine doesn't report a number. Underneath,
+  each pane keeps a running session total of the tokens the engine
+  reports, across every generation since the app started; Clear
   never resets it. Beside the session total, a small sparkline
   graphs the live tokens-per-second rate while a side generates,
   keeping the last 30 seconds of generation across turns; it
@@ -274,7 +272,7 @@ menu. (Or run `bash run.sh` from the app folder.)
 - Activity lights: each pane has a small colored light and small
   words under its stats line saying what that side is doing right
   now — grey Idle, amber while it waits (queued, waiting for
-  Ollama to answer, or a relay hop waiting for your review),
+  the model to answer, or a relay hop waiting for your review),
   green while it thinks or summarizes, red for a few seconds when
   a turn fails.
 - System meter: the status bar shows the whole machine's CPU %
@@ -427,33 +425,23 @@ GUI tests need a display or offscreen Qt plus the flag:
 DUAL_CHAT_GUI_TESTS=1 QT_QPA_PLATFORM=offscreen python3 -m unittest discover -s tests -v
 ```
 
-## When Ollama stops answering
+## When a turn fails
 
-On a slow computer Ollama can stall for a moment while it is busy
-generating. DUO handles that: a turn retries a few times with a
-pause between tries before it fails, and a relay keeps going when a
-hop succeeds on a retry. If a reply was already streaming when the
-connection dropped, the partial reply stays in the pane with a plain
-note — DUO never retries a half-streamed turn, because that would
-repeat the part you already saw.
+The engine is in the app now, so there is no server to stall or
+stop. A turn can still fail, and the pane says why in plain words:
+the model's file is gone, the model is too big for this PC's free
+memory, or something went wrong with that turn. If a reply was
+already streaming when a turn failed, the part you already saw
+stays in the pane — a failed turn is never silently re-run,
+because that would repeat it.
 
-If Ollama has genuinely stopped, the panes say so in plain words.
-Start Ollama yourself — `ollama serve` in a terminal — and try
-again. DUO never starts or stops a server: closing DUO leaves
-Ollama running exactly as it found it.
+If Fyrn is not installed, the window opens anyway and the status
+bar says so: "Fyrn is not installed on this PC. DUO runs on Fyrn,
+so install Fyrn and try again." Install Fyrn from its own
+installer, then press a pane's Refresh button.
 
 If something keeps going wrong, press Debug report (next to the save
 buttons) and send the file it writes. It holds the app version,
-Ollama's status, what DUO was doing, and the errors — never your
+Fyrn's status, what DUO was doing, and the errors — never your
 messages or your attached files. DUO also keeps a rotating log next
 to the app (`duo-debug.log`) so the last few runs are on hand.
-
-## Testing knob
-
-Point the app at a different Ollama address (for testing only):
-
-```sh
-DUAL_CHAT_OLLAMA_URL=http://127.0.0.1:11435 bash run.sh
-```
-
-Or: `bash run.sh --ollama-url http://127.0.0.1:11435`

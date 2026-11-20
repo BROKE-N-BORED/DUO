@@ -12,7 +12,7 @@ first-run guard).
 """
 import time
 
-from duo_ollama import OllamaError, check_for_update
+from duo_fyrn import EngineError
 
 
 def _qt():
@@ -108,7 +108,7 @@ class _ModelLoader:
                         signals.models_loaded.emit(models)
                     except RuntimeError:
                         pass  # Window gone; nothing left to update.
-                except OllamaError as exc:
+                except EngineError as exc:
                     if on_result is not None:
                         on_result(False, str(exc),
                                   time.monotonic() - started)
@@ -177,7 +177,9 @@ class _UpdateChecker:
     by patching dual_chat.check_for_update -- the seam the v0.28
     tests were written against, kept alive the same way the v0.25
     split kept dual_chat.shutil for its patch point. When omitted
-    the module's own check_for_update runs."""
+    duo_updater's check_for_update runs (imported lazily in the
+    thread: duo_updater imports this module, so a top-level
+    import here would be a circle)."""
 
     def __init__(self, signals, current_version, manual,
                  check_fn=None):
@@ -185,8 +187,11 @@ class _UpdateChecker:
 
         class _Thread(QThread):
             def run(self):
-                fn = (check_fn if check_fn is not None
-                      else check_for_update)
+                if check_fn is not None:
+                    fn = check_fn
+                else:
+                    from duo_updater import check_for_update
+                    fn = check_for_update
                 result = fn(current_version)
                 try:
                     signals.update_checked.emit(result, manual)

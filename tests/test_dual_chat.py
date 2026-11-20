@@ -1,5 +1,5 @@
-"""Tests for DUO. No real Ollama needed: a fake Ollama HTTP
-server (and a fake client for the GUI tests) stands in for the real one.
+"""Tests for DUO. No real Fyrn needed: a stub fyrn package
+(and a fake client for the GUI tests) stands in for the real one.
 
 Run from the project root:  python3 -m unittest discover -s tests -v
 """
@@ -27,13 +27,13 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from dual_chat import (  # noqa: E402
-    AGREEMENT_PHRASES, APP_VERSION, AWARE_TEMPLATE, CHAT_MAX_ATTEMPTS,
-    CHAT_RETRY_DELAYS, CHAT_TIMEOUT, COMPARE_PREFIX,
+    AGREEMENT_PHRASES, APP_VERSION, AWARE_TEMPLATE,
+    CHAT_TIMEOUT, COMPARE_PREFIX,
     CONVERSATION_FORMAT_VERSION, DECK_PAGE_HTML,
     DECK_PORT, ERROR_STATE_HOLD_MS,
     EXPLAIN_AGREE, EXPLAIN_INSTR, EXPLAIN_RELAY_ROW1, EXPLAIN_STOP,
     EXPLAIN_STYLE,
-    EXPLAIN_TASK, EXPLAIN_TASK_ROW, EXPLAIN_TEMP,
+    EXPLAIN_TASK, EXPLAIN_TASK_ROW,
     FIRST_RUN_HEADER, FIRST_RUN_STEP1, FIRST_RUN_STEP2, FIRST_RUN_STEP3,
     FIRST_RUN_TICK, FULL_LOG_MAX_ENTRIES,
     FULL_LOG_TRIMMED_NOTE,
@@ -41,7 +41,7 @@ from dual_chat import (  # noqa: E402
     HIST_TRANSCRIPT_MIN_HEIGHT,
     MAX_ATTACHMENTS,
     MAX_ATTACHMENT_BYTES, MODEL_FIT_RESERVE_BYTES, MSG_EMPTY,
-    MSG_MODEL_FAILED, MSG_OLLAMA_DOWN, MSG_OLLAMA_SLOW, MSG_TURN_FAILED,
+    MSG_FYRN_MISSING, MSG_MODEL_FAILED, MSG_TURN_FAILED,
     MSG_PHONE_BUSY, MSG_PHONE_RELAY, MSG_PHONE_TARGET,
     MSG_UPDATE_AVAILABLE, MSG_UPDATE_DOWNLOADING, MSG_UPDATE_FAILED,
     MSG_UPDATE_LATEST, MSG_UPDATE_PENDING,
@@ -49,7 +49,7 @@ from dual_chat import (  # noqa: E402
     SETTING_ENTER_TO_SEND,
     SETTING_FIRST_RUN_DONE,
     SETTING_HIST_SPLITTER_STATE,
-    SETTING_SPLITTER_STATE, SETTING_TEMPERATURE,
+    SETTING_SPLITTER_STATE,
     SETTING_WINDOW_GEOMETRY,
     SIDE_COLORS,
     SIDE_STATES,
@@ -58,13 +58,12 @@ from dual_chat import (  # noqa: E402
     TASK_CONTINUE_TEMPLATE, TASK_FOLLOW_UPS, TASK_REVIEW_TEMPLATE,
     TASK_REVISE_TEMPLATE, TASK_ROUNDS_DEFAULT, TASK_ROUNDS_MAX,
     TASK_ROUNDS_MIN,
-    TEMPERATURE_DEFAULT, TEMPERATURE_MAX, TEMPERATURE_MIN,
     UPDATE_CHECK_TIMEOUT, UPDATE_CHECK_URL, UPDATE_CHECK_URL_ENV,
     AttachmentError, Cancelled,
     ChatMessage, ChatSide, Conversation, ConversationError, DeckServer,
     HISTORY_BUDGET_CHARS,
     NoModelSelected,
-    OllamaClient, OllamaError, RelaySession,
+    EngineError, FyrnClient, RelaySession,
     SUMMARY_KEEP_LAST, SUMMARY_LABEL, SUMMARIZE_PROMPT, SerialRunner,
     SingleInstance,
     TaskSession, TranscriptError, append_full_log_entry, attachment_tag,
@@ -89,9 +88,8 @@ from dual_chat import (  # noqa: E402
     model_fits,
     notify_existing,
     parse_cpu_times, parse_meminfo,
-    parse_ollama_list_output, parse_ps_payload,
-    parse_side_transcript, parse_stop_phrases, parse_tags_payload,
-    parse_tags_sizes, parse_version, phrase_is_whole_reply,
+    parse_side_transcript, parse_stop_phrases,
+    parse_version, phrase_is_whole_reply,
     phrase_matches,
     read_system_meter, read_total_ram,
     render_qr_pixmap,
@@ -108,7 +106,6 @@ from duo_storage import (  # noqa: E402
     delete_pair, delete_preset, is_valid_preset, load_pairs,
     load_presets, pair_tooltip, pairs_path, preset_tooltip,
     presets_file_corrupt, presets_path, save_pair, save_preset,
-    valid_temperature,
 )
 
 import duo_updater  # noqa: E402  (the v0.55 self-update module)
@@ -125,126 +122,16 @@ TEST_LOGGER = make_debug_logger(log_dir=_TEST_LOG_DIR)
 # Fake Ollama server
 # ---------------------------------------------------------------------------
 
-class FakeOllamaHandler(BaseHTTPRequestHandler):
-    models = ["fake-a:latest", "fake-b:latest"]
-    # model -> size in bytes, as /api/tags reports it.
-    model_sizes = {"fake-a:latest": 1100000000,
-                   "fake-b:latest": 8500000000}
-    # model -> list of streamed chunks
-    replies = {
-        "fake-a:latest": ["Hello ", "from A."],
-        "fake-b:latest": ["Hello ", "from B."],
-    }
-    # Every /api/chat request body received, in order. Tests that
-    # assert on the wire (e.g. the options tests) clear it first.
-    bodies = []
-    protocol_version = "HTTP/1.1"
-
-    def log_message(self, *args):
-        pass
-
-    def _send_json(self, payload, status=200):
-        body = json.dumps(payload).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def do_GET(self):
-        if self.path == "/api/tags":
-            self._send_json({"models": [
-                {"name": n, "size": self.model_sizes.get(n)}
-                for n in self.models]})
-        elif self.path == "/api/ps":
-            self._send_json({"models": [
-                {"name": "fake-a:latest", "size": 1900000000},
-                {"name": "fake-b:latest", "size": 1500000000},
-            ]})
-        else:
-            self._send_json({"error": "not found"}, status=404)
-
-    def do_POST(self):
-        if self.path != "/api/chat":
-            self._send_json({"error": "not found"}, status=404)
-            return
-        length = int(self.headers.get("Content-Length") or 0)
-        payload = json.loads(self.rfile.read(length).decode("utf-8"))
-        FakeOllamaHandler.bodies.append(payload)
-        model = payload.get("model")
-        if model not in self.replies:
-            self._send_json(
-                {"error": "model '%s' not found" % model}, status=404)
-            return
-        self.send_response(200)
-        self.send_header("Content-Type", "application/x-ndjson")
-        self.end_headers()
-        try:
-            for chunk in self.replies[model]:
-                line = json.dumps(
-                    {"message": {"role": "assistant", "content": chunk},
-                     "done": False}).encode("utf-8") + b"\n"
-                self.wfile.write(line)
-                self.wfile.flush()
-                time.sleep(0.01)
-            self.wfile.write(
-                json.dumps({"message": {"role": "assistant", "content": ""},
-                            "done": True, "done_reason": "stop",
-                            "eval_count": 20,
-                            "eval_duration": 1000000000,
-                            "prompt_eval_count": 128,
-                            "prompt_eval_duration": 200000000,
-                            "total_duration": 1500000000}
-                           ).encode("utf-8") + b"\n")
-            self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError):
-            pass  # Client cancelled mid-stream; expected in cancel tests.
 
 
-def start_fake_server():
-    server = ThreadingHTTPServer(("127.0.0.1", 0), FakeOllamaHandler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    return server, "http://127.0.0.1:%d" % server.server_address[1]
 
 
 # ---------------------------------------------------------------------------
 # Parsing
 # ---------------------------------------------------------------------------
 
-class ParseTagsTests(unittest.TestCase):
-    def test_names_sorted(self):
-        payload = {"models": [{"name": "b:2b"}, {"name": "a:2b"}]}
-        self.assertEqual(parse_tags_payload(payload), ["a:2b", "b:2b"])
-
-    def test_empty_and_missing(self):
-        self.assertEqual(parse_tags_payload({}), [])
-        self.assertEqual(parse_tags_payload({"models": []}), [])
-        self.assertEqual(parse_tags_payload({"models": [{"size": 1}]}), [])
 
 
-class ParseTagsSizesTests(unittest.TestCase):
-    """v0.33 (redesign R2): /api/tags also reports each model's size,
-    which the picker shows next to the name."""
-
-    def test_names_and_sizes_sorted(self):
-        payload = {"models": [{"name": "b:2b", "size": 2000},
-                              {"name": "a:2b", "size": 1000}]}
-        self.assertEqual(parse_tags_sizes(payload),
-                         [("a:2b", 1000), ("b:2b", 2000)])
-
-    def test_missing_or_bad_size_is_none(self):
-        payload = {"models": [{"name": "a:2b"},
-                              {"name": "b:2b", "size": "huge"},
-                              {"name": "c:2b", "size": 1000}]}
-        self.assertEqual(parse_tags_sizes(payload),
-                         [("a:2b", None), ("b:2b", None),
-                          ("c:2b", 1000)])
-
-    def test_empty_and_missing(self):
-        self.assertEqual(parse_tags_sizes({}), [])
-        self.assertEqual(parse_tags_sizes({"models": []}), [])
-        self.assertEqual(parse_tags_sizes({"models": [{"size": 1}]}), [])
 
 
 class ModelFitTests(unittest.TestCase):
@@ -320,20 +207,6 @@ class ModelFitTests(unittest.TestCase):
             os.unlink(path)
 
 
-class ParseOllamaListTests(unittest.TestCase):
-    SAMPLE = """NAME                    ID              SIZE      MODIFIED
-qwen3.5:2b              abc123        1.9 GB    2 hours ago
-minicpm5:2b             def456        1.5 GB    3 days ago
-
-"""
-
-    def test_rows_parsed_header_skipped(self):
-        self.assertEqual(parse_ollama_list_output(self.SAMPLE),
-                         ["minicpm5:2b", "qwen3.5:2b"])
-
-    def test_header_only(self):
-        self.assertEqual(
-            parse_ollama_list_output("NAME  ID  SIZE  MODIFIED\n"), [])
 
 
 # ---------------------------------------------------------------------------
@@ -693,35 +566,6 @@ class TaskSessionTests(unittest.TestCase):
 # Serial runner: one at a time, in order, cancellable
 # ---------------------------------------------------------------------------
 
-class StartOllamaTests(unittest.TestCase):
-    """v0.58 (P2-53): the down state's click remedy spawns
-    `ollama serve` detached, and says False honestly when ollama
-    is missing or the spawn fails."""
-
-    def test_not_installed_returns_false(self):
-        import duo_ollama
-        with mock.patch.object(duo_ollama.shutil, "which",
-                               return_value=None):
-            self.assertFalse(duo_ollama.start_ollama())
-
-    def test_spawn_is_detached_serve(self):
-        import duo_ollama
-        popen = mock.Mock()
-        with mock.patch.object(duo_ollama.shutil, "which",
-                               return_value="/usr/bin/ollama"), \
-                mock.patch.object(duo_ollama.subprocess, "Popen", popen):
-            self.assertTrue(duo_ollama.start_ollama())
-        args, kwargs = popen.call_args
-        self.assertEqual(args[0], ["/usr/bin/ollama", "serve"])
-        self.assertTrue(kwargs["start_new_session"])
-
-    def test_spawn_failure_returns_false(self):
-        import duo_ollama
-        with mock.patch.object(duo_ollama.shutil, "which",
-                               return_value="/usr/bin/ollama"), \
-                mock.patch.object(duo_ollama.subprocess, "Popen",
-                                  side_effect=OSError("nope")):
-            self.assertFalse(duo_ollama.start_ollama())
 
 
 class SerialRunnerTests(unittest.TestCase):
@@ -745,13 +589,13 @@ class SerialRunnerTests(unittest.TestCase):
         done = threading.Event()
 
         def fn(emit, cancel_event):
-            raise OllamaError(MSG_OLLAMA_DOWN)
+            raise EngineError(MSG_FYRN_MISSING)
 
         runner = SerialRunner(
             on_error=lambda j, m: (errors.append(m), done.set()))
         runner.submit("A", fn)
         self.assertTrue(done.wait(timeout=5))
-        self.assertEqual(errors, [MSG_OLLAMA_DOWN])
+        self.assertEqual(errors, [MSG_FYRN_MISSING])
 
     def test_jobs_run_one_at_a_time_in_order(self):
         events = []
@@ -856,7 +700,7 @@ class SerialRunnerTests(unittest.TestCase):
         done = threading.Event()
 
         def fn(emit, cancel_event):
-            raise OllamaError("Ollama isn't running.")
+            raise EngineError("Ollama isn't running.")
 
         runner = SerialRunner(
             on_error=lambda j, msg: errors.append(msg),
@@ -867,122 +711,9 @@ class SerialRunnerTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Ollama client against the fake server
+# Fyrn client against the stub fyrn package
 # ---------------------------------------------------------------------------
 
-class OllamaClientTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.server, cls.url = start_fake_server()
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.server.shutdown()
-        cls.server.server_close()
-
-    def test_list_models(self):
-        client = OllamaClient(self.url)
-        self.assertEqual(client.list_models(), ["fake-a:latest", "fake-b:latest"])
-
-    def test_list_models_with_sizes(self):
-        # v0.33 (redesign R2): sizes ride along with the names.
-        client = OllamaClient(self.url)
-        self.assertEqual(
-            client.list_models_with_sizes(),
-            [("fake-a:latest", 1100000000),
-             ("fake-b:latest", 8500000000)])
-
-    def test_chat_stream_collects_chunks(self):
-        client = OllamaClient(self.url)
-        seen = []
-        full = client.chat_stream(
-            "fake-a:latest", [{"role": "user", "content": "hi"}],
-            seen.append, threading.Event())
-        self.assertEqual(full, "Hello from A.")
-        self.assertEqual(seen, ["Hello ", "from A."])
-
-    def test_chat_stream_sends_options(self):
-        FakeOllamaHandler.bodies.clear()
-        client = OllamaClient(self.url)
-        full = client.chat_stream(
-            "fake-a:latest", [{"role": "user", "content": "hi"}],
-            lambda t: None, threading.Event(),
-            options={"temperature": 1.4})
-        self.assertEqual(full, "Hello from A.")
-        self.assertEqual(len(FakeOllamaHandler.bodies), 1)
-        self.assertEqual(FakeOllamaHandler.bodies[0].get("options"),
-                         {"temperature": 1.4})
-
-    def test_chat_stream_without_options_sends_no_options_key(self):
-        FakeOllamaHandler.bodies.clear()
-        client = OllamaClient(self.url)
-        client.chat_stream(
-            "fake-a:latest", [{"role": "user", "content": "hi"}],
-            lambda t: None, threading.Event())
-        self.assertEqual(len(FakeOllamaHandler.bodies), 1)
-        self.assertNotIn("options", FakeOllamaHandler.bodies[0])
-
-    def test_chat_stream_unknown_model_plain_error(self):
-        client = OllamaClient(self.url)
-        with self.assertRaises(OllamaError) as ctx:
-            client.chat_stream(
-                "nope:latest", [{"role": "user", "content": "hi"}],
-                lambda t: None, threading.Event())
-        self.assertNotIn("Traceback", str(ctx.exception))
-        self.assertIn("couldn't be loaded", str(ctx.exception))
-
-    def test_chat_stream_cancel_midway(self):
-        client = OllamaClient(self.url)
-        event = threading.Event()
-        event.set()  # cancelled before the first chunk is read
-        with self.assertRaises(Cancelled):
-            client.chat_stream(
-                "fake-a:latest", [{"role": "user", "content": "hi"}],
-                lambda t: None, event)
-
-    def test_ollama_down_plain_error(self):
-        client = OllamaClient("http://127.0.0.1:9")  # nothing listens here
-        with mock.patch("dual_chat.shutil.which", return_value=None):
-            with self.assertRaises(OllamaError) as ctx:
-                client.list_models()
-        self.assertIn("isn't running", str(ctx.exception))
-        with self.assertRaises(OllamaError) as ctx:
-            client.chat_stream(
-                "fake-a:latest", [{"role": "user", "content": "hi"}],
-                lambda t: None, threading.Event())
-        self.assertIn("isn't running", str(ctx.exception))
-
-    def test_chat_stream_reports_metrics(self):
-        client = OllamaClient(self.url)
-        seen = {}
-        full = client.chat_stream(
-            "fake-a:latest", [{"role": "user", "content": "hi"}],
-            lambda t: None, threading.Event(),
-            on_metrics=seen.update)
-        self.assertEqual(full, "Hello from A.")
-        # The done chunk's timing fields, exactly as the server sent them.
-        self.assertEqual(seen["eval_count"], 20)
-        self.assertEqual(seen["eval_duration_ns"], 1000000000)
-        self.assertEqual(seen["prompt_eval_count"], 128)
-        self.assertEqual(seen["prompt_eval_duration_ns"], 200000000)
-        self.assertEqual(seen["total_duration_ns"], 1500000000)
-        # Client-side timing is measured, not canned: present, sane.
-        self.assertIsNotNone(seen["ttft_s"])
-        self.assertGreaterEqual(seen["ttft_s"], 0)
-        self.assertIsNotNone(seen["total_s"])
-        self.assertGreaterEqual(seen["total_s"], seen["ttft_s"])
-
-    def test_running_models(self):
-        client = OllamaClient(self.url)
-        self.assertEqual(client.running_models(),
-                         {"fake-a:latest": 1900000000,
-                          "fake-b:latest": 1500000000})
-
-    def test_running_models_down_plain_error(self):
-        client = OllamaClient("http://127.0.0.1:9")  # nothing listens here
-        with self.assertRaises(OllamaError) as ctx:
-            client.running_models()
-        self.assertIn("isn't running", str(ctx.exception))
 
 
 # ---------------------------------------------------------------------------
@@ -990,14 +721,15 @@ class OllamaClientTests(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class FakeGuiClient:
-    """Stands in for OllamaClient in the GUI tests.
+    """Stands in for FyrnClient in the GUI tests.
 
     ``replies`` maps a model to a scripted list of replies, consumed in
     order (the last one repeats). ``messages_seen`` records every messages
     list the app sent, deep-copied, so relay tests can assert the exact
     text each model received. ``options_seen`` records the options dict
-    passed with each turn, so temperature tests can assert what each
-    side transmitted. ``max_active`` proves generations never
+    passed with each turn (always empty since v0.59: the FYRN
+    engine takes no per-turn options). ``max_active`` proves
+    generations never
     overlap. ``metrics`` maps a model to canned timing values reported
     through on_metrics (a default set is used when a model has none);
     ``ps`` maps a model name to its canned size in bytes for
@@ -1248,14 +980,14 @@ class GuiTests(unittest.TestCase):
                          .toPlainText(), "")
 
     def test_ollama_down_shows_plain_error(self):
-        from dual_chat import OllamaError, build_window
+        from dual_chat import EngineError, build_window
 
         class DownClient:
             def list_models(self, timeout=5):
-                raise OllamaError("Ollama isn't running.")
+                raise EngineError("Ollama isn't running.")
 
             def chat_stream(self, *a, **k):
-                raise OllamaError("Ollama isn't running.")
+                raise EngineError("Ollama isn't running.")
 
         window = build_window(DownClient(), logger=TEST_LOGGER)
         try:
@@ -1808,15 +1540,6 @@ class StatsMathTests(unittest.TestCase):
         self.assertEqual(format_session_line({"out": 42, "in": 128}),
                          "Session: 42 out / 128 in")
 
-    def test_parse_ps_payload(self):
-        self.assertEqual(parse_ps_payload(
-            {"models": [{"name": "a:2b", "size": 1900000000},
-                        {"name": "b:2b", "size": 512000000}]}),
-            {"a:2b": 1900000000, "b:2b": 512000000})
-        self.assertEqual(parse_ps_payload({}), {})
-        self.assertEqual(parse_ps_payload({"models": []}), {})
-        self.assertEqual(parse_ps_payload({"models": [{"name": "a:2b"}]}), {})
-        self.assertEqual(parse_ps_payload({"models": [{"size": 5}]}), {})
 
     def test_format_ram(self):
         self.assertEqual(format_ram(1900000000), "1.9 GB")
@@ -1939,41 +1662,34 @@ class PairsTests(unittest.TestCase):
                      if n.startswith(".duo-pairs-")]
         self.assertEqual(leftovers, [])
 
-    def test_valid_temperature(self):
-        # v0.41 (redesign R6): only real numbers load as temperatures.
-        # A hand-edited pairs file can hold anything; the loader must
-        # never hand the spinbox a value it can't take.
-        self.assertEqual(valid_temperature(0.3), 0.3)
-        self.assertEqual(valid_temperature(1), 1.0)
-        self.assertEqual(valid_temperature(2.0), 2.0)
-        for bad in (None, "0.7", True, float("nan"), float("inf"),
-                    float("-inf"), [0.7]):
-            self.assertIsNone(valid_temperature(bad))
 
     def test_pair_tooltip_shows_both_sides(self):
         # v0.41 (redesign R6): hovering a pair shows what loading it
-        # would set -- both models, both temperatures, and the
-        # instructions preview. No em-dash: tooltips are visible UI.
+        # would set -- both models and the instructions preview.
+        # v0.59: a pair saved by an older DUO also holds
+        # temperatures; the FYRN engine has no temperature knob, so
+        # those keys are ignored and never promised in the tooltip.
+        # No em-dash: tooltips are visible UI.
         setup = {"model_a": "fake-a:latest", "model_b": "fake-b:latest",
                  "temperature_a": 0.3, "temperature_b": 1.4,
                  "instruction_a": "Be brief.",
                  "instruction_b": "Be thorough."}
         self.assertEqual(pair_tooltip(setup), (
-            "Model A: fake-a:latest, temperature 0.3\n"
+            "Model A: fake-a:latest\n"
             "Instructions: Be brief.\n"
-            "Model B: fake-b:latest, temperature 1.4\n"
+            "Model B: fake-b:latest\n"
             "Instructions: Be thorough."))
         self.assertNotIn("\u2014", pair_tooltip(setup))
 
     def test_pair_tooltip_old_format_says_unchanged(self):
-        # A pair saved before temperatures were stored: the missing
+        # A pair saved before instructions were stored: the missing
         # keys read as "unchanged", never as a reset.
         text = pair_tooltip({"model_a": "fake-a:latest",
                              "model_b": "fake-b:latest"})
         self.assertEqual(text, (
-            "Model A: fake-a:latest, temperature unchanged\n"
+            "Model A: fake-a:latest\n"
             "Instructions: unchanged\n"
-            "Model B: fake-b:latest, temperature unchanged\n"
+            "Model B: fake-b:latest\n"
             "Instructions: unchanged"))
         self.assertNotIn("\u2014", text)
 
@@ -1983,17 +1699,18 @@ class PairsTests(unittest.TestCase):
                              "instruction_a": "x" * 80,
                              "instruction_b": ""})
         self.assertIn("Instructions: " + "x" * 60 + "...", text)
-        self.assertIn("Model B: no model picked, temperature 0.7", text)
+        self.assertIn("Model B: no model picked", text)
         self.assertIn("Instructions: no instructions", text)
         self.assertNotIn("\u2014", text)
 
-    def test_pair_tooltip_garbage_temperature_says_unchanged(self):
+    def test_pair_tooltip_garbage_temperature_ignored(self):
         text = pair_tooltip({"model_a": "a", "model_b": "b",
                              "temperature_a": "hot",
                              "temperature_b": float("nan"),
                              "instruction_a": "", "instruction_b": ""})
-        self.assertIn("Model A: a, temperature unchanged", text)
-        self.assertIn("Model B: b, temperature unchanged", text)
+        self.assertIn("Model A: a", text)
+        self.assertIn("Model B: b", text)
+        self.assertNotIn("temperature", text)
 
 
 class RelayPresetTests(unittest.TestCase):
@@ -2531,19 +2248,16 @@ class DirectorGuiTests(unittest.TestCase):
     def test_pairs_save_load_round_trip(self):
         self.state["widgets"]["A"]["instr_edit"].setPlainText("Be brief.")
         self.state["widgets"]["B"]["instr_edit"].setPlainText("Be thorough.")
-        # v0.41 (redesign R6): temperatures follow the pair too.
-        # Set them explicitly: QSettings persists them between tests,
-        # so the saved values must not depend on test order.
-        self.state["widgets"]["A"]["temperature"].setValue(0.3)
-        self.state["widgets"]["B"]["temperature"].setValue(1.4)
         self.state["pair_name"].setText("work pair")
         self.state["pair_save"].click()
         self.app.processEvents()
         with open(self.pairs_file, "r", encoding="utf-8") as fh:
             on_disk = json.load(fh)
+        # v0.59: pairs hold models and instructions only. The FYRN
+        # engine has no temperature knob, so no temperature keys are
+        # saved anymore.
         self.assertEqual(on_disk, {"pairs": {"work pair": {
             "model_a": "fake-a:latest", "model_b": "fake-b:latest",
-            "temperature_a": 0.3, "temperature_b": 1.4,
             "instruction_a": "Be brief.",
             "instruction_b": "Be thorough."}}})
         combo = self.state["pair_combo"]
@@ -2552,8 +2266,6 @@ class DirectorGuiTests(unittest.TestCase):
         # Change everything, then load the pair back from the dropdown.
         self.state["widgets"]["A"]["picker"].setCurrentIndex(1)
         self.state["widgets"]["B"]["picker"].setCurrentIndex(0)
-        self.state["widgets"]["A"]["temperature"].setValue(1.9)
-        self.state["widgets"]["B"]["temperature"].setValue(0.1)
         self.state["widgets"]["A"]["instr_edit"].setPlainText("")
         self.state["widgets"]["B"]["instr_edit"].setPlainText("")
         self.app.processEvents()
@@ -2564,10 +2276,6 @@ class DirectorGuiTests(unittest.TestCase):
         self.assertEqual(convo.sides["A"].model, "fake-a:latest")
         self.assertEqual(convo.sides["B"].model, "fake-b:latest")
         self.assertEqual(
-            self.state["widgets"]["A"]["temperature"].value(), 0.3)
-        self.assertEqual(
-            self.state["widgets"]["B"]["temperature"].value(), 1.4)
-        self.assertEqual(
             self.state["widgets"]["A"]["instr_edit"].toPlainText(),
             "Be brief.")
         self.assertEqual(
@@ -2576,23 +2284,14 @@ class DirectorGuiTests(unittest.TestCase):
         # Re-picking the pair that is already selected still loads it:
         # change the setup again and activate the same dropdown item.
         self.state["widgets"]["A"]["picker"].setCurrentIndex(1)
-        self.state["widgets"]["A"]["temperature"].setValue(2.0)
         self.state["widgets"]["A"]["instr_edit"].setPlainText("Changed.")
         self.app.processEvents()
         combo.activated.emit(0)
         self.app.processEvents()
         self.assertEqual(convo.sides["A"].model, "fake-a:latest")
         self.assertEqual(
-            self.state["widgets"]["A"]["temperature"].value(), 0.3)
-        self.assertEqual(
             self.state["widgets"]["A"]["instr_edit"].toPlainText(),
             "Be brief.")
-        # Leave the persisted temperatures at the defaults, so no
-        # later test inherits this test's values.
-        self.state["widgets"]["A"]["temperature"].setValue(
-            TEMPERATURE_DEFAULT)
-        self.state["widgets"]["B"]["temperature"].setValue(
-            TEMPERATURE_DEFAULT)
 
     def test_pairs_nothing_loaded_by_default(self):
         save_pair(self.pairs_file, "work pair",
@@ -3895,7 +3594,7 @@ class TaskRoundsGuiTests(unittest.TestCase):
                         self.messages_seen.append(
                             (model, copy.deepcopy(messages)))
                     on_chunk("partial ")
-                    raise OllamaError(MSG_OLLAMA_SLOW)
+                    raise EngineError(MSG_TURN_FAILED)
                 return super().chat_stream(
                     model, messages, on_chunk, cancel_event, timeout,
                     on_metrics, on_retry, options)
@@ -5257,426 +4956,10 @@ class FullLogCapGuiTests(unittest.TestCase):
 # v0.10: chat retry, Start Ollama, debug log layer
 # ---------------------------------------------------------------------------
 
-class FlakyOllamaHandler(FakeOllamaHandler):
-    """Fake Ollama that fails /api/chat in scripted ways.
-
-    mode "fail_n": drop the first fail_n /api/chat requests (close the
-    connection without answering), then serve normally.
-    mode "fail_always": drop every /api/chat request. /api/tags still
-    answers, so the probe says Ollama is up.
-    mode "drop_after_two": stream two chunks, then cut the connection.
-    mode "error_first": answer 200 with an error chunk before any
-    content -- the model failed to start.
-    mode "error_after_two": stream two chunks, then an error chunk
-    -- the turn failed mid-stream (v0.58, P2-52).
-    mode "llama_500_n": answer the first fail_n /api/chat requests
-    with HTTP 500 "timed out waiting for llama-server to start"
-    (Ollama's transient start timeout), then serve normally.
-    mode "tags_fail": drop every /api/tags request; /api/chat serves
-    normally -- a broken tags endpoint must not poison a chat.
-    mode "tags_fail_n": drop the first fail_n /api/tags requests,
-    then serve normally.
-    mode "chat_and_tags_fail": drop every /api/chat and every
-    /api/tags request -- both endpoints down at once.
-    mode "stall": answer 200, then send nothing for 60 s -- the
-    server went quiet mid-turn. The client must notice Stop
-    (v0.52) or the silence budget, not hang on the read.
-    mode "stall_after_two": stream two chunks, then go quiet for
-    60 s -- content already streamed, then the stall.
-    mode "slow_dribble": stream the chunks 1 s apart -- slower
-    than a patched short read window, faster than the silence
-    budget. The turn must still succeed.
-    chat_posts counts the /api/chat requests the server saw;
-    tags_gets counts the /api/tags requests.
-    """
-
-    mode = "fail_n"
-    fail_n = 0
-    chat_posts = 0
-    tags_gets = 0
-
-    def _drop(self):
-        # RST, not a clean FIN: a clean close after content would look
-        # like a finished stream, and the client must see a failure.
-        try:
-            self.connection.setsockopt(
-                socket.SOL_SOCKET, socket.SO_LINGER,
-                struct.pack("ii", 1, 0))
-        except OSError:
-            pass
-        self.close_connection = True
-        try:
-            self.connection.close()
-        except OSError:
-            pass
-
-    def do_GET(self):
-        if self.path == "/api/tags":
-            type(self).tags_gets += 1
-            if self.mode in ("tags_fail", "chat_and_tags_fail"):
-                self._drop()
-                return
-            if (self.mode == "tags_fail_n"
-                    and type(self).tags_gets <= self.fail_n):
-                self._drop()
-                return
-        return super().do_GET()
-
-    def do_POST(self):
-        if self.path != "/api/chat":
-            return super().do_POST()
-        type(self).chat_posts += 1
-        if self.mode == "fail_always":
-            self._drop()
-            return
-        if self.mode == "chat_and_tags_fail":
-            self._drop()
-            return
-        if self.mode == "fail_n" and type(self).chat_posts <= self.fail_n:
-            self._drop()
-            return
-        if self.mode == "llama_500_n" and type(self).chat_posts <= self.fail_n:
-            # Read the body first so the client sees a clean 500,
-            # not a reset.
-            length = int(self.headers.get("Content-Length") or 0)
-            self.rfile.read(length)
-            self._send_json(
-                {"error": "timed out waiting for llama-server to start"},
-                status=500)
-            return
-        if self.mode == "drop_after_two":
-            # Stream two chunks without reading the request body, give
-            # the client a moment to read them, then cut the stream.
-            self.send_response(200)
-            self.send_header("Content-Type", "application/x-ndjson")
-            self.end_headers()
-            for chunk in ("Hello ", "from A."):
-                line = json.dumps(
-                    {"message": {"role": "assistant", "content": chunk},
-                     "done": False}).encode("utf-8") + b"\n"
-                self.wfile.write(line)
-            self.wfile.flush()
-            time.sleep(0.2)
-            self._drop()
-            return
-        if self.mode in ("error_first", "error_after_two"):
-            self.send_response(200)
-            self.send_header("Content-Type", "application/x-ndjson")
-            self.end_headers()
-            if self.mode == "error_after_two":
-                for chunk in ("Hello ", "from A."):
-                    line = json.dumps(
-                        {"message": {"role": "assistant",
-                                     "content": chunk},
-                         "done": False}).encode("utf-8") + b"\n"
-                    self.wfile.write(line)
-            line = json.dumps(
-                {"error": "the model blew up"}).encode("utf-8") + b"\n"
-            self.wfile.write(line)
-            self.wfile.flush()
-            return
-        if self.mode == "stall":
-            # Headers out, then nothing: read the body first so
-            # the request is complete, then sleep longer than any
-            # test's patience. The handler thread is a daemon; the
-            # client's cancel or silence budget ends the turn.
-            length = int(self.headers.get("Content-Length") or 0)
-            self.rfile.read(length)
-            self.send_response(200)
-            self.send_header("Content-Type", "application/x-ndjson")
-            self.end_headers()
-            self.wfile.flush()
-            time.sleep(60)
-            return
-        if self.mode == "stall_after_two":
-            length = int(self.headers.get("Content-Length") or 0)
-            self.rfile.read(length)
-            self.send_response(200)
-            self.send_header("Content-Type", "application/x-ndjson")
-            self.end_headers()
-            for chunk in ("Hello ", "from A."):
-                line = json.dumps(
-                    {"message": {"role": "assistant", "content": chunk},
-                     "done": False}).encode("utf-8") + b"\n"
-                self.wfile.write(line)
-            self.wfile.flush()
-            time.sleep(60)
-            return
-        if self.mode == "slow_dribble":
-            length = int(self.headers.get("Content-Length") or 0)
-            self.rfile.read(length)
-            self.send_response(200)
-            self.send_header("Content-Type", "application/x-ndjson")
-            self.end_headers()
-            for chunk in ("Hello ", "from A."):
-                line = json.dumps(
-                    {"message": {"role": "assistant", "content": chunk},
-                     "done": False}).encode("utf-8") + b"\n"
-                self.wfile.write(line)
-                self.wfile.flush()
-                time.sleep(1.0)
-            self.wfile.write(
-                json.dumps({"message": {"role": "assistant", "content": ""},
-                            "done": True, "done_reason": "stop",
-                            "eval_count": 20,
-                            "eval_duration": 1000000000,
-                            "prompt_eval_count": 128,
-                            "prompt_eval_duration": 200000000,
-                            "total_duration": 1500000000}
-                           ).encode("utf-8") + b"\n")
-            self.wfile.flush()
-            return
-        return super().do_POST()
 
 
-def start_flaky_server(mode, fail_n=0):
-    """A fake Ollama server with the given failure mode. Returns
-    (server, handler_class, url); the caller shuts the server down."""
-    class Flaky(FlakyOllamaHandler):
-        pass
-
-    Flaky.mode = mode
-    Flaky.fail_n = fail_n
-    Flaky.chat_posts = 0
-    Flaky.tags_gets = 0
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Flaky)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    return server, Flaky, "http://127.0.0.1:%d" % server.server_address[1]
 
 
-class OllamaClientRetryTests(unittest.TestCase):
-    """Chat turns retry transient failures -- and only those."""
-
-    def setUp(self):
-        # Fast backoff in tests; the production pauses are seconds.
-        # The constants live in duo_ollama since the v0.25 split --
-        # patch them there, where the client reads them.
-        self._patcher = mock.patch("duo_ollama.CHAT_RETRY_DELAYS",
-                                   (0.01, 0.01))
-        self._patcher.start()
-        self._tags_patcher = mock.patch("duo_ollama.TAGS_RETRY_DELAYS",
-                                        (0.01, 0.01))
-        self._tags_patcher.start()
-        self._servers = []
-
-    def tearDown(self):
-        self._patcher.stop()
-        self._tags_patcher.stop()
-        for server in self._servers:
-            server.shutdown()
-            server.server_close()
-
-    def _start(self, mode, fail_n=0):
-        server, handler, url = start_flaky_server(mode, fail_n)
-        self._servers.append(server)
-        return handler, url
-
-    def test_retry_succeeds_after_two_failures(self):
-        handler, url = self._start("fail_n", fail_n=2)
-        client = OllamaClient(url)
-        retries = []
-        seen = []
-        full = client.chat_stream(
-            "fake-a:latest", [{"role": "user", "content": "hi"}],
-            seen.append, threading.Event(),
-            on_retry=lambda a, d, k: retries.append((a, d, k)))
-        self.assertEqual(full, "Hello from A.")
-        self.assertEqual(seen, ["Hello ", "from A."])
-        self.assertEqual(handler.chat_posts, 3)
-        self.assertEqual([attempt for attempt, _, _ in retries], [1, 2])
-
-    def test_retry_exhausted_when_ollama_down(self):
-        client = OllamaClient("http://127.0.0.1:9")  # nothing listens
-        with self.assertRaises(OllamaError) as ctx:
-            client.chat_stream(
-                "fake-a:latest", [{"role": "user", "content": "hi"}],
-                lambda t: None, threading.Event())
-        self.assertEqual(str(ctx.exception), MSG_OLLAMA_DOWN)
-
-    def test_retry_exhausted_when_ollama_slow(self):
-        # The server drops every /api/chat: slow/busy, never
-        # "not running". The error comes from what the attempts
-        # failed with, not from a probe.
-        handler, url = self._start("fail_always")
-        client = OllamaClient(url)
-        with self.assertRaises(OllamaError) as ctx:
-            client.chat_stream(
-                "fake-a:latest", [{"role": "user", "content": "hi"}],
-                lambda t: None, threading.Event())
-        self.assertEqual(str(ctx.exception), MSG_OLLAMA_SLOW)
-        self.assertEqual(handler.chat_posts, CHAT_MAX_ATTEMPTS)
-
-    def test_llama_start_timeout_is_retried(self):
-        # v0.49 (Code Forge's StartFix): Ollama's transient HTTP 500
-        # "timed out waiting for llama-server to start" is retried
-        # like a dropped connection -- the turn completes instead
-        # of dying on a model that just wasn't up yet.
-        handler, url = self._start("llama_500_n", fail_n=1)
-        client = OllamaClient(url)
-        seen = []
-        full = client.chat_stream(
-            "fake-a:latest", [{"role": "user", "content": "hi"}],
-            seen.append, threading.Event())
-        self.assertEqual(full, "Hello from A.")
-        self.assertEqual(seen, ["Hello ", "from A."])
-        self.assertEqual(handler.chat_posts, 2)
-
-    def test_other_http_errors_are_not_retried(self):
-        # The retry is only for the llama-server start timeout: a
-        # real model failure (unknown model, HTTP 404) still fails
-        # at once with the model message, after one request.
-        handler, url = self._start("fail_n")
-        client = OllamaClient(url)
-        with self.assertRaises(OllamaError) as ctx:
-            client.chat_stream(
-                "no-such-model:latest",
-                [{"role": "user", "content": "hi"}],
-                lambda t: None, threading.Event())
-        self.assertEqual(str(ctx.exception), MSG_MODEL_FAILED)
-        self.assertEqual(handler.chat_posts, 1)
-
-    def test_error_chunk_before_content_is_a_model_failure(self):
-        # v0.58 (P2-52): an error chunk before any content means
-        # the model failed to start -- the load-failure words fit.
-        handler, url = self._start("error_first")
-        client = OllamaClient(url)
-        with self.assertRaises(OllamaError) as ctx:
-            client.chat_stream(
-                "fake-a:latest", [{"role": "user", "content": "hi"}],
-                lambda t: None, threading.Event())
-        self.assertEqual(str(ctx.exception), MSG_MODEL_FAILED)
-
-    def test_error_chunk_after_content_is_not_a_load_failure(self):
-        # v0.58 (P2-52): an error chunk after content streamed is a
-        # mid-turn failure; blaming the model's loading was wrong.
-        handler, url = self._start("error_after_two")
-        client = OllamaClient(url)
-        chunks = []
-        with self.assertRaises(OllamaError) as ctx:
-            client.chat_stream(
-                "fake-a:latest", [{"role": "user", "content": "hi"}],
-                chunks.append, threading.Event())
-        self.assertEqual(chunks, ["Hello ", "from A."])
-        self.assertEqual(str(ctx.exception), MSG_OLLAMA_SLOW)
-
-    def test_chat_sends_keep_alive(self):
-        # v0.49 (Code Forge's Audit B20): every chat request carries
-        # keep_alive "30m", so the model stays loaded for the
-        # session instead of unloading after Ollama's 5-minute
-        # default and paying a full reload on the next turn.
-        FakeOllamaHandler.bodies.clear()
-        _, url = self._start("fail_n")
-        client = OllamaClient(url)
-        client.chat_stream(
-            "fake-a:latest", [{"role": "user", "content": "hi"}],
-            lambda t: None, threading.Event())
-        self.assertEqual(len(FakeOllamaHandler.bodies), 1)
-        self.assertEqual(FakeOllamaHandler.bodies[0].get("keep_alive"),
-                         "30m")
-
-    def test_tags_retry_succeeds_after_two_failures(self):
-        # v0.49: the model list is retried like a turn -- two
-        # dropped /api/tags attempts under load don't lose the
-        # list, the third attempt lands it.
-        handler, url = self._start("tags_fail_n", fail_n=2)
-        client = OllamaClient(url)
-        self.assertEqual(client.list_models(),
-                         ["fake-a:latest", "fake-b:latest"])
-        self.assertEqual(handler.tags_gets, 3)
-
-    def test_chat_succeeds_when_tags_is_broken(self):
-        # v0.49: /api/tags failing under load must not poison a
-        # chat -- the tags endpoint is dead here and the turn still
-        # completes, with no error at all.
-        _, url = self._start("tags_fail")
-        client = OllamaClient(url)
-        full = client.chat_stream(
-            "fake-a:latest", [{"role": "user", "content": "hi"}],
-            lambda t: None, threading.Event())
-        self.assertEqual(full, "Hello from A.")
-
-    def test_exhausted_retries_report_slow_when_tags_also_down(self):
-        # v0.49: when the chat attempts fail AND /api/tags is down
-        # too, the error is still slow/busy -- the attempts failed
-        # with dropped connections, not refusals. The old
-        # probe-based error would have misreported this as
-        # "Ollama isn't running".
-        handler, url = self._start("chat_and_tags_fail")
-        client = OllamaClient(url)
-        with self.assertRaises(OllamaError) as ctx:
-            client.chat_stream(
-                "fake-a:latest", [{"role": "user", "content": "hi"}],
-                lambda t: None, threading.Event())
-        self.assertEqual(str(ctx.exception), MSG_OLLAMA_SLOW)
-        self.assertEqual(handler.chat_posts, CHAT_MAX_ATTEMPTS)
-
-    def test_unreachable_ollama_plain_error_without_hang(self):
-        # v0.49 (c): a genuinely unreachable Ollama still produces
-        # the plain down error -- quickly, with no traceback and no
-        # hang. Nothing listens on port 9, so every attempt is a
-        # refused connection.
-        client = OllamaClient("http://127.0.0.1:9")
-        started = time.time()
-        with self.assertRaises(OllamaError) as ctx:
-            client.chat_stream(
-                "fake-a:latest", [{"role": "user", "content": "hi"}],
-                lambda t: None, threading.Event())
-        self.assertEqual(str(ctx.exception), MSG_OLLAMA_DOWN)
-        self.assertLess(time.time() - started, 30.0)
-
-    def test_no_retry_once_content_streamed(self):
-        handler, url = self._start("drop_after_two")
-        client = OllamaClient(url)
-        seen = []
-        with self.assertRaises(OllamaError) as ctx:
-            client.chat_stream(
-                "fake-a:latest", [{"role": "user", "content": "hi"}],
-                seen.append, threading.Event())
-        self.assertEqual(str(ctx.exception), MSG_OLLAMA_SLOW)
-        self.assertEqual(seen, ["Hello ", "from A."])  # partial kept
-        self.assertEqual(handler.chat_posts, 1)  # no retry, no duplicate
-
-    def test_cancel_interrupts_backoff_sleep(self):
-        # Long pauses: Stop must end the wait at once, not sleep
-        # through it.
-        with mock.patch("duo_ollama.CHAT_RETRY_DELAYS", (30.0, 30.0)):
-            client = OllamaClient("http://127.0.0.1:9")
-            event = threading.Event()
-            outcome = {}
-
-            def run():
-                try:
-                    client.chat_stream(
-                        "fake-a:latest",
-                        [{"role": "user", "content": "hi"}],
-                        lambda t: None, event)
-                    outcome["result"] = "returned"
-                except Cancelled:
-                    outcome["result"] = "cancelled"
-                except Exception as exc:  # noqa: BLE001 - record it
-                    outcome["result"] = "error: %s" % exc
-
-            thread = threading.Thread(target=run, daemon=True)
-            started = time.monotonic()
-            thread.start()
-            time.sleep(0.3)
-            event.set()
-            thread.join(timeout=5)
-            self.assertFalse(thread.is_alive())
-            self.assertEqual(outcome.get("result"), "cancelled")
-            self.assertLess(time.monotonic() - started, 5.0)
-
-    def test_chat_timeout_matches_code_forge(self):
-        self.assertEqual(CHAT_TIMEOUT, 1800)
-        params = inspect.signature(OllamaClient.chat_stream).parameters
-        self.assertEqual(params["timeout"].default, 1800)
-
-    def test_down_and_slow_messages_are_distinct(self):
-        self.assertNotEqual(MSG_OLLAMA_DOWN, MSG_OLLAMA_SLOW)
-        self.assertIn("isn't running", MSG_OLLAMA_DOWN)
-        self.assertIn("slow or busy", MSG_OLLAMA_SLOW)
-        self.assertNotIn("isn't running", MSG_OLLAMA_SLOW)
 
 
 
@@ -5759,7 +5042,7 @@ class DebugLogGuiTests(unittest.TestCase):
         text = self._read(path)
         self.assertIn("DEBUG REPORT", text)
         self.assertIn(APP_VERSION, text)
-        self.assertIn("ollama", text.lower())
+        self.assertIn("fyrn", text.lower())
         self.assertIn("Recent actions", text)
         self.assertIn("DUO %s started" % APP_VERSION, text)
         self.assertEqual(self.state["status_label"].text(),
@@ -6061,13 +5344,14 @@ class DeckServerTests(unittest.TestCase):
 @unittest.skipUnless(os.environ.get("DUAL_CHAT_GUI_TESTS") == "1",
                      "GUI tests run with DUAL_CHAT_GUI_TESTS=1")
 class NoStartOllamaButtonGuiTests(unittest.TestCase):
-    """v0.49 removed the Start Ollama button and its spawn manager
-    outright. v0.58 (P2-53) brings back a plain button only, under
-    the no-terminal rule: it lives in the status bar, hidden while
-    Ollama is up, shown only in the down state. The v0.49 manager
-    machinery (ollama_manager, do_start_ollama, set_ollama_down)
-    stays gone. The down-state behavior itself is pinned by
-    DriveFixesGuiTests."""
+    """v0.59: the FYRN engine runs in-process, so there is no
+    service to start and no Start button of any kind. The v0.49
+    manager machinery (ollama_manager, do_start_ollama,
+    set_ollama_down) and the v0.58 Start Ollama button
+    (start_ollama_btn) all stay gone, and the per-pane Temperature
+    knobs retired with the swap (the FYRN runner has no
+    temperature control) stay gone too. The engine-missing state
+    itself is pinned by DriveFixesGuiTests."""
 
     @classmethod
     def setUpClass(cls):
@@ -6094,20 +5378,19 @@ class NoStartOllamaButtonGuiTests(unittest.TestCase):
                 return True
         return cond()
 
-    def test_start_ollama_button_hidden_while_ollama_is_up(self):
-        # The v0.49 manager keys stay gone.
+    def test_no_start_button_and_no_temperature_knobs(self):
+        # The manager keys and the button key stay gone.
         self.assertNotIn("ollama_manager", self.state)
         self.assertNotIn("do_start_ollama", self.state)
         self.assertNotIn("set_ollama_down", self.state)
-        # Exactly one Start Ollama button exists (v0.58), and with
-        # the model list loaded it stays hidden: it belongs to the
-        # down state only.
+        self.assertNotIn("start_ollama_btn", self.state)
         from PySide6 import QtWidgets
-        btn = self.state["start_ollama_btn"]
         texts = [b.text() for b in
                  self.window.findChildren(QtWidgets.QPushButton)]
-        self.assertEqual(texts.count("Start Ollama"), 1)
-        self.assertFalse(btn.isVisible())
+        self.assertNotIn("Start Ollama", texts)
+        for side in ("A", "B"):
+            self.assertNotIn("temperature",
+                             self.state["widgets"][side])
 
     def test_button_row_keeps_its_other_buttons(self):
         # The removal took only the one button: the rest of the
@@ -7788,134 +7071,10 @@ class ConversationGuiTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Temperature controls (v0.19, audit T8)
+# Token counts (the temperature controls that headed this section
+# from v0.19 retired in v0.59 with the FYRN swap)
 # ---------------------------------------------------------------------------
 
-@unittest.skipUnless(os.environ.get("DUAL_CHAT_GUI_TESTS") == "1",
-                     "GUI tests run with DUAL_CHAT_GUI_TESTS=1")
-class TemperatureGuiTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        from PySide6.QtWidgets import QApplication
-        cls.app = QApplication.instance() or QApplication([])
-        cls.client = FakeGuiClient()
-
-    def setUp(self):
-        # Temperatures are persisted per side, so clear both before
-        # every window: each test starts from the default (0.7).
-        self._clear_temperatures()
-        from dual_chat import build_window
-        self.client.reset()
-        self.window = build_window(self.client, logger=TEST_LOGGER)
-        self.window.show()
-        self.state = self.window._dual_chat
-        self._wait_for(lambda: self.state["widgets"]["A"]["picker"].count() == 2)
-        self._pick_models()
-
-    def tearDown(self):
-        self.window.close()
-        self._clear_temperatures()
-
-    def _clear_temperatures(self):
-        from PySide6.QtCore import QSettings
-        settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
-        settings.remove(SETTING_TEMPERATURE % "A")
-        settings.remove(SETTING_TEMPERATURE % "B")
-        settings.sync()
-
-    def _wait_for(self, cond, timeout=10.0):
-        from PySide6.QtTest import QTest
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            QTest.qWait(50)
-            if cond():
-                return True
-        return cond()
-
-    def _pick_models(self):
-        self.state["widgets"]["A"]["picker"].setCurrentIndex(0)
-        self.state["widgets"]["B"]["picker"].setCurrentIndex(1)
-        self.app.processEvents()
-
-    def _temp(self, side):
-        return self.state["widgets"][side]["temperature"]
-
-    def test_controls_present_and_default(self):
-        for side in ("A", "B"):
-            spin = self._temp(side)
-            self.assertTrue(spin.isVisible())
-            self.assertEqual(spin.value(), TEMPERATURE_DEFAULT)
-            self.assertEqual(spin.minimum(), TEMPERATURE_MIN)
-            self.assertEqual(spin.maximum(), TEMPERATURE_MAX)
-            self.assertEqual(spin.singleStep(), 0.1)
-            self.assertEqual(spin.decimals(), 1)
-            self.assertIn("0.7 is Ollama's default", spin.toolTip())
-
-    def test_temperature_clamps_to_range(self):
-        self._temp("A").setValue(5.0)
-        self.assertEqual(self._temp("A").value(), TEMPERATURE_MAX)
-        self._temp("A").setValue(-1.0)
-        self.assertEqual(self._temp("A").value(), TEMPERATURE_MIN)
-
-    def test_temperature_persists_across_restart(self):
-        from dual_chat import build_window
-        self._temp("A").setValue(1.3)
-        self._temp("B").setValue(0.2)
-        self.app.processEvents()
-        self.window.close()
-        self.app.processEvents()
-        window2 = build_window(self.client, logger=TEST_LOGGER)
-        try:
-            window2.show()
-            state2 = window2._dual_chat
-            self.assertTrue(self._wait_for(
-                lambda: state2["widgets"]["A"]["picker"].count() == 2))
-            self.assertEqual(
-                state2["widgets"]["A"]["temperature"].value(), 1.3)
-            self.assertEqual(
-                state2["widgets"]["B"]["temperature"].value(), 0.2)
-        finally:
-            window2.close()
-
-    def test_send_to_both_transmits_each_sides_temperature(self):
-        self._temp("A").setValue(0.3)
-        self._temp("B").setValue(1.4)
-        self.app.processEvents()
-        self.client.options_seen.clear()
-        self.state["composer"].setPlainText("Hello, both of you.")
-        self.state["send_both"].click()
-        ok = self._wait_for(lambda: (
-            len(self.state["convo"].sides["A"].messages) == 2
-            and len(self.state["convo"].sides["B"].messages) == 2),
-            timeout=15)
-        self.assertTrue(ok, "send to both should land in both panes")
-        self.assertEqual(
-            self.client.options_seen,
-            [("fake-a:latest", {"temperature": 0.3}),
-             ("fake-b:latest", {"temperature": 1.4})])
-
-    def test_relay_hops_transmit_each_sides_temperature(self):
-        self._temp("A").setValue(0.3)
-        self._temp("B").setValue(1.4)
-        self.app.processEvents()
-        self.client.options_seen.clear()
-        self.state["start_picker"].setCurrentIndex(0)  # A starts
-        self.state["cap_spin"].setValue(2)
-        self.state["mode_picker"].setCurrentIndex(0)  # Blind
-        self.state["composer"].setPlainText("Talk to each other.")
-        self.app.processEvents()
-        self.state["relay_btn"].click()
-        ok = self._wait_for(
-            lambda: self.state["relay_status"].text().startswith(
-                "Relay stopped"),
-            timeout=20)
-        self.assertTrue(ok, "relay should run and stop: %s"
-                        % self.state["relay_status"].text())
-        # Turn 1 is A's (the seed), turn 2 is B's (A's reply).
-        self.assertEqual(
-            self.client.options_seen,
-            [("fake-a:latest", {"temperature": 0.3}),
-             ("fake-b:latest", {"temperature": 1.4})])
 
 
 @unittest.skipUnless(os.environ.get("DUAL_CHAT_GUI_TESTS") == "1",
@@ -8067,7 +7226,7 @@ class TokenCountGuiTests(unittest.TestCase):
                 # v0.10 shape: the partial reply stays, the counts
                 # are withheld.
                 on_chunk("partial ")
-                raise OllamaError(MSG_OLLAMA_SLOW)
+                raise EngineError(MSG_TURN_FAILED)
 
         window = build_window(FailingClient(), logger=TEST_LOGGER)
         try:
@@ -9085,14 +8244,14 @@ class MarkdownGuiTests(unittest.TestCase):
                         frags)
 
     def test_failed_turn_stays_plain(self):
-        from dual_chat import OllamaError
+        from dual_chat import EngineError
 
         class FailingClient(FakeGuiClient):
             def chat_stream(self, model, messages, on_chunk,
                             cancel_event, timeout=1800, on_metrics=None,
                             on_retry=None, options=None):
                 on_chunk("**partial** ")
-                raise OllamaError("boom")
+                raise EngineError("boom")
 
         self.window.close()
         from dual_chat import build_window
@@ -9165,7 +8324,7 @@ class ModuleSplitTests(unittest.TestCase):
     covered by the existing tests, which import through dual_chat
     unchanged."""
 
-    MODULES = ("duo_ollama", "duo_stats", "duo_text", "duo_tasks",
+    MODULES = ("duo_fyrn", "duo_stats", "duo_text", "duo_tasks",
                "duo_markdown", "duo_model", "duo_transcript",
                "duo_storage", "duo_runner", "duo_icon", "duo_menu",
                "duo_deck", "duo_workers", "duo_debug",
@@ -9208,7 +8367,7 @@ class ModuleSplitTests(unittest.TestCase):
         import duo_menu
         import duo_model
         import duo_motion
-        import duo_ollama
+        import duo_fyrn
         import duo_pairs
         import duo_runner
         import duo_single
@@ -9234,14 +8393,12 @@ class ModuleSplitTests(unittest.TestCase):
             (dual_chat.Conversation, duo_model.Conversation),
             (dual_chat.RelaySession, duo_model.RelaySession),
             (dual_chat.NoModelSelected, duo_model.NoModelSelected),
-            (dual_chat.OllamaClient, duo_ollama.OllamaClient),
-            (dual_chat.OllamaError, duo_ollama.OllamaError),
-            (dual_chat.Cancelled, duo_ollama.Cancelled),
-            (dual_chat.CHAT_RETRY_DELAYS, duo_ollama.CHAT_RETRY_DELAYS),
-            (dual_chat.check_for_update, duo_ollama.check_for_update),
-            (dual_chat.start_ollama, duo_ollama.start_ollama),
-            (dual_chat.MSG_TURN_FAILED, duo_ollama.MSG_TURN_FAILED),
-            (dual_chat.parse_version, duo_ollama.parse_version),
+            (dual_chat.FyrnClient, duo_fyrn.FyrnClient),
+            (dual_chat.EngineError, duo_fyrn.EngineError),
+            (dual_chat.Cancelled, duo_fyrn.Cancelled),
+            (dual_chat.check_for_update, duo_updater.check_for_update),
+            (dual_chat.MSG_TURN_FAILED, duo_fyrn.MSG_TURN_FAILED),
+            (dual_chat.parse_version, duo_updater.parse_version),
             (dual_chat.SerialRunner, duo_runner.SerialRunner),
             (dual_chat.PairPresetController,
              duo_pairs.PairPresetController),
@@ -9287,19 +8444,14 @@ class ModuleSplitTests(unittest.TestCase):
             (dual_chat.SIDE_STATES, duo_constants.SIDE_STATES),
             (dual_chat.SIDE_STATES_SHORT,
              duo_constants.SIDE_STATES_SHORT),
-            (dual_chat.OLLAMA_START_WAIT_MS,
-             duo_constants.OLLAMA_START_WAIT_MS),
             (dual_chat.ERROR_STATE_HOLD_MS,
              duo_constants.ERROR_STATE_HOLD_MS),
             (dual_chat.first_run_guide_html,
              duo_constants.first_run_guide_html),
-            (dual_chat.EXPLAIN_TEMP, duo_constants.EXPLAIN_TEMP),
             (dual_chat.MSG_UPDATE_LATEST,
              duo_constants.MSG_UPDATE_LATEST),
             (dual_chat.SETTING_ENTER_TO_SEND,
              duo_constants.SETTING_ENTER_TO_SEND),
-            (dual_chat.TEMPERATURE_DEFAULT,
-             duo_constants.TEMPERATURE_DEFAULT),
             (dual_chat.HISTORY_BUDGET_CHARS,
              duo_constants.HISTORY_BUDGET_CHARS),
             (dual_chat.Sparkline, duo_sparkline.Sparkline),
@@ -9321,17 +8473,32 @@ class ModuleSplitTests(unittest.TestCase):
     def test_moved_code_still_behaves(self):
         import duo_markdown
         import duo_model
-        import duo_ollama
+        import duo_fyrn
         import duo_stats
         import duo_storage
         import duo_tasks
         import duo_text
         import duo_transcript
-        # Ollama payload parsing sorts names.
-        self.assertEqual(
-            duo_ollama.parse_tags_payload(
-                {"models": [{"name": "b"}, {"name": "a"}]}),
-            ["a", "b"])
+        # Fyrn message splitting: system text becomes the
+        # instructions, the last user turn is the prompt, and the
+        # turns between are the history.
+        instructions, history, prompt = duo_fyrn._split_messages([
+            {"role": "system", "content": "Be terse."},
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"},
+            {"role": "user", "content": "next"}])
+        self.assertEqual(instructions, "Be terse.")
+        self.assertEqual(history, [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"}])
+        self.assertEqual(prompt, "next")
+        # Embedding models cannot chat; the check never blocks a
+        # model it cannot identify.
+        self.assertTrue(duo_fyrn.is_embedding_model(
+            {"name": "nomic-embed-text:latest", "facts": {}}))
+        self.assertFalse(duo_fyrn.is_embedding_model(
+            {"name": "qwen:latest",
+             "facts": {"architecture": "qwen2"}}))
         # Stats math: 40 tokens over 2s is 20 tok/s.
         stats = duo_stats.compute_turn_stats(
             {"eval_count": 40, "eval_duration_ns": 2_000_000_000,
@@ -9921,7 +9088,7 @@ class UpdateCheckGuiTests(unittest.TestCase):
         self.check_first_result = ("newer", "0.29")
         self._build_window()
         self.assertEqual(self._message(),
-                         "Ollama connected: 2 model(s) found.")
+                         "Fyrn connected: 2 model(s) found.")
         self.check_gate.set()
         self.assertTrue(self._wait_for(
             lambda: self._message()
@@ -9934,7 +9101,7 @@ class UpdateCheckGuiTests(unittest.TestCase):
             lambda: len(self.check_calls) >= 1))
         self.app.processEvents()
         self.assertEqual(self._message(),
-                         "Ollama connected: 2 model(s) found.")
+                         "Fyrn connected: 2 model(s) found.")
 
     def test_startup_check_failed_stays_silent(self):
         self.check_first_result = ("failed", None)
@@ -9943,7 +9110,7 @@ class UpdateCheckGuiTests(unittest.TestCase):
             lambda: len(self.check_calls) >= 1))
         self.app.processEvents()
         self.assertEqual(self._message(),
-                         "Ollama connected: 2 model(s) found.")
+                         "Fyrn connected: 2 model(s) found.")
 
     def test_manual_check_latest(self):
         self._build_window()
@@ -10789,7 +9956,6 @@ class AccessibleNamesGuiTests(unittest.TestCase):
         expected = {
             "picker": "Model %s picker",
             "refresh": "Refresh Model %s list",
-            "temperature": "Temperature for Model %s",
             "instr_toggle": "Instructions for Model %s",
             "instr_edit": "Instructions text for Model %s",
             "transcript": "Conversation with Model %s",
@@ -10813,13 +9979,6 @@ class AccessibleNamesGuiTests(unittest.TestCase):
             for key, template in expected.items():
                 self.assertEqual(widgets[key].accessibleName(),
                                  template % side, (side, key))
-
-    def test_temperature_label_is_the_spinbox_buddy(self):
-        self._build_window()
-        for side in ("A", "B"):
-            widgets = self.state["widgets"][side]
-            self.assertIs(widgets["temp_label"].buddy(),
-                          widgets["temperature"])
 
     def test_composer_and_chip_stop_have_names(self):
         self._build_window()
@@ -10850,8 +10009,10 @@ class AccessibleNamesGuiTests(unittest.TestCase):
 class DriveFixesGuiTests(unittest.TestCase):
     """v0.58: the 2026-11-19 user drive's fixes -- Tab moves out of
     the text edits instead of being swallowed (P1-32), and the
-    Ollama-down state offers a Start Ollama button that starts the
-    service and re-checks (P2-53)."""
+    engine-down state is honest (P2-53). v0.59: the engine is FYRN
+    in-process, so the down state is Fyrn missing, and there is no
+    Start button: the status line says what is wrong and what to
+    do, in plain words."""
 
     @classmethod
     def setUpClass(cls):
@@ -10908,54 +10069,25 @@ class DriveFixesGuiTests(unittest.TestCase):
         self.app.processEvents()
         self.assertIsNot(self.window.focusWidget(), composer)
 
-    def test_start_ollama_button_recovers_the_model_list(self):
-        class DownOnceClient(FakeGuiClient):
-            def __init__(self):
-                super().__init__()
-                self.list_calls = 0
-
-            def list_models_with_sizes(self, timeout=5):
-                self.list_calls += 1
-                if self.list_calls == 1:
-                    raise OllamaError(MSG_OLLAMA_DOWN)
-                return super().list_models_with_sizes(timeout)
-
-        import dual_chat
-        client = DownOnceClient()
-        self._build_window(client)
-        btn = self.state["start_ollama_btn"]
-        self.assertTrue(self._wait_for(lambda: btn.isVisible()),
-                        "the down state must offer Start Ollama")
-        self.assertEqual(self.state["status_label"].text(),
-                         MSG_OLLAMA_DOWN)
-        with mock.patch.object(dual_chat, "start_ollama",
-                               return_value=True) as spawn, \
-                mock.patch.object(dual_chat, "OLLAMA_START_WAIT_MS", 10):
-            btn.click()
-            self.assertTrue(self._wait_for(
-                lambda: self.state["widgets"]["A"]["picker"].count() == 2),
-                "the model list must reload after the start")
-        spawn.assert_called_once_with()
-        self.assertFalse(btn.isVisible())
-
-    def test_start_ollama_not_installed_says_so(self):
+    def test_engine_missing_state_is_plain_and_has_no_start_button(self):
         class DownClient(FakeGuiClient):
             def list_models_with_sizes(self, timeout=5):
-                raise OllamaError(MSG_OLLAMA_DOWN)
+                raise EngineError(MSG_FYRN_MISSING)
 
-        import dual_chat
         self._build_window(DownClient())
-        btn = self.state["start_ollama_btn"]
-        self.assertTrue(self._wait_for(lambda: btn.isVisible()))
-        with mock.patch.object(dual_chat, "start_ollama",
-                               return_value=False):
-            btn.click()
-            self.app.processEvents()
+        self.assertTrue(self._wait_for(
+            lambda: self.state["status_label"].text()
+            == MSG_FYRN_MISSING),
+            "the missing state must say Fyrn is not installed")
+        self.assertNotIn("start_ollama_btn", self.state)
+        from PySide6 import QtWidgets
+        texts = [b.text() for b in
+                 self.window.findChildren(QtWidgets.QPushButton)]
+        self.assertNotIn("Start Ollama", texts)
+        # The pickers stay empty and the status is the whole story:
+        # no model can be picked while the engine is missing.
         self.assertEqual(
-            self.state["status_label"].text(),
-            "Ollama doesn't seem to be installed on this PC.")
-        self.assertTrue(btn.isVisible())
-        self.assertTrue(btn.isEnabled())
+            self.state["widgets"]["A"]["picker"].count(), 0)
 
 
 @unittest.skipUnless(os.environ.get("DUAL_CHAT_GUI_TESTS") == "1",
@@ -11251,7 +10383,7 @@ class UpdaterGuiTests(unittest.TestCase):
         self._build_window()
         self._arm_modal_clicker("Not now")
         self.assertEqual(self._message(),
-                         "Ollama connected: 2 model(s) found.")
+                         "Fyrn connected: 2 model(s) found.")
         self.check_gate.set()
         self.assertTrue(self._wait_for(
             lambda: self._message()
@@ -11523,7 +10655,7 @@ class ActivityStateTests(unittest.TestCase):
         self.assertEqual(SIDE_STATES["thinking"],
                          ("#2fbf5a", "Thinking…"))
         self.assertEqual(SIDE_STATES["waiting"],
-                         ("#e8a33d", "Waiting for Ollama…"))
+                         ("#e8a33d", "Waiting for the model…"))
         self.assertEqual(SIDE_STATES["review"],
                          ("#e8a33d", "Waiting for you to review…"))
         self.assertEqual(SIDE_STATES["error"],
@@ -11698,7 +10830,7 @@ class ActivityIndicatorGuiTests(unittest.TestCase):
                             cancel_event, timeout=1800, on_metrics=None,
                             on_retry=None, options=None):
                 on_chunk("partial ")
-                raise OllamaError(MSG_MODEL_FAILED)
+                raise EngineError(MSG_MODEL_FAILED)
 
         # The error hold is 5s in the product; the window under test
         # uses a short hold so the suite doesn't wait it out. The
@@ -11741,7 +10873,7 @@ class ActivityIndicatorGuiTests(unittest.TestCase):
                             on_retry=None, options=None):
                 if not FailOnceClient.failed:
                     FailOnceClient.failed = True
-                    raise OllamaError(MSG_MODEL_FAILED)
+                    raise EngineError(MSG_MODEL_FAILED)
                 return super().chat_stream(
                     model, messages, on_chunk, cancel_event,
                     timeout=timeout, on_metrics=on_metrics,
@@ -12258,14 +11390,10 @@ class MenuBarGuiTests(unittest.TestCase):
         self.assertTrue(self._wait_for(
             lambda: not self.window.isVisible(), timeout=10))
 
-    def test_temperature_tooltip_and_nudge_have_no_em_dash(self):
-        tip = self.state["widgets"]["A"]["temperature"].toolTip()
-        self.assertIn(
-            "0.7 is Ollama's default. Lower is more focused, "
-            "higher is more random.", tip)
-        self.assertNotIn("\u2014", tip)
+    def test_nudge_text_has_no_em_dash(self):
         nudge = self.state["widgets"]["A"]["nudge"].text()
         self.assertEqual(nudge, "History is long. Summarize?")
+        self.assertNotIn("\u2014", nudge)
 @unittest.skipUnless(os.environ.get("DUAL_CHAT_GUI_TESTS") == "1",
                      "GUI tests run with DUAL_CHAT_GUI_TESTS=1")
 class DirectorCollapseGuiTests(unittest.TestCase):
@@ -13702,9 +12830,6 @@ class FieldExplanationTests(unittest.TestCase):
 
     def test_explanation_texts_are_the_pinned_words(self):
         self.assertEqual(
-            EXPLAIN_TEMP, "Lower is more focused, higher is more "
-                          "creative.")
-        self.assertEqual(
             EXPLAIN_RELAY_ROW1,
             "Start with picks which side answers first. "
             "Turns caps the relay. "
@@ -13734,7 +12859,7 @@ class FieldExplanationTests(unittest.TestCase):
                          "font-size: 11px; color: #6b6b6b;")
 
     def test_no_explanation_has_an_em_dash(self):
-        for text in (EXPLAIN_TEMP, EXPLAIN_RELAY_ROW1, EXPLAIN_STOP,
+        for text in (EXPLAIN_RELAY_ROW1, EXPLAIN_STOP,
                      EXPLAIN_AGREE, EXPLAIN_INSTR, EXPLAIN_TASK,
                      EXPLAIN_TASK_ROW, EXPLAIN_STYLE):
             self.assertNotIn("\u2014", text)
@@ -14280,9 +13405,11 @@ class PaneIdentityGuiTests(unittest.TestCase):
 @unittest.skipUnless(os.environ.get("DUAL_CHAT_GUI_TESTS") == "1",
                      "GUI tests run with DUAL_CHAT_GUI_TESTS=1")
 class PairSettingsGuiTests(unittest.TestCase):
-    """v0.41 (redesign R6): saved pairs carry the whole setup --
-    models, temperatures, and instructions -- and hovering a pair
-    or a relay preset shows what loading it would set."""
+    """v0.41 (redesign R6): saved pairs carry the setup -- models
+    and instructions -- and hovering a pair or a relay preset
+    shows what loading it would set. v0.59: pairs saved by older
+    versions also hold temperatures; the FYRN engine has no
+    temperature knob, so those keys are ignored on load."""
 
     @classmethod
     def setUpClass(cls):
@@ -14291,9 +13418,6 @@ class PairSettingsGuiTests(unittest.TestCase):
         cls.client = FakeGuiClient()
 
     def setUp(self):
-        # Temperatures are persisted per side, so clear both before
-        # every window: each test starts from the default (0.7).
-        self._clear_temperatures()
         from dual_chat import build_window
         self.client.reset()
         self.tmp = tempfile.TemporaryDirectory()
@@ -14314,14 +13438,6 @@ class PairSettingsGuiTests(unittest.TestCase):
         self.window.close()
         self._env.stop()
         self.tmp.cleanup()
-        self._clear_temperatures()
-
-    def _clear_temperatures(self):
-        from PySide6.QtCore import QSettings
-        settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
-        settings.remove(SETTING_TEMPERATURE % "A")
-        settings.remove(SETTING_TEMPERATURE % "B")
-        settings.sync()
 
     def _wait_for(self, cond, timeout=10.0):
         from PySide6.QtTest import QTest
@@ -14337,15 +13453,10 @@ class PairSettingsGuiTests(unittest.TestCase):
         self.state["widgets"]["B"]["picker"].setCurrentIndex(1)
         self.app.processEvents()
 
-    def _temp(self, side):
-        return self.state["widgets"][side]["temperature"].value()
-
     def _instr(self, side):
         return self.state["widgets"][side]["instr_edit"].toPlainText()
 
-    def _set_setup(self, temp_a, temp_b, instr_a, instr_b):
-        self.state["widgets"]["A"]["temperature"].setValue(temp_a)
-        self.state["widgets"]["B"]["temperature"].setValue(temp_b)
+    def _set_setup(self, instr_a, instr_b):
         self.state["widgets"]["A"]["instr_edit"].setPlainText(instr_a)
         self.state["widgets"]["B"]["instr_edit"].setPlainText(instr_b)
         self.app.processEvents()
@@ -14354,8 +13465,8 @@ class PairSettingsGuiTests(unittest.TestCase):
         from PySide6.QtCore import Qt
         return combo.itemData(index, Qt.ToolTipRole)
 
-    def test_save_captures_temperatures_and_instructions(self):
-        self._set_setup(0.3, 1.4, "Be brief.", "Be thorough.")
+    def test_save_captures_models_and_instructions(self):
+        self._set_setup("Be brief.", "Be thorough.")
         self.state["pair_name"].setText("work pair")
         self.state["pair_save"].click()
         self.app.processEvents()
@@ -14363,11 +13474,12 @@ class PairSettingsGuiTests(unittest.TestCase):
             on_disk = json.load(fh)
         self.assertEqual(on_disk, {"pairs": {"work pair": {
             "model_a": "fake-a:latest", "model_b": "fake-b:latest",
-            "temperature_a": 0.3, "temperature_b": 1.4,
             "instruction_a": "Be brief.",
             "instruction_b": "Be thorough."}}})
 
-    def test_load_restores_temperatures_and_instructions(self):
+    def test_load_restores_models_and_instructions(self):
+        # The saved pair carries temperature keys from an older
+        # DUO: they load without error and are simply ignored.
         save_pair(self.pairs_file, "work pair",
                   {"model_a": "fake-a:latest", "model_b": "fake-b:latest",
                    "temperature_a": 0.3, "temperature_b": 1.4,
@@ -14377,25 +13489,23 @@ class PairSettingsGuiTests(unittest.TestCase):
         # Change everything, then load the pair from the dropdown.
         self.state["widgets"]["A"]["picker"].setCurrentIndex(1)
         self.state["widgets"]["B"]["picker"].setCurrentIndex(0)
-        self._set_setup(1.9, 0.1, "", "")
+        self._set_setup("", "")
         combo = self.state["pair_combo"]
         combo.setCurrentIndex(0)
         self.app.processEvents()
         convo = self.state["convo"]
         self.assertEqual(convo.sides["A"].model, "fake-a:latest")
         self.assertEqual(convo.sides["B"].model, "fake-b:latest")
-        self.assertEqual(self._temp("A"), 0.3)
-        self.assertEqual(self._temp("B"), 1.4)
         self.assertEqual(self._instr("A"), "Be brief.")
         self.assertEqual(self._instr("B"), "Be thorough.")
         self.assertIn("Pair 'work pair' loaded.",
                       self.state["status_label"].text())
 
     def test_old_format_pair_leaves_settings_alone(self):
-        # A pair saved before temperatures were stored holds models
-        # only. Loading it restores the models and leaves the current
-        # temperatures and instructions exactly as they are -- it
-        # must not reset them to defaults or blank them.
+        # A pair saved before instructions were stored holds models
+        # only. Loading it restores the models and leaves the
+        # current instructions exactly as they are -- it must not
+        # blank them.
         with open(self.pairs_file, "w", encoding="utf-8") as fh:
             json.dump({"pairs": {"old pair": {
                 "model_a": "fake-a:latest",
@@ -14403,21 +13513,19 @@ class PairSettingsGuiTests(unittest.TestCase):
         self.state["refresh_pair_combo"]()
         self.state["widgets"]["A"]["picker"].setCurrentIndex(1)
         self.state["widgets"]["B"]["picker"].setCurrentIndex(0)
-        self._set_setup(1.9, 0.1, "Keep me.", "Keep me too.")
+        self._set_setup("Keep me.", "Keep me too.")
         self.state["pair_combo"].setCurrentIndex(0)
         self.app.processEvents()
         convo = self.state["convo"]
         self.assertEqual(convo.sides["A"].model, "fake-a:latest")
         self.assertEqual(convo.sides["B"].model, "fake-b:latest")
-        self.assertEqual(self._temp("A"), 1.9)
-        self.assertEqual(self._temp("B"), 0.1)
         self.assertEqual(self._instr("A"), "Keep me.")
         self.assertEqual(self._instr("B"), "Keep me too.")
 
     def test_missing_model_still_restores_settings(self):
         # A pair whose model is no longer installed: the plain note
-        # still appears, and the temperatures and instructions for
-        # that side still restore -- they don't depend on the model.
+        # still appears, and the instructions for that side still
+        # restore -- they don't depend on the model.
         save_pair(self.pairs_file, "gone pair",
                   {"model_a": "gone-model:latest",
                    "model_b": "fake-b:latest",
@@ -14425,13 +13533,11 @@ class PairSettingsGuiTests(unittest.TestCase):
                    "instruction_a": "Be brief.",
                    "instruction_b": "Be thorough."})
         self.state["refresh_pair_combo"]()
-        self._set_setup(1.9, 0.1, "", "")
+        self._set_setup("", "")
         self.state["pair_combo"].setCurrentIndex(0)
         self.app.processEvents()
         self.assertIn("not installed: gone-model:latest",
                       self.state["status_label"].text())
-        self.assertEqual(self._temp("A"), 0.3)
-        self.assertEqual(self._temp("B"), 1.4)
         self.assertEqual(self._instr("A"), "Be brief.")
         self.assertEqual(self._instr("B"), "Be thorough.")
         self.assertEqual(self.state["convo"].sides["B"].model,
@@ -14446,9 +13552,9 @@ class PairSettingsGuiTests(unittest.TestCase):
         self.state["refresh_pair_combo"]()
         text = self._tooltip(self.state["pair_combo"], 0)
         self.assertEqual(text, (
-            "Model A: fake-a:latest, temperature 0.3\n"
+            "Model A: fake-a:latest\n"
             "Instructions: Be brief.\n"
-            "Model B: fake-b:latest, temperature 1.4\n"
+            "Model B: fake-b:latest\n"
             "Instructions: Be thorough."))
         self.assertNotIn("\u2014", text)
 
@@ -14535,17 +13641,20 @@ class FieldExplanationsGuiTests(unittest.TestCase):
         self.state["widgets"]["B"]["picker"].setCurrentIndex(1)
         self.app.processEvents()
 
-    def test_temperature_explanations_text_style_and_visible(self):
+    def test_instructions_explanations_text_style_and_visible(self):
+        # v0.59: the instructions explanation is the per-pane one
+        # left (the temperature row and its explanation retired
+        # with the FYRN swap).
         for side in ("A", "B"):
-            label = self.state["widgets"][side]["temp_explain"]
-            self.assertEqual(label.text(), EXPLAIN_TEMP)
+            label = self.state["widgets"][side]["instr_explain"]
+            self.assertEqual(label.text(), EXPLAIN_INSTR)
             self.assertEqual(label.styleSheet(), EXPLAIN_STYLE)
+            # The explanation lives in the Instructions section,
+            # which starts closed: expand it to see the label.
+            self.state["widgets"][side]["instr_toggle"].click()
+            self.app.processEvents()
             self.assertTrue(label.isVisible())
-            # One line: a wrapped label's size hint wraps the
-            # sentence at ~198 px and the row grows two lines
-            # tall, while the unwrapped sentence is 244 px and
-            # fits the row even at the 900 px minimum width.
-            self.assertFalse(label.wordWrap())
+            self.assertTrue(label.wordWrap())
 
     def test_relay_explanations_text_style_and_visible(self):
         relay_label = self.state["relay_explain"]
@@ -15366,7 +14475,7 @@ class MotionGuiTests(unittest.TestCase):
                             on_retry=None, options=None):
                 if not FailOnceClient.failed:
                     FailOnceClient.failed = True
-                    raise OllamaError(MSG_MODEL_FAILED)
+                    raise EngineError(MSG_MODEL_FAILED)
                 return super().chat_stream(
                     model, messages, on_chunk, cancel_event,
                     timeout=timeout, on_metrics=on_metrics,
@@ -15418,7 +14527,6 @@ class MotionGuiTests(unittest.TestCase):
             self.state["composer"], self.state["task_edit"],
             self.state["widgets"]["A"]["transcript"],
             self.state["widgets"]["A"]["search_edit"],
-            self.state["widgets"]["A"]["temperature"],
             self.state["widgets"]["A"]["picker"],
             self.state["widgets"]["A"]["hist_list"],
             self.state["widgets"]["A"]["instr_edit"],
@@ -15934,7 +15042,7 @@ class AccessibilityGuiTests(unittest.TestCase):
             for key in ("stats", "activity", "session_tokens"):
                 self.assertIn("font-size: %dpx;" % size_px,
                               widgets[side][key].styleSheet(), key)
-            for key in ("temp_explain", "instr_explain"):
+            for key in ("instr_explain",):
                 sheet = widgets[side][key].styleSheet()
                 self.assertIn("font-size: %dpx;" % size_px, sheet,
                               key)
@@ -16395,83 +15503,408 @@ class DarkPaletteGuiTests(unittest.TestCase):
             colors["search_bg"])
 
 
-class OllamaClientStallTests(unittest.TestCase):
-    """v0.52 (P0-1): Stop interrupts a stalled generation. The read
-    loop used to block up to CHAT_TIMEOUT inside one readline, so
-    Stop did nothing for up to 90 min across the three attempts.
-    Now the socket wakes every CHAT_READ_TIMEOUT seconds to check
-    Stop, and a genuine stall still fails the attempt after the
-    silence budget. The read window is patched to 0.5 s here so
-    the tests run in seconds, not minutes."""
-
-    def setUp(self):
-        self._patcher = mock.patch("duo_ollama.CHAT_RETRY_DELAYS",
-                                   (0.01, 0.01))
-        self._patcher.start()
-        self._read_patcher = mock.patch("duo_ollama.CHAT_READ_TIMEOUT",
-                                        0.5)
-        self._read_patcher.start()
-        self._servers = []
-
-    def tearDown(self):
-        self._patcher.stop()
-        self._read_patcher.stop()
-        for server in self._servers:
-            server.shutdown()
-            server.server_close()
-
-    def _start(self, mode, fail_n=0):
-        server, handler, url = start_flaky_server(mode, fail_n)
-        self._servers.append(server)
-        return handler, url
-
-    def _stream(self, url, cancel_event, timeout=None):
-        client = OllamaClient(url)
-        kwargs = {}
-        if timeout is not None:
-            kwargs["timeout"] = timeout
-        return client.chat_stream(
-            "fake-a:latest", [{"role": "user", "content": "hi"}],
-            lambda t: None, cancel_event, **kwargs)
-
-    def test_stop_interrupts_a_stalled_generation(self):
-        handler, url = self._start("stall")
-        cancel_event = threading.Event()
-        # Stop half a second into the stall: without the fix this
-        # test would hang for the 30-minute readline timeout.
-        threading.Timer(0.5, cancel_event.set).start()
-        started = time.monotonic()
-        with self.assertRaises(Cancelled):
-            self._stream(url, cancel_event)
-        self.assertLess(time.monotonic() - started, 10)
-        # A cancel is not a retryable failure: one attempt only.
-        self.assertEqual(handler.chat_posts, 1)
-
-    def test_stop_interrupts_a_stall_after_content_streamed(self):
-        handler, url = self._start("stall_after_two")
-        cancel_event = threading.Event()
-        threading.Timer(0.5, cancel_event.set).start()
-        started = time.monotonic()
-        with self.assertRaises(Cancelled):
-            self._stream(url, cancel_event)
-        self.assertLess(time.monotonic() - started, 10)
-        self.assertEqual(handler.chat_posts, 1)
-
-    def test_stall_past_the_silence_budget_fails_slow(self):
-        handler, url = self._start("stall")
-        started = time.monotonic()
-        with self.assertRaises(OllamaError) as ctx:
-            self._stream(url, threading.Event(), timeout=2)
-        self.assertEqual(str(ctx.exception), MSG_OLLAMA_SLOW)
-        # All three attempts ran their 2 s silence budget.
-        self.assertEqual(handler.chat_posts, 3)
-        self.assertLess(time.monotonic() - started, 15)
-
-    def test_slow_stream_survives_the_short_windows(self):
-        _, url = self._start("slow_dribble")
-        full = self._stream(url, threading.Event())
-        self.assertEqual(full, "Hello from A.")
 
 
 if __name__ == "__main__":
     unittest.main()
+
+
+
+# ---------------------------------------------------------------------------
+# v0.59: the FYRN backend -- finder and client against a stub fyrn
+# ---------------------------------------------------------------------------
+
+
+def _make_fake_fyrn_install(root, version="9.9"):
+    """A directory shaped like an installed Fyrn: install.sh, the
+    fyrn package with a __version__, and the venv python."""
+    import pathlib
+    root = pathlib.Path(root)
+    (root / "fyrn").mkdir(parents=True)
+    (root / ".venv" / "bin").mkdir(parents=True)
+    (root / "install.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+    (root / "fyrn" / "__init__.py").write_text(
+        '__version__ = "%s"\n' % version, encoding="utf-8")
+    python = root / ".venv" / "bin" / "python"
+    python.write_text("", encoding="utf-8")
+    python.chmod(0o755)
+    return root
+
+
+class FyrnFinderTests(unittest.TestCase):
+    """duo_fyrn.find_fyrn_install: override, launcher, home search,
+    ambiguity -- the same discovery Fyrn Chat Test proved."""
+
+    def setUp(self):
+        import duo_fyrn
+        self.mod = duo_fyrn
+        self.tmp = tempfile.TemporaryDirectory()
+        import pathlib
+        self.root = pathlib.Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_launcher_app_dir_line(self):
+        install = _make_fake_fyrn_install(self.root / "opt" / "FYRN")
+        home = self.root / "home"
+        (home / ".local" / "bin").mkdir(parents=True)
+        (home / ".local" / "bin" / "fyrn").write_text(
+            '#!/bin/sh\nAPP_DIR="%s"\n' % install, encoding="utf-8")
+        found = self.mod.find_fyrn_install(home=home, environ={})
+        self.assertEqual(found.folder, install)
+        self.assertEqual(found.version, "9.9")
+        self.assertEqual(found.python,
+                         install / ".venv" / "bin" / "python")
+
+    def test_environment_override_wins(self):
+        install = _make_fake_fyrn_install(self.root / "FYRN")
+        found = self.mod.find_fyrn_install(
+            home=self.root / "empty-home",
+            environ={"FYRN_INSTALL_DIR": str(install)})
+        self.assertEqual(found.folder, install)
+
+    def test_home_search_finds_an_install(self):
+        install = _make_fake_fyrn_install(
+            self.root / "home" / "Apps" / "FYRN")
+        found = self.mod.find_fyrn_install(
+            home=self.root / "home", environ={})
+        self.assertEqual(found.folder, install)
+
+    def test_two_installs_are_refused_not_guessed(self):
+        _make_fake_fyrn_install(self.root / "home" / "one" / "FYRN")
+        _make_fake_fyrn_install(self.root / "home" / "two" / "FYRN")
+        with self.assertRaises(self.mod.FyrnAmbiguousError):
+            self.mod.find_fyrn_install(
+                home=self.root / "home", environ={})
+
+    def test_no_install_raises_not_found(self):
+        (self.root / "home").mkdir()
+        with self.assertRaises(self.mod.FyrnNotFoundError):
+            self.mod.find_fyrn_install(
+                home=self.root / "home", environ={})
+
+    def test_incomplete_folder_is_not_an_install(self):
+        import pathlib
+        partial = self.root / "home" / "FYRN"
+        (partial / "fyrn").mkdir(parents=True)
+        (partial / "install.sh").write_text("", encoding="utf-8")
+        (partial / "fyrn" / "__init__.py").write_text(
+            "", encoding="utf-8")
+        with self.assertRaises(self.mod.FyrnNotFoundError):
+            self.mod.find_fyrn_install(
+                home=self.root / "home", environ={})
+
+    def test_models_folder_from_fyrn_settings(self):
+        home = self.root / "home"
+        conf = home / ".config" / "BrokeNBored"
+        conf.mkdir(parents=True)
+        (conf / "fyrn.conf").write_text(
+            "[General]\nmodels_folder=/data/Models\n",
+            encoding="utf-8")
+        import pathlib
+        self.assertEqual(self.mod.fyrn_models_folder(home=home),
+                         pathlib.Path("/data/Models"))
+
+    def test_models_folder_default(self):
+        import pathlib
+        home = self.root / "home"
+        home.mkdir()
+        self.assertEqual(self.mod.fyrn_models_folder(home=home),
+                         home / "Models")
+
+
+class _StubRunnerError(Exception):
+    pass
+
+
+class _StubCancelled(Exception):
+    pass
+
+
+class _StubLoadCancelled(Exception):
+    pass
+
+
+class _StubModelTooBig(Exception):
+    pass
+
+
+class _StubModelNotFound(Exception):
+    pass
+
+
+class _StubRunner:
+    def __init__(self):
+        self.tokens = ["Hello", " world"]
+        self.error = None
+        self.error_after = None
+        self.stats = {"tokens": 7, "elapsed_s": 0.5,
+                      "ttft_s": 0.1, "tokens_per_sec": 14.0}
+        self.calls = []
+
+    def generate(self, prompt, on_token, cancel_event, history=None,
+                 instructions=None, images=None, max_tokens=None):
+        self.calls.append({"prompt": prompt, "history": history,
+                           "instructions": instructions})
+        if self.error is not None and self.error_after is None:
+            raise self.error
+        for index, token in enumerate(self.tokens):
+            if cancel_event.is_set():
+                raise _StubCancelled()
+            on_token(token)
+            if self.error_after is not None \
+                    and index + 1 >= self.error_after:
+                raise self.error
+        return dict(self.stats)
+
+
+class _StubController:
+    def __init__(self, runner):
+        self.runner = runner
+        self.current_path = None
+        self.loads = []
+        self.load_error = None
+
+    def is_loaded(self):
+        return self.current_path is not None
+
+    def load(self, path, progress_cb=None, cancel_event=None,
+             display_name=None):
+        if self.load_error is not None:
+            raise self.load_error
+        self.loads.append(path)
+        self.current_path = path
+
+    def unload(self):
+        self.current_path = None
+
+
+_STUB_MODELS = [
+    {"name": "folder-a", "path": "/models/folder-a.gguf",
+     "size": 100, "source": "folder", "facts": {}},
+    {"name": "embed-x", "path": "/models/embed-x.gguf",
+     "size": 50, "source": "folder",
+     "facts": {"architecture": "bert"}},
+]
+_STUB_OLLAMA_MODELS = [
+    {"name": "ollie:7b", "path": "/ollie/ollie.gguf",
+     "size": 200, "source": "ollama", "facts": {}},
+]
+
+
+class FyrnClientTests(unittest.TestCase):
+    """FyrnClient against a stub fyrn package in sys.modules: the
+    client contract (streaming, metrics, load-on-switch, error
+    wording) without a real Fyrn or a real model."""
+
+    def setUp(self):
+        import duo_fyrn
+        self.mod = duo_fyrn
+        self.tmp = tempfile.TemporaryDirectory()
+        self.runner = _StubRunner()
+        self.controller = _StubController(self.runner)
+        runner = self.runner
+        controller = self.controller
+
+        import types
+        fyrn_pkg = types.ModuleType("fyrn")
+        core = types.ModuleType("fyrn.core")
+        core.ModelController = lambda r: controller
+        core.ModelTooBigError = _StubModelTooBig
+        core.ModelNotFoundError = _StubModelNotFound
+        core.scan_models = lambda folder: (list(_STUB_MODELS), [])
+        runner_mod = types.ModuleType("fyrn.runner")
+        runner_mod.LlamaRunner = lambda: runner
+        runner_mod.RunnerError = _StubRunnerError
+        runner_mod.GenerationCancelled = _StubCancelled
+        runner_mod.LoadCancelled = _StubLoadCancelled
+        discover = types.ModuleType("fyrn.discover")
+        discover.discover_ollama_models = \
+            lambda: (list(_STUB_OLLAMA_MODELS), [])
+        self._patchers = [
+            mock.patch.dict(sys.modules, {
+                "fyrn": fyrn_pkg, "fyrn.core": core,
+                "fyrn.runner": runner_mod, "fyrn.discover": discover}),
+            mock.patch.object(
+                self.mod, "find_fyrn_install",
+                side_effect=self.mod.FyrnNotFoundError("none")),
+            mock.patch.object(
+                self.mod, "fyrn_models_folder",
+                return_value=self.tmp.name),
+        ]
+        for patcher in self._patchers:
+            patcher.start()
+
+    def tearDown(self):
+        for patcher in reversed(self._patchers):
+            patcher.stop()
+        self.tmp.cleanup()
+
+    def _client(self):
+        return self.mod.FyrnClient()
+
+    def test_list_models_sorted_with_sizes_embeddings_out(self):
+        client = self._client()
+        self.assertEqual(client.list_models(),
+                         ["folder-a", "ollie:7b"])
+        self.assertEqual(client.list_models_with_sizes(),
+                         [("folder-a", 100), ("ollie:7b", 200)])
+
+    def test_chat_streams_and_maps_metrics(self):
+        client = self._client()
+        chunks = []
+        metrics = []
+        text = client.chat_stream(
+            "folder-a", [{"role": "user", "content": "hi"}],
+            chunks.append, threading.Event(),
+            on_metrics=metrics.append)
+        self.assertEqual(text, "Hello world")
+        self.assertEqual(chunks, ["Hello", " world"])
+        self.assertEqual(len(metrics), 1)
+        self.assertEqual(metrics[0]["eval_count"], 7)
+        self.assertEqual(metrics[0]["eval_duration_ns"], 500000000)
+        self.assertIsNone(metrics[0]["prompt_eval_count"])
+        self.assertEqual(metrics[0]["ttft_s"], 0.1)
+        self.assertGreaterEqual(metrics[0]["total_s"], 0.0)
+
+    def test_instructions_history_and_prompt_split(self):
+        client = self._client()
+        client.chat_stream("folder-a", [
+            {"role": "system", "content": "Be terse."},
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"},
+            {"role": "user", "content": "next"}],
+            lambda token: None, threading.Event())
+        call = self.runner.calls[-1]
+        self.assertEqual(call["instructions"], "Be terse.")
+        self.assertEqual(call["prompt"], "next")
+        self.assertEqual(call["history"], [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"}])
+
+    def test_loads_once_per_model_and_reports_running(self):
+        client = self._client()
+        self.assertEqual(client.running_models(), {})
+        messages = [{"role": "user", "content": "hi"}]
+        client.chat_stream("folder-a", messages, lambda t: None,
+                           threading.Event())
+        client.chat_stream("folder-a", messages, lambda t: None,
+                           threading.Event())
+        self.assertEqual(self.controller.loads,
+                         ["/models/folder-a.gguf"])
+        self.assertEqual(client.running_models(), {"folder-a": 100})
+        client.chat_stream("ollie:7b", messages, lambda t: None,
+                           threading.Event())
+        self.assertEqual(self.controller.loads,
+                         ["/models/folder-a.gguf", "/ollie/ollie.gguf"])
+        self.assertEqual(client.running_models(), {"ollie:7b": 200})
+
+    def test_unknown_model_is_a_plain_error(self):
+        client = self._client()
+        with self.assertRaises(self.mod.EngineError) as ctx:
+            client.chat_stream("ghost", [{"role": "user",
+                                          "content": "hi"}],
+                               lambda t: None, threading.Event())
+        self.assertEqual(str(ctx.exception), MSG_MODEL_FAILED)
+
+    def test_cancel_during_generation_raises_cancelled(self):
+        self.runner.tokens = ["a", "b", "c"]
+        event = threading.Event()
+        seen = []
+
+        def on_token(token):
+            seen.append(token)
+            event.set()
+
+        client = self._client()
+        with self.assertRaises(self.mod.Cancelled):
+            client.chat_stream("folder-a",
+                               [{"role": "user", "content": "hi"}],
+                               on_token, event)
+        self.assertEqual(seen, ["a"])
+
+    def test_runner_error_before_output_is_the_load_wording(self):
+        self.runner.error = _StubRunnerError("boom")
+        client = self._client()
+        with self.assertRaises(self.mod.EngineError) as ctx:
+            client.chat_stream("folder-a",
+                               [{"role": "user", "content": "hi"}],
+                               lambda t: None, threading.Event())
+        self.assertEqual(str(ctx.exception), MSG_MODEL_FAILED)
+
+    def test_runner_error_after_output_is_the_turn_wording(self):
+        self.runner.error = _StubRunnerError("boom")
+        self.runner.error_after = 1
+        client = self._client()
+        with self.assertRaises(self.mod.EngineError) as ctx:
+            client.chat_stream("folder-a",
+                               [{"role": "user", "content": "hi"}],
+                               lambda t: None, threading.Event())
+        self.assertEqual(str(ctx.exception), MSG_TURN_FAILED)
+
+    def test_model_too_big_names_the_model(self):
+        self.controller.load_error = _StubModelTooBig(
+            "needs 12 GB, this PC has 8 GB")
+        client = self._client()
+        with self.assertRaises(self.mod.EngineError) as ctx:
+            client.chat_stream("folder-a",
+                               [{"role": "user", "content": "hi"}],
+                               lambda t: None, threading.Event())
+        self.assertIn("folder-a", str(ctx.exception))
+        self.assertIn("too big", str(ctx.exception))
+
+    def test_model_gone_between_listing_and_load(self):
+        self.controller.load_error = _StubModelNotFound("gone")
+        client = self._client()
+        with self.assertRaises(self.mod.EngineError) as ctx:
+            client.chat_stream("folder-a",
+                               [{"role": "user", "content": "hi"}],
+                               lambda t: None, threading.Event())
+        self.assertEqual(str(ctx.exception),
+                         self.mod.MSG_MODEL_GONE)
+
+    def test_cancel_during_load_raises_cancelled(self):
+        self.controller.load_error = _StubLoadCancelled()
+        client = self._client()
+        with self.assertRaises(self.mod.Cancelled):
+            client.chat_stream("folder-a",
+                               [{"role": "user", "content": "hi"}],
+                               lambda t: None, threading.Event())
+
+
+class FyrnMissingTests(unittest.TestCase):
+    """No stub, no install: every entry point answers with the
+    plain Fyrn-missing message, never a traceback."""
+
+    def setUp(self):
+        import duo_fyrn
+        self.mod = duo_fyrn
+        self._patchers = [
+            mock.patch.dict(sys.modules, {"fyrn": None}),
+            mock.patch.object(
+                self.mod, "find_fyrn_install",
+                side_effect=self.mod.FyrnNotFoundError("none")),
+        ]
+        for patcher in self._patchers:
+            patcher.start()
+
+    def tearDown(self):
+        for patcher in reversed(self._patchers):
+            patcher.stop()
+
+    def test_missing_engine_wording(self):
+        client = self.mod.FyrnClient()
+        # running_models raises too (its one caller, the RAM meter,
+        # guards the call); the message is the same plain wording.
+        with self.assertRaises(self.mod.EngineError) as ctx:
+            client.running_models()
+        self.assertEqual(str(ctx.exception), MSG_FYRN_MISSING)
+        with self.assertRaises(self.mod.EngineError) as ctx:
+            client.list_models()
+        self.assertEqual(str(ctx.exception), MSG_FYRN_MISSING)
+        with self.assertRaises(self.mod.EngineError) as ctx:
+            client.chat_stream("any", [{"role": "user",
+                                         "content": "hi"}],
+                               lambda t: None, threading.Event())
+        self.assertEqual(str(ctx.exception), MSG_FYRN_MISSING)

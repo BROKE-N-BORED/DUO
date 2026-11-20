@@ -1,5 +1,5 @@
 """Window constants for DUO: plain-language messages, activity-state
-tables, QSettings keys, layout floors, temperature bounds, first-run
+tables, QSettings keys, layout floors, first-run
 guide text, and field explanations.
 
 Moved verbatim from dual_chat.py in v0.47 (redesign R9): the window
@@ -46,7 +46,7 @@ MSG_PYSIDE6_MISSING = (
 # is a failed turn, held a few seconds so it is seen, then idle.
 SIDE_STATES = {
     "idle": ("#8a8a8a", "Idle"),
-    "waiting": ("#e8a33d", "Waiting for Ollama…"),
+    "waiting": ("#e8a33d", "Waiting for the model…"),
     "thinking": ("#2fbf5a", "Thinking…"),
     "summarizing": ("#2fbf5a", "Summarizing…"),
     "queued": ("#e8a33d", "Queued…"),
@@ -70,10 +70,6 @@ SIDE_STATES_SHORT = {
     "review": "Review…",
     "error": "Failed",
 }
-# How long the Start Ollama button waits before re-checking the
-# model list (v0.58, P2-53): the service needs a moment to open
-# its port before the list call can succeed.
-OLLAMA_START_WAIT_MS = 2000
 # Relay chip (v0.34, redesign R3): the relay's status dot and words.
 # The same palette as the activity lights, so the colors mean the
 # same thing everywhere: grey idle, green working, amber waiting on
@@ -120,10 +116,10 @@ PANES_MIN_HEIGHT = 250
 
 # v0.57 (P1-11): the total time closing waits for background
 # threads (model loads, update checks, downloads) before it
-# closes anyway. A model-list load can take ~42 s with Ollama
-# down (tags retries plus the CLI fallback); the window must
-# never freeze that long. Threads still running after this are
-# orphaned, never destroyed mid-flight (see _orphan_holder).
+# closes anyway. A model-list load can take a while (the disk
+# scan plus the header reads); the window must never freeze
+# that long. Threads still running after this are orphaned,
+# never destroyed mid-flight (see _orphan_holder).
 CLOSE_WAIT_MS = 5000
 # v0.56 (P1-8): the director's sections scroll past this height
 # instead of demanding more room -- 130 px shows the Relay
@@ -134,12 +130,6 @@ CLOSE_WAIT_MS = 5000
 DIRECTOR_SCROLL_MAX_HEIGHT = 130
 HIST_EDITOR_MIN_HEIGHT = 60
 HIST_EDITOR_DEFAULT_HEIGHT = 110
-# Model parameters (v0.19): each side's temperature is remembered
-# per side the same way. %s is the side ("A"/"B").
-SETTING_TEMPERATURE = "temperature/%s"
-TEMPERATURE_DEFAULT = 0.7  # Ollama's own default, made visible.
-TEMPERATURE_MIN = 0.0
-TEMPERATURE_MAX = 2.0
 # First-run guide (v0.39, redesign R5): the flag remembers that the
 # user has used the app (first send, relay, task, opened
 # conversation, or import). While it is unset and both panes are
@@ -165,7 +155,6 @@ FIRST_RUN_TICK = "\u2713"  # a checkmark, not a bullet
 # size/fit entries + its position already say what it is for),
 # and neither do the composer, the search boxes, or the pair and
 # preset name fields (their placeholders cover them).
-EXPLAIN_TEMP = "Lower is more focused, higher is more creative."
 EXPLAIN_RELAY_ROW1 = ("Start with picks which side answers first. "
                       "Turns caps the relay. "
                       "Blind hides that the other side is an AI.")

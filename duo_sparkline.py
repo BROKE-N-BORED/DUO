@@ -8,15 +8,15 @@ last 60 samples (the last 30 seconds of generation). When the side
 is idle the graph freezes, showing the recent history. No axes, no
 labels -- the stats line next to it carries the exact number.
 
-What the samples are, honestly. Ollama's stream carries no token
-counts until the done chunk, so mid-turn there is no true token
-count to sample: the live samples are characters streamed so far,
-divided by CHARS_PER_TOKEN, divided by the seconds since the first
-token. That is an approximation, and it feeds only the graph's
-shape -- no number is ever drawn from it, and the stats line's
-counts stay exact (they come from the done chunk, never estimated).
-The final sample of a turn IS exact: the turn's tok/s from the
-done chunk, the same number the stats line shows.
+What the samples are, honestly. The engine's stream carries no
+token counts until the turn ends, so mid-turn there is no true
+token count to sample: the live samples are characters streamed
+so far, divided by CHARS_PER_TOKEN, divided by the seconds since
+the first token. That is an approximation, and it feeds only the
+graph's shape -- no number is ever drawn from it, and the stats
+line's counts stay exact (they come from the turn's stats, never
+estimated). The final sample of a turn IS exact: the turn's
+tok/s from those stats, the same number the stats line shows.
 
 The window owns the sampling (a 500 ms timer per side, running
 only while that side generates); this module owns the samples and
